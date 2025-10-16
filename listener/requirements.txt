@@ -1,0 +1,8 @@
+python-telegram-bot==21.*
+asyncssh==2.*
+orjson==3.*
+pydantic==2.*
+tenacity==8.*
+structlog==24.*
+uvloop==0.19.*
+grid3

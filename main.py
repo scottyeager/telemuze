@@ -1,0 +1,919 @@
+# listener/main.py
+# Telemuze Listener - Telegram bot entrypoint
+#
+# Responsibilities:
+# - Authenticate users
+# - Accept Telegram audio/video uploads
+# - Queue jobs, enforce concurrency
+# - Provision short-lived "composer" VMs (via grid3.tfcmd)
+# - Transfer files via SSH/SCP, run transcription, fetch results
+# - Reply with text (and attach .txt if over Telegram limit)
+#
+# Notes:
+# - TODO: Implement retrieval of composer VM IP/host after deployment
+# - TODO: Implement strict host key verification (TOFU) and persistence in known_hosts
+# - TODO: Networking/placement specifics when provisioning via grid3.tfcmd
+# - TODO: Cancel-on-delete stretch goal is not implemented (use Cancel button)
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import re
+import sqlite3
+import string
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import asyncssh
+
+# Grid provisioning (assumed available as per user instruction)
+from grid3 import tfcmd as grid3_tfcmd
+from telegram import (
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputFile,
+    Update,
+)
+from telegram.ext import (
+    Application,
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
+# ----------------------------
+# Configuration and constants
+# ----------------------------
+
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+if not TELEGRAM_BOT_TOKEN:
+    print("ERROR: TELEGRAM_BOT_TOKEN is required", file=sys.stderr)
+    sys.exit(1)
+
+# Deployment info for composers
+TF_MNEMONIC = os.environ.get("TF_MNEMONIC", "")
+if not TF_MNEMONIC:
+    print("ERROR: TF_MNEMONIC is required", file=sys.stderr)
+    sys.exit(1)
+
+TF_NETWORK = os.environ.get("TF_NETWORK", "main")
+
+TF_NODE_ID = os.environ.get("TF_NODE_ID")
+if not TF_NODE_ID:
+    print("ERROR: TF_NODE_ID is required", file=sys.stderr)
+    sys.exit(1)
+
+# Auth
+ALLOWED_USERNAMES = {
+    u.strip().lower()
+    for u in os.environ.get("ALLOWED_USERNAMES", "").split(",")
+    if u.strip()
+}
+ALLOWED_USER_IDS = {
+    int(u)
+    for u in os.environ.get("ALLOWED_USER_IDS", "").split(",")
+    if u.strip().isdigit()
+}
+
+if not ALLOWED_USERNAMES and not ALLOWED_USER_IDS:
+    print(
+        "ERROR: At least one allowed user is required (ALLOWED_USERNAMES or ALLOWED_USER_IDS)",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+# Concurrency (TODO: remove. We only support one composer)
+MAX_COMPOSERS = int(os.environ.get("MAX_COMPOSERS", "1"))
+PER_USER_CONCURRENCY = int(os.environ.get("PER_USER_CONCURRENCY", "1"))
+
+# Defaults
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "large-v3")
+DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "auto")
+
+# Limits/timeouts
+JOB_TIMEOUT_SEC = int(os.environ.get("JOB_TIMEOUT_SEC", str(3 * 60 * 60)))  # 3h
+FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", str(20 * 60)))  # 20m
+SSH_CONNECT_TIMEOUT_SEC = int(os.environ.get("SSH_CONNECT_TIMEOUT_SEC", "90"))
+SSH_CMD_IDLE_TIMEOUT_SEC = int(os.environ.get("SSH_CMD_IDLE_TIMEOUT_SEC", "300"))
+
+# Cache warmer
+CACHE_WARM_INTERVAL_MIN = int(os.environ.get("CACHE_WARM_INTERVAL_MIN", "360"))
+
+# File and SSH paths
+HOME_DIR = Path.home()
+STATE_DIR = HOME_DIR / ".telemuze"
+STATE_DIR.mkdir(parents=True, exist_ok=True)
+TMP_DIR = Path(os.environ.get("TELEMUZE_TMP_DIR", "/tmp/telemuze"))
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+
+SSH_KEY_PATH = STATE_DIR / "id_ed25519"
+SSH_PUB_PATH = STATE_DIR / "id_ed25519.pub"
+KNOWN_HOSTS_PATH = STATE_DIR / "known_hosts"
+COMPOSER_USERNAME = "root"
+
+# Telegram message char limit
+TELEGRAM_TEXT_LIMIT = 4096
+
+# ----------------------------
+# Logging
+# ----------------------------
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
+log = logging.getLogger("telemuze.listener")
+
+# ----------------------------
+# User settings storage (SQLite)
+# ----------------------------
+
+DB_PATH = STATE_DIR / "db.sqlite"
+
+
+def _db_init():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            model TEXT NOT NULL,
+            language TEXT NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_user_settings(user_id: int, username: Optional[str]) -> Tuple[str, str]:
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute(
+        "SELECT model, language FROM user_settings WHERE user_id = ?", (user_id,)
+    )
+    row = cur.fetchone()
+    if row:
+        conn.close()
+        return row[0], row[1]
+    # Insert defaults
+    ts = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO user_settings (user_id, username, model, language, updated_at) VALUES (?, ?, ?, ?, ?)",
+        (user_id, username or "", DEFAULT_MODEL, DEFAULT_LANGUAGE, ts),
+    )
+    conn.commit()
+    conn.close()
+    return DEFAULT_MODEL, DEFAULT_LANGUAGE
+
+
+def set_user_model(user_id: int, username: Optional[str], model: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    ts = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO user_settings (user_id, username, model, language, updated_at) VALUES (?, ?, ?, COALESCE((SELECT language FROM user_settings WHERE user_id = ?), ?), ?)",
+        (user_id, username or "", model, user_id, DEFAULT_LANGUAGE, ts),
+    )
+    conn.commit()
+    conn.close()
+
+
+def set_user_language(user_id: int, username: Optional[str], language: str) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    ts = int(time.time())
+    conn.execute(
+        "INSERT OR REPLACE INTO user_settings (user_id, username, model, language, updated_at) VALUES (?, ?, COALESCE((SELECT model FROM user_settings WHERE user_id = ?), ?), ?, ?)",
+        (user_id, username or "", user_id, DEFAULT_MODEL, language, ts),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ----------------------------
+# SSH key management
+# ----------------------------
+
+
+def ensure_ssh_keypair():
+    if SSH_KEY_PATH.exists() and SSH_PUB_PATH.exists():
+        return
+    log.info("Generating SSH keypair at %s", SSH_KEY_PATH)
+    SSH_KEY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # Use ssh-keygen to create an ed25519 key
+    subprocess.run(
+        [
+            "ssh-keygen",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-f",
+            str(SSH_KEY_PATH),
+            "-C",
+            "telemuze",
+        ],
+        check=True,
+    )
+
+
+# ----------------------------
+# Job and scheduler
+# ----------------------------
+
+
+@dataclass
+class Job:
+    job_id: str
+    user_id: int
+    username: Optional[str]
+    chat_id: int
+    original_message_id: int
+    local_input_path: Path
+    original_filename: str
+    model: str
+    language: str
+    status_message_id: Optional[int] = None
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+
+    # runtime fields
+    vm_name: str = ""
+    vm_ip: Optional[str] = None
+
+
+class Scheduler:
+    def __init__(self):
+        self.queue: asyncio.Queue[Job] = asyncio.Queue()
+        self.global_sem = asyncio.Semaphore(MAX_COMPOSERS)
+        self.user_sems: Dict[int, asyncio.Semaphore] = {}
+        self.jobs: Dict[str, Job] = {}
+        self.tasks: Dict[str, asyncio.Task] = {}
+        self.last_activity_ts = time.time()
+        self._stop_event = asyncio.Event()
+
+    def get_user_sem(self, user_id: int) -> asyncio.Semaphore:
+        if user_id not in self.user_sems:
+            self.user_sems[user_id] = asyncio.Semaphore(PER_USER_CONCURRENCY)
+        return self.user_sems[user_id]
+
+    def queue_position(self) -> int:
+        return self.queue.qsize() + 1
+
+    async def submit(self, job: Job):
+        self.jobs[job.job_id] = job
+        await self.queue.put(job)
+
+    async def cancel_job(self, job_id: str) -> bool:
+        job = self.jobs.get(job_id)
+        if not job:
+            return False
+        job.cancel_event.set()
+        # If job is still in queue, it's difficult to remove from asyncio.Queue without draining.
+        # We'll let the scheduler skip it when popped.
+        return True
+
+    async def run(self, app: Application):
+        while not self._stop_event.is_set():
+            job: Job = await self.queue.get()
+            if job.cancel_event.is_set():
+                await self._set_status(app, job, "Canceled")
+                self._cleanup_local(job)
+                self.jobs.pop(job.job_id, None)
+                self.queue.task_done()
+                continue
+
+            # Acquire semaphores
+            await self.global_sem.acquire()
+            user_sem = self.get_user_sem(job.user_id)
+            await user_sem.acquire()
+
+            # Start task
+            task = asyncio.create_task(self._run_job(app, job, user_sem))
+            self.tasks[job.job_id] = task
+            self.queue.task_done()
+
+    async def shutdown(self):
+        self._stop_event.set()
+        # Do not cancel running jobs abruptly; allow graceful stop.
+
+    async def _set_status(self, app: Application, job: Job, text: string):
+        if job.status_message_id is None:
+            return
+        try:
+            await app.bot.edit_message_text(
+                chat_id=job.chat_id,
+                message_id=job.status_message_id,
+                text=f"{text}",
+            )
+        except Exception as e:
+            log.warning("Failed to edit status message: %s", e)
+
+    def _cleanup_local(self, job: Job):
+        with contextlib.suppress(Exception):
+            if job.local_input_path.exists():
+                job.local_input_path.unlink()
+            job.local_input_path.parent.rmdir()
+
+    async def _run_job(self, app: Application, job: Job, user_sem: asyncio.Semaphore):
+        try:
+            self.last_activity_ts = time.time()
+            # Provision composer
+            await self._set_status(app, job, "Provisioning worker…")
+            vm_name = f"composer-{job.job_id}"
+            job.vm_name = vm_name
+
+            vm_ip = await provision_composer(vm_name)
+            job.vm_ip = vm_ip
+
+            if job.cancel_event.is_set():
+                await self._set_status(app, job, "Canceled")
+                await destroy_composer(vm_name)
+                self._cleanup_local(job)
+                return
+
+            # Connect via SSH (retry while VM boots)
+            await self._set_status(app, job, "Connecting to worker…")
+            conn = await connect_ssh_with_retries(vm_ip)
+
+            try:
+                # Prepare remote dirs
+                remote_input_dir = f"/job/input/{job.job_id}"
+                remote_output_dir = f"/job/output/{job.job_id}"
+                remote_logs_dir = "/job/logs"
+                await run_ssh_command(
+                    conn,
+                    f"mkdir -p {remote_input_dir} {remote_output_dir} {remote_logs_dir}",
+                )
+
+                # Upload file
+                await self._set_status(app, job, "Uploading...")
+                remote_input_path = (
+                    f"{remote_input_dir}/{sanitize_filename(job.original_filename)}"
+                )
+                await asyncssh.scp(
+                    str(job.local_input_path),
+                    (conn, remote_input_path),
+                    recurse=False,
+                    preserve=True,
+                )
+
+                if job.cancel_event.is_set():
+                    await self._set_status(app, job, "Canceled")
+                    return
+
+                # Run transcription
+                await self._set_status(app, job, "Transcribing…")
+                cmd = (
+                    f"python3 /opt/telemuze/composer.py "
+                    f"--in {sh_quote(remote_input_path)} "
+                    f"--model {sh_quote(job.model)} "
+                    f"--language {sh_quote(job.language)} "
+                    f"--job-id {sh_quote(job.job_id)}"
+                )
+                # Wrap with timeout
+                json_result = await run_ssh_command_with_json(
+                    conn, cmd, timeout=JOB_TIMEOUT_SEC
+                )
+
+                if job.cancel_event.is_set():
+                    await self._set_status(app, job, "Canceled")
+                    return
+
+                if not json_result.get("ok"):
+                    err = json_result.get("error", "Transcription failed")
+                    await self._send_error_reply(
+                        app, job, f"Transcription failed: {err}"
+                    )
+                    return
+
+                text_path = json_result.get("text_path")
+                if not text_path:
+                    await self._send_error_reply(app, job, "No transcript produced.")
+                    return
+
+                # Fetch transcript text via cat
+                transcript_text = await run_ssh_command(
+                    conn, f"cat {sh_quote(text_path)}", timeout=SSH_CMD_IDLE_TIMEOUT_SEC
+                )
+
+                # Send transcript to Telegram
+                await self._send_transcript_reply(app, job, transcript_text)
+
+                await self._set_status(app, job, "Done ✅")
+            finally:
+                # Cleanup remote files and destroy VM
+                with contextlib.suppress(Exception):
+                    await run_ssh_command(
+                        conn,
+                        f"rm -rf /job/input/{job.job_id} /job/output/{job.job_id}",
+                        timeout=60,
+                    )
+                conn.close()
+                await destroy_composer(job.vm_name)
+
+            # Cleanup local
+            self._cleanup_local(job)
+
+        except asyncio.TimeoutError:
+            await self._send_error_reply(
+                app,
+                job,
+                "This job exceeded the maximum processing time and was canceled.",
+            )
+        except Exception as e:
+            log.exception("Job %s failed: %s", job.job_id, e)
+            await self._send_error_reply(
+                app, job, "An internal error occurred while processing your file."
+            )
+        finally:
+            self.tasks.pop(job.job_id, None)
+            self.jobs.pop(job.job_id, None)
+            self.global_sem.release()
+            user_sem.release()
+
+    async def _send_error_reply(self, app: Application, job: Job, text: str):
+        try:
+            await app.bot.send_message(
+                chat_id=job.chat_id,
+                text=f"❌ {text}",
+                reply_to_message_id=job.original_message_id,
+            )
+        except Exception as e:
+            log.warning("Failed to send error reply: %s", e)
+        with contextlib.suppress(Exception):
+            await self._set_status(app, job, "Failed ❌")
+
+    async def _send_transcript_reply(
+        self, app: Application, job: Job, transcript_text: str
+    ):
+        text = transcript_text.strip()
+        if not text:
+            await app.bot.send_message(
+                chat_id=job.chat_id,
+                text="ℹ️ Transcription completed, but no speech was detected.",
+                reply_to_message_id=job.original_message_id,
+            )
+            return
+
+        if len(text) <= TELEGRAM_TEXT_LIMIT:
+            await app.bot.send_message(
+                chat_id=job.chat_id,
+                text=text,
+                reply_to_message_id=job.original_message_id,
+            )
+        else:
+            # Send truncated text first
+            truncated = text[:TELEGRAM_TEXT_LIMIT]
+            await app.bot.send_message(
+                chat_id=job.chat_id,
+                text=truncated,
+                reply_to_message_id=job.original_message_id,
+            )
+            # Attach full transcript as .txt
+            with tempfile.NamedTemporaryFile(
+                "w+", encoding="utf-8", delete=False, suffix=".txt"
+            ) as tf:
+                tf.write(text)
+                tmp_path = tf.name
+            try:
+                await app.bot.send_document(
+                    chat_id=job.chat_id,
+                    document=InputFile(
+                        tmp_path, filename=f"transcript-{job.job_id}.txt"
+                    ),
+                    caption="Full transcript",
+                    reply_to_message_id=job.original_message_id,
+                )
+            finally:
+                with contextlib.suppress(Exception):
+                    os.unlink(tmp_path)
+
+
+scheduler = Scheduler()
+
+# ----------------------------
+# Grid3 provisioning wrappers
+# ----------------------------
+
+tfcmd = grid3_tfcmd.TFCmd()
+
+
+async def provision_composer(vm_name: str) -> str:
+    """
+    Provision a composer VM and return its IP address or hostname.
+
+    TODO:
+    - Pass placement hints (TF_NODE_ID/TF_FARM_ID) to tfcmd
+    - Inject the SSH public key into the VM's authorized_keys
+    - Retrieve the assigned public IP or DNS name
+    """
+    log.info("Provisioning VM %s", vm_name)
+    # Assumes tfcmd accepts a name; if not, consider a single-name strategy or extend tfcmd API.
+    vm_info = await asyncio.to_thread(
+        tfcmd.deploy_vm, vm_name, ssh=SSH_KEY_PATH, node=TF_NODE_ID
+    )
+    vm_ip = vm_info.get("mycelium_ip")
+    if not vm_ip:
+        raise RuntimeError(f"No mycelium_ip returned for VM {vm_name}")
+
+    return vm_ip
+
+
+async def destroy_composer(vm_name: str):
+    log.info("Destroying VM %s", vm_name)
+    with contextlib.suppress(Exception):
+        await asyncio.to_thread(tfcmd.cancel_vm, vm_name)
+
+
+# ----------------------------
+# SSH helpers
+# ----------------------------
+
+
+async def connect_ssh_with_retries(host: str) -> asyncssh.SSHClientConnection:
+    start = time.time()
+    last_err: Optional[Exception] = None
+    while time.time() - start < SSH_CONNECT_TIMEOUT_SEC:
+        try:
+            conn = await asyncssh.connect(
+                host=host,
+                username=COMPOSER_USERNAME,
+                client_keys=[str(SSH_KEY_PATH)],
+                known_hosts=None,
+            )
+            return conn
+        except Exception as e:
+            last_err = e
+            await asyncio.sleep(3)
+    raise RuntimeError(f"SSH connect timeout to {host}: {last_err}")
+
+
+async def run_ssh_command(
+    conn: asyncssh.SSHClientConnection, cmd: str, timeout: Optional[int] = None
+) -> str:
+    log.debug("SSH RUN: %s", cmd)
+    async with conn.create_process(cmd) as proc:
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                proc.kill()
+            raise
+        if proc.exit_status != 0:
+            raise RuntimeError(
+                f"Remote command failed ({proc.exit_status}): {stderr or stdout}"
+            )
+        return stdout
+
+
+async def run_ssh_command_with_json(
+    conn: asyncssh.SSHClientConnection, cmd: str, timeout: Optional[int] = None
+) -> dict:
+    out = await run_ssh_command(conn, cmd, timeout=timeout)
+    # transcribe.sh prints one JSON line at the end
+    try:
+        # Use last non-empty line as JSON
+        lines = [l for l in out.splitlines() if l.strip()]
+        return json.loads(lines[-1]) if lines else {}
+    except Exception as e:
+        raise RuntimeError(f"Failed to parse JSON from output: {e}\nOut: {out[:5000]}")
+
+
+def sh_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\"'\"'") + "'"
+
+
+def sanitize_filename(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+    return safe[:128] if len(safe) > 128 else safe
+
+
+# ----------------------------
+# Telegram handlers
+# ----------------------------
+
+
+def is_user_allowed(username: Optional[str], user_id: int) -> bool:
+    if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
+        return True
+    if ALLOWED_USERNAMES and (username or "").lower() in ALLOWED_USERNAMES:
+        return True
+    # If no allowlists set, allow all by default
+    if not ALLOWED_USER_IDS and not ALLOWED_USERNAMES:
+        return True
+    return False
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user:
+        return
+    if not is_user_allowed(update.effective_user.username, update.effective_user.id):
+        await update.effective_message.reply_text("Access denied.")
+        return
+    await update.effective_message.reply_text(
+        "Hi! Send me an audio or video, and I’ll transcribe it.\n"
+        "Commands:\n"
+        "/model <tiny|base|small|medium|large-v3>\n"
+        "/language <auto|en|es|de|...>\n"
+        "/settings to view your current settings."
+    )
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start_cmd(update, context)
+
+
+async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    if not is_user_allowed(user.username, user.id):
+        await update.effective_message.reply_text("Access denied.")
+        return
+    model, lang = get_user_settings(user.id, user.username)
+    await update.effective_message.reply_text(
+        f"Your settings:\n- Model: {model}\n- Language: {lang}"
+    )
+
+
+MODEL_CHOICES = {"tiny", "base", "small", "medium", "large-v3"}
+
+
+async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    if not is_user_allowed(user.username, user.id):
+        await update.effective_message.reply_text("Access denied.")
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Usage: /model <tiny|base|small|medium|large-v3>"
+        )
+        return
+    model = context.args[0].strip().lower()
+    if model not in MODEL_CHOICES:
+        await update.effective_message.reply_text(
+            "Invalid model. Choose one of: tiny, base, small, medium, large-v3"
+        )
+        return
+    set_user_model(user.id, user.username, model)
+    await update.effective_message.reply_text(f"Model set to: {model}")
+
+
+LANG_RE = re.compile(r"^[a-z]{2}(-[A-Z]{2})?$")
+
+
+async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+    if not is_user_allowed(user.username, user.id):
+        await update.effective_message.reply_text("Access denied.")
+        return
+    if not context.args:
+        await update.effective_message.reply_text("Usage: /language <auto|code>")
+        return
+    lang = context.args[0].strip().lower()
+    if lang != "auto" and not LANG_RE.match(lang):
+        await update.effective_message.reply_text(
+            "Invalid language code. Use 'auto' or ISO 639-1 codes like en, es, de."
+        )
+        return
+    set_user_language(user.id, user.username, lang)
+    await update.effective_message.reply_text(f"Language set to: {lang}")
+
+
+def build_cancel_keyboard(job_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("Cancel", callback_data=f"cancel:{job_id}")]]
+    )
+
+
+async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    await query.answer()
+    m = re.match(r"^cancel:(?P<job_id>[\w-]+)$", query.data)
+    if not m:
+        return
+    job_id = m.group("job_id")
+    job = scheduler.jobs.get(job_id)
+    user = update.effective_user
+    if not job or not user or user.id != job.user_id:
+        # Only owner can cancel
+        return
+    ok = await scheduler.cancel_job(job_id)
+    if ok:
+        with contextlib.suppress(Exception):
+            await query.edit_message_text("Canceling…")
+    else:
+        with contextlib.suppress(Exception):
+            await query.edit_message_text("Unable to cancel.")
+
+
+async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.effective_message
+    user = update.effective_user
+    if not user:
+        return
+    if not is_user_allowed(user.username, user.id):
+        await message.reply_text("Access denied.")
+        return
+
+    # Identify the file
+    tg_file_id, inferred_name = extract_file_id_and_name(message)
+    if not tg_file_id:
+        await message.reply_text(
+            "I can’t process that message. Please send an audio or video file."
+        )
+        return
+
+    # Fetch user settings
+    model, lang = get_user_settings(user.id, user.username)
+
+    # Prepare local path
+    job_id = str(uuid.uuid4())
+    job_dir = TMP_DIR / job_id / "input"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    local_path = job_dir / inferred_name
+
+    # Download from Telegram
+    try:
+        tg_file = await context.bot.get_file(tg_file_id)
+        await tg_file.download_to_drive(custom_path=str(local_path))
+    except Exception as e:
+        log.exception("Download failed: %s", e)
+        await message.reply_text("Failed to download the file from Telegram.")
+        return
+
+    # Queue job and send status
+    pos = scheduler.queue_position()
+    status_msg = await message.reply_text(
+        f"Queued (position {pos})",
+        reply_to_message_id=message.message_id,
+        reply_markup=build_cancel_keyboard(job_id),
+    )
+
+    job = Job(
+        job_id=job_id,
+        user_id=user.id,
+        username=user.username,
+        chat_id=message.chat_id,
+        original_message_id=message.message_id,
+        local_input_path=local_path,
+        original_filename=inferred_name,
+        model=model,
+        language=lang,
+        status_message_id=status_msg.message_id,
+    )
+    await scheduler.submit(job)
+
+
+def extract_file_id_and_name(message) -> Tuple[Optional[str], str]:
+    # Voice note (OGG Opus)
+    if message.voice:
+        return message.voice.file_id, f"voice-{message.id or int(time.time())}.ogg"
+    # Audio (music/podcast)
+    if message.audio:
+        name = message.audio.file_name or f"audio-{message.id or int(time.time())}.mp3"
+        return message.audio.file_id, name
+    # Video
+    if message.video:
+        name = message.video.file_name or f"video-{message.id or int(time.time())}.mp4"
+        return message.video.file_id, name
+    # VideoNote (round video)
+    if message.video_note:
+        return (
+            message.video_note.file_id,
+            f"videonote-{message.id or int(time.time())}.mp4",
+        )
+    # Document (generic)
+    if message.document:
+        name = (
+            message.document.file_name or f"document-{message.id or int(time.time())}"
+        )
+        return message.document.file_id, name
+    return None, ""
+
+
+# ----------------------------
+# Cache warmer
+# ----------------------------
+
+
+async def cache_warmer_task(app: Application):
+    """
+    Periodically spin a composer to keep the composer flist cached on the node. Activity timestamp is also reset by regular composer deployments.
+    """
+    while True:
+        try:
+            now = time.time()
+            idle_sec = now - scheduler.last_activity_ts
+            if idle_sec > CACHE_WARM_INTERVAL_MIN * 60 and scheduler.queue.empty():
+                vm_name = f"composer-warm-{int(now)}"
+                log.info("Running cache warmer: %s", vm_name)
+                try:
+                    vm_ip = await provision_composer(vm_name)
+                except Exception as e:
+                    log.warning("Warm provision failed: %s", e)
+                    await destroy_composer(vm_name)
+                    await asyncio.sleep(60)
+                    continue
+
+                await destroy_composer(vm_name)
+                # Reset last activity to now to avoid back-to-back warmers
+                scheduler.last_activity_ts = time.time()
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.warning("Cache warmer error: %s", e)
+            await asyncio.sleep(60)
+
+
+# ----------------------------
+# Application lifecycle
+# ----------------------------
+
+
+async def on_startup(app: Application):
+    _db_init()
+    ensure_ssh_keypair()
+    log.info("Allowed usernames: %s", ", ".join(sorted(ALLOWED_USERNAMES)) or "(any)")
+    log.info(
+        "Allowed user IDs: %s", ", ".join(map(str, sorted(ALLOWED_USER_IDS))) or "(any)"
+    )
+
+    # Start scheduler
+    app.bot_data["scheduler_task"] = asyncio.create_task(scheduler.run(app))
+    # Start cache warmer
+    app.bot_data["warmer_task"] = asyncio.create_task(cache_warmer_task(app))
+
+
+async def on_shutdown(app: Application):
+    await scheduler.shutdown()
+    # Cancel background tasks
+    for key in ("scheduler_task", "warmer_task"):
+        task: Optional[asyncio.Task] = app.bot_data.get(key)
+        if task:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+def build_application() -> Application:
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
+
+    # Commands
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("settings", settings_cmd))
+    app.add_handler(CommandHandler("model", model_cmd))
+    app.add_handler(CommandHandler("language", language_cmd))
+
+    # Cancel button
+    app.add_handler(CallbackQueryHandler(cancel_callback, pattern=r"^cancel:"))
+
+    # Media handler
+    media_filter = (
+        filters.VOICE
+        | filters.AUDIO
+        | filters.VIDEO
+        | filters.VIDEO_NOTE
+        | filters.Document.ALL  # We'll validate in handler if needed
+    )
+    app.add_handler(MessageHandler(media_filter, handle_media))
+
+    return app
+
+
+def main():
+    app = build_application()
+    # Graceful shutdown on SIGINT/SIGTERM
+    try:
+        app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+
+
+if __name__ == "__main__":
+    main()
