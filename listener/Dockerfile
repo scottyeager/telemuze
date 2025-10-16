@@ -13,13 +13,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 COPY listener/requirements.txt /opt/telemuze/
 
 WORKDIR /opt/telemuze
 
+RUN uv venv /.venv
+
 # Python deps (listener)
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN uv pip install --no-cache-dir --break-system-packages -r requirements.txt
 
 RUN  wget https://github.com/threefoldtech/tfgrid-sdk-go/releases/download/v0.16.11/tfgrid-sdk-go_Linux_x86_64.tar.gz && \
     tar -xzf tfgrid-sdk-go_Linux_x86_64.tar.gz -C /usr/local/bin tfcmd && \
@@ -33,7 +37,3 @@ COPY listener/zinit/* /etc/zinit
 
 # Create state dir for SSH keys/db (owned by root by default; adjust if you use a non-root user)
 RUN mkdir -p /root/.telemuze /tmp/telemuze && chmod 700 /root/.telemuze
-
-# No ENTRYPOINT/CMD. zinit will start the listener, e.g.:
-# - name: telemuze-listener
-#   exec: [ "python3", "-m", "listener.main" ]

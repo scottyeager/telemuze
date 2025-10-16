@@ -93,6 +93,11 @@ if not ALLOWED_USERNAMES and not ALLOWED_USER_IDS:
     )
     sys.exit(1)
 
+COMPOSER_FLIST = os.environ.get("COMPOSER_FLIST", "")
+COMPOSER_CPUS = int(os.environ.get("COMPOSER_CPUS", "4"))
+# Memory in GB
+COMPOSER_RAM = int(os.environ.get("COMPOSER_RAM", "8"))
+
 # Concurrency (TODO: remove. We only support one composer)
 MAX_COMPOSERS = int(os.environ.get("MAX_COMPOSERS", "1"))
 PER_USER_CONCURRENCY = int(os.environ.get("PER_USER_CONCURRENCY", "1"))
@@ -330,96 +335,102 @@ class Scheduler:
             self.last_activity_ts = time.time()
             # Provision composer
             await self._set_status(app, job, "Provisioning worker…")
-            vm_name = f"composer-{job.job_id}"
+            vm_name = f"cmp{job.job_id[:8]}"
             job.vm_name = vm_name
 
-            vm_ip = await provision_composer(vm_name)
-            job.vm_ip = vm_ip
-
-            if job.cancel_event.is_set():
-                await self._set_status(app, job, "Canceled")
-                await destroy_composer(vm_name)
-                self._cleanup_local(job)
-                return
-
-            # Connect via SSH (retry while VM boots)
-            await self._set_status(app, job, "Connecting to worker…")
-            conn = await connect_ssh_with_retries(vm_ip)
-
             try:
-                # Prepare remote dirs
-                remote_input_dir = f"/job/input/{job.job_id}"
-                remote_output_dir = f"/job/output/{job.job_id}"
-                remote_logs_dir = "/job/logs"
-                await run_ssh_command(
-                    conn,
-                    f"mkdir -p {remote_input_dir} {remote_output_dir} {remote_logs_dir}",
-                )
-
-                # Upload file
-                await self._set_status(app, job, "Uploading...")
-                remote_input_path = (
-                    f"{remote_input_dir}/{sanitize_filename(job.original_filename)}"
-                )
-                await asyncssh.scp(
-                    str(job.local_input_path),
-                    (conn, remote_input_path),
-                    recurse=False,
-                    preserve=True,
-                )
+                vm_ip = await provision_composer(vm_name)
+                job.vm_ip = vm_ip
 
                 if job.cancel_event.is_set():
                     await self._set_status(app, job, "Canceled")
+                    self._cleanup_local(job)
                     return
 
-                # Run transcription
-                await self._set_status(app, job, "Transcribing…")
-                cmd = (
-                    f"python3 /opt/telemuze/composer.py "
-                    f"--in {sh_quote(remote_input_path)} "
-                    f"--model {sh_quote(job.model)} "
-                    f"--language {sh_quote(job.language)} "
-                    f"--job-id {sh_quote(job.job_id)}"
-                )
-                # Wrap with timeout
-                json_result = await run_ssh_command_with_json(
-                    conn, cmd, timeout=JOB_TIMEOUT_SEC
-                )
+                # Connect via SSH (retry while VM boots)
+                await self._set_status(app, job, "Connecting to worker…")
+                conn = await connect_ssh_with_retries(vm_ip)
 
-                if job.cancel_event.is_set():
-                    await self._set_status(app, job, "Canceled")
-                    return
-
-                if not json_result.get("ok"):
-                    err = json_result.get("error", "Transcription failed")
-                    await self._send_error_reply(
-                        app, job, f"Transcription failed: {err}"
-                    )
-                    return
-
-                text_path = json_result.get("text_path")
-                if not text_path:
-                    await self._send_error_reply(app, job, "No transcript produced.")
-                    return
-
-                # Fetch transcript text via cat
-                transcript_text = await run_ssh_command(
-                    conn, f"cat {sh_quote(text_path)}", timeout=SSH_CMD_IDLE_TIMEOUT_SEC
-                )
-
-                # Send transcript to Telegram
-                await self._send_transcript_reply(app, job, transcript_text)
-
-                await self._set_status(app, job, "Done ✅")
-            finally:
-                # Cleanup remote files and destroy VM
-                with contextlib.suppress(Exception):
+                try:
+                    # Prepare remote dirs
+                    remote_input_dir = f"/job/input/{job.job_id}"
+                    remote_output_dir = f"/job/output/{job.job_id}"
+                    remote_logs_dir = "/job/logs"
                     await run_ssh_command(
                         conn,
-                        f"rm -rf /job/input/{job.job_id} /job/output/{job.job_id}",
-                        timeout=60,
+                        f"mkdir -p {remote_input_dir} {remote_output_dir} {remote_logs_dir}",
                     )
-                conn.close()
+
+                    # Upload file
+                    await self._set_status(app, job, "Uploading...")
+                    remote_input_path = (
+                        f"{remote_input_dir}/{sanitize_filename(job.original_filename)}"
+                    )
+                    await asyncssh.scp(
+                        str(job.local_input_path),
+                        (conn, remote_input_path),
+                        recurse=False,
+                        preserve=True,
+                    )
+
+                    if job.cancel_event.is_set():
+                        await self._set_status(app, job, "Canceled")
+                        return
+
+                    # Run transcription
+                    await self._set_status(app, job, "Transcribing…")
+                    cmd = (
+                        f"uv run /opt/telemuze/composer.py "
+                        f"--in {sh_quote(remote_input_path)} "
+                        f"--model {sh_quote(job.model)} "
+                        f"--language {sh_quote(job.language)} "
+                        f"--job-id {sh_quote(job.job_id)}"
+                    )
+                    # Wrap with timeout
+                    json_result = await run_ssh_command_with_json(
+                        conn, cmd, timeout=JOB_TIMEOUT_SEC
+                    )
+
+                    if job.cancel_event.is_set():
+                        await self._set_status(app, job, "Canceled")
+                        return
+
+                    if not json_result.get("ok"):
+                        err = json_result.get("error", "Transcription failed")
+                        await self._send_error_reply(
+                            app, job, f"Transcription failed: {err}"
+                        )
+                        return
+
+                    text_path = json_result.get("text_path")
+                    if not text_path:
+                        await self._send_error_reply(
+                            app, job, "No transcript produced."
+                        )
+                        return
+
+                    # Fetch transcript text via cat
+                    transcript_text = await run_ssh_command(
+                        conn,
+                        f"cat {sh_quote(text_path)}",
+                        timeout=SSH_CMD_IDLE_TIMEOUT_SEC,
+                    )
+
+                    # Send transcript to Telegram
+                    await self._send_transcript_reply(app, job, transcript_text)
+
+                    await self._set_status(app, job, "Done ✅")
+                finally:
+                    # Cleanup remote files
+                    with contextlib.suppress(Exception):
+                        await run_ssh_command(
+                            conn,
+                            f"rm -rf /job/input/{job.job_id} /job/output/{job.job_id}",
+                            timeout=60,
+                        )
+                    conn.close()
+            finally:
+                # and destroy VM
                 await destroy_composer(job.vm_name)
 
             # Cleanup local
@@ -519,9 +530,8 @@ async def provision_composer(vm_name: str) -> str:
     - Retrieve the assigned public IP or DNS name
     """
     log.info("Provisioning VM %s", vm_name)
-    # Assumes tfcmd accepts a name; if not, consider a single-name strategy or extend tfcmd API.
     vm_info = await asyncio.to_thread(
-        tfcmd.deploy_vm, vm_name, ssh=SSH_KEY_PATH, node=TF_NODE_ID
+        tfcmd.deploy_vm, vm_name, ssh=str(SSH_PUB_PATH), node=TF_NODE_ID
     )
     vm_ip = vm_info.get("mycelium_ip")
     if not vm_ip:
@@ -624,7 +634,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(
         "Hi! Send me an audio or video, and I’ll transcribe it.\n"
         "Commands:\n"
-        "/model <tiny|base|small|medium|large-v3>\n"
+        "/model <tiny|base|small|medium|large-v3|turbo>\n"
         "/language <auto|en|es|de|...>\n"
         "/settings to view your current settings."
     )
@@ -647,7 +657,7 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-MODEL_CHOICES = {"tiny", "base", "small", "medium", "large-v3"}
+MODEL_CHOICES = {"tiny", "base", "small", "medium", "large-v3", "turbo"}
 
 
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -823,7 +833,7 @@ async def cache_warmer_task(app: Application):
             now = time.time()
             idle_sec = now - scheduler.last_activity_ts
             if idle_sec > CACHE_WARM_INTERVAL_MIN * 60 and scheduler.queue.empty():
-                vm_name = f"composer-warm-{int(now)}"
+                vm_name = f"cmpwrm{int(now)}"
                 log.info("Running cache warmer: %s", vm_name)
                 try:
                     vm_ip = await provision_composer(vm_name)

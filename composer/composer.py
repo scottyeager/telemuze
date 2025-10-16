@@ -11,6 +11,7 @@ import uuid
 LOG_DIR = "/job/logs"
 OUT_ROOT = "/job/output"
 IN_ROOT = "/job/input"
+MODEL_DIR = "/models"
 
 
 def eprint(*args, **kwargs):
@@ -117,13 +118,21 @@ def main():
             )
             log_fh.flush()
             model = whisperx.load_model(
-                args.model, device=device, compute_type=compute_type
+                args.model,
+                device=device,
+                compute_type=compute_type,
+                download_root=MODEL_DIR,
             )
 
             audio = whisperx.load_audio(wav_path)
             lang = None if args.language == "auto" else args.language
             result = model.transcribe(audio, language=lang)
-            text = (result.get("text") or "").strip()
+
+            # TODO: we can get start/end timestamps and other goodies from segments
+            # result: {'segments': [{'text': "...", 'start': 0.031, 'end': 2.107}], 'language': 'en'}
+            text = "\n".join(
+                s["text"].strip() for s in result.get("segments", []) if "text" in s
+            )
 
             with open(txt_path, "w", encoding="utf-8") as f:
                 f.write(text)

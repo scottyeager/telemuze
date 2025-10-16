@@ -15,24 +15,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install uv
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+RUN uv venv /.venv
+
 # Python deps: PyTorch CPU wheels, WhisperX, and friends
 # Important: install torch/torchaudio from the PyTorch CPU index first
-RUN pip3 install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu \
-    torch==2.3.* torchvision==0.18.* torchaudio==2.3.*
-
-RUN pip3 install --no-cache-dir \
-    whisperx==3.1.* \
-    numpy \
-    orjson==3.* \
-    tqdm
+RUN uv pip install \
+    --index https://download.pytorch.org/whl/cpu \
+    torchaudio~=2.8.0 whisperx
 
 # Runtime directories
 RUN mkdir -p /job/input /job/output /job/logs /models /opt/telemuze
 
-# Copy SSH-invoked scripts
-COPY composer/transcribe.sh /usr/local/bin/transcribe.sh
-COPY composer/run_transcribe.py /opt/telemuze/run_transcribe.py
-RUN chmod +x /usr/local/bin/transcribe.sh && chown -R transcriber:transcriber /opt/telemuze
+COPY composer/load_models.py /opt/telemuze/
+
+# Cache models so they are there immediately on deployment
+RUN uv run /opt/telemuze/load_models.py
+
+# Do this last so we don't have to cache models again if we change it
+COPY composer/composer.py /opt/telemuze/
 
 # No ENTRYPOINT/CMD. Listener will SSH in and run:
 # /usr/local/bin/transcribe.sh --in <remote_input_path> --model <model> --language <lang>
