@@ -61,6 +61,9 @@ if not TELEGRAM_BOT_TOKEN:
     print("ERROR: TELEGRAM_BOT_TOKEN is required", file=sys.stderr)
     sys.exit(1)
 
+# Override composer IP for development
+COMPOSER_IP_OVERRIDE = os.environ.get("COMPOSER_IP_OVERRIDE")
+
 # Deployment info for composers
 TF_MNEMONIC = os.environ.get("TF_MNEMONIC", "")
 if not TF_MNEMONIC:
@@ -93,7 +96,10 @@ if not ALLOWED_USERNAMES and not ALLOWED_USER_IDS:
     )
     sys.exit(1)
 
-COMPOSER_FLIST = os.environ.get("COMPOSER_FLIST", "")
+COMPOSER_FLIST = os.environ.get(
+    "COMPOSER_FLIST",
+    "https://hub.threefold.me/scott.3bot/scottyeager-telemuze-composer-latest.flist",
+)
 COMPOSER_CPUS = int(os.environ.get("COMPOSER_CPUS", "4"))
 # Memory in GB
 COMPOSER_RAM = int(os.environ.get("COMPOSER_RAM", "8"))
@@ -380,7 +386,7 @@ class Scheduler:
                     # Run transcription
                     await self._set_status(app, job, "Transcribing…")
                     cmd = (
-                        f"uv run /opt/telemuze/composer.py "
+                        f"/usr/bin/uv run /opt/telemuze/composer.py "
                         f"--in {sh_quote(remote_input_path)} "
                         f"--model {sh_quote(job.model)} "
                         f"--language {sh_quote(job.language)} "
@@ -529,6 +535,10 @@ async def provision_composer(vm_name: str) -> str:
     - Inject the SSH public key into the VM's authorized_keys
     - Retrieve the assigned public IP or DNS name
     """
+    if COMPOSER_IP_OVERRIDE:
+        log.info("Using override composer IP: %s", COMPOSER_IP_OVERRIDE)
+        return COMPOSER_IP_OVERRIDE
+
     log.info("Provisioning VM %s", vm_name)
     vm_info = await asyncio.to_thread(
         tfcmd.deploy_vm, vm_name, ssh=str(SSH_PUB_PATH), node=TF_NODE_ID
@@ -541,6 +551,10 @@ async def provision_composer(vm_name: str) -> str:
 
 
 async def destroy_composer(vm_name: str):
+    if COMPOSER_IP_OVERRIDE:
+        log.info("Skipping VM destruction for override composer")
+        return
+
     log.info("Destroying VM %s", vm_name)
     with contextlib.suppress(Exception):
         await asyncio.to_thread(tfcmd.cancel_vm, vm_name)
@@ -870,7 +884,10 @@ async def on_startup(app: Application):
     # Start scheduler
     app.bot_data["scheduler_task"] = asyncio.create_task(scheduler.run(app))
     # Start cache warmer
-    app.bot_data["warmer_task"] = asyncio.create_task(cache_warmer_task(app))
+    if COMPOSER_IP_OVERRIDE:
+        log.info("Composer IP override set; cache warmer disabled.")
+    else:
+        app.bot_data["warmer_task"] = asyncio.create_task(cache_warmer_task(app))
 
 
 async def on_shutdown(app: Application):
