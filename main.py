@@ -100,6 +100,10 @@ COMPOSER_FLIST = os.environ.get(
     "COMPOSER_FLIST",
     "https://hub.threefold.me/scott.3bot/scottyeager-telemuze-composer-latest.flist",
 )
+COMPOSER_ENTRYPOINT = os.environ.get(
+    "COMPOSER_ENTRYPOINT",
+    "/sbin/zinit init",
+)
 COMPOSER_CPUS = int(os.environ.get("COMPOSER_CPUS", "4"))
 # Memory in GB
 COMPOSER_RAM = int(os.environ.get("COMPOSER_RAM", "8"))
@@ -541,7 +545,14 @@ async def provision_composer(vm_name: str) -> str:
 
     log.info("Provisioning VM %s", vm_name)
     vm_info = await asyncio.to_thread(
-        tfcmd.deploy_vm, vm_name, ssh=str(SSH_PUB_PATH), node=TF_NODE_ID
+        tfcmd.deploy_vm,
+        vm_name,
+        ssh=str(SSH_PUB_PATH),
+        node=TF_NODE_ID,
+        flist=COMPOSER_FLIST,
+        cpu=COMPOSER_CPUS,
+        memory=COMPOSER_RAM,
+        entrypoint=COMPOSER_ENTRYPOINT,
     )
     vm_ip = vm_info.get("mycelium_ip")
     if not vm_ip:
