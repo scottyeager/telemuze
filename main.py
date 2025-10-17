@@ -132,8 +132,12 @@ STATE_DIR.mkdir(parents=True, exist_ok=True)
 TMP_DIR = Path(os.environ.get("TELEMUZE_TMP_DIR", "/tmp/telemuze"))
 TMP_DIR.mkdir(parents=True, exist_ok=True)
 
-SSH_KEY_PATH = STATE_DIR / "id_ed25519"
-SSH_PUB_PATH = STATE_DIR / "id_ed25519.pub"
+SSH_KEY_OVERRIDE_PATH = os.environ.get("SSH_KEY_OVERRIDE_PATH")
+if SSH_KEY_OVERRIDE_PATH:
+    SSH_KEY_PATH = Path(SSH_KEY_OVERRIDE_PATH).expanduser().resolve()
+else:
+    SSH_KEY_PATH = STATE_DIR / "id_ed25519"
+SSH_PUB_PATH = Path(f"{SSH_KEY_PATH}.pub")
 KNOWN_HOSTS_PATH = STATE_DIR / "known_hosts"
 COMPOSER_USERNAME = "root"
 
@@ -222,6 +226,17 @@ def set_user_language(user_id: int, username: Optional[str], language: str) -> N
 
 
 def ensure_ssh_keypair():
+    if SSH_KEY_OVERRIDE_PATH:
+        if not SSH_KEY_PATH.exists():
+            log.critical("SSH key override path %s does not exist.", SSH_KEY_PATH)
+            sys.exit(1)
+        if not SSH_PUB_PATH.exists():
+            log.warning(
+                "SSH public key %s not found for override key. Deployment may fail if needed.",
+                SSH_PUB_PATH,
+            )
+        return
+
     if SSH_KEY_PATH.exists() and SSH_PUB_PATH.exists():
         return
     log.info("Generating SSH keypair at %s", SSH_KEY_PATH)
