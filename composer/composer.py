@@ -80,7 +80,11 @@ def main():
     os.makedirs(in_dir, exist_ok=True)
 
     basename = pathlib.Path(in_path).name
-    wav_path = os.path.join(in_dir, f"{basename.rsplit('.', 1)[0]}.wav")
+    stem, ext = os.path.splitext(basename)
+    if ext.lower() == ".wav":
+        wav_path = os.path.join(in_dir, f"{stem}_converted.wav")
+    else:
+        wav_path = os.path.join(in_dir, f"{stem}.wav")
     txt_path = os.path.join(out_dir, "transcript.txt")
     log_path = os.path.join(LOG_DIR, f"{job_id}.log")
 
