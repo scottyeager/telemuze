@@ -657,10 +657,7 @@ def sanitize_filename(name: str) -> str:
 def is_user_allowed(username: Optional[str], user_id: int) -> bool:
     if ALLOWED_USER_IDS and user_id in ALLOWED_USER_IDS:
         return True
-    if ALLOWED_USERNAMES and (username or "").lower() in ALLOWED_USERNAMES:
-        return True
-    # If no allowlists set, allow all by default
-    if not ALLOWED_USER_IDS and not ALLOWED_USERNAMES:
+    if ALLOWED_USERNAMES and (username or "") in ALLOWED_USERNAMES:
         return True
     return False
 
@@ -902,10 +899,8 @@ async def cache_warmer_task(app: Application):
 async def on_startup(app: Application):
     _db_init()
     ensure_ssh_keypair()
-    log.info("Allowed usernames: %s", ", ".join(sorted(ALLOWED_USERNAMES)) or "(any)")
-    log.info(
-        "Allowed user IDs: %s", ", ".join(map(str, sorted(ALLOWED_USER_IDS))) or "(any)"
-    )
+    log.info("Allowed usernames: %s", ", ".join(sorted(ALLOWED_USERNAMES)))
+    log.info("Allowed user IDs: %s", ", ".join(map(str, sorted(ALLOWED_USER_IDS))))
 
     # Start scheduler
     app.bot_data["scheduler_task"] = asyncio.create_task(scheduler.run(app))
