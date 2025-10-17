@@ -1,8 +1,43 @@
-Telemuze
+# Telemuze
 
-What it is
-- Telegram bot that transcribes audio/video to plain text using WhisperX.
-- Architecture: one long-lived listener VM (bot) provisions short-lived composer VMs to do CPU-only transcription over SSH.
+Telemuze is a Telegram bot that transcribes audio/video to plain text using WhisperX. It's designed to use VMs on the ThreeFold Grid to do the transcription work. One VM is a long running "listener" that uses minimal resources. When a job arrives, an ephemeral "composer" VM is spawned to do the heavy lifting.
+
+## Quickstart
+
+```
+TODO: Provide instructions here based on prebuilt flists available from TF Hub
+```
+
+## Run with local listener
+
+To run the listener locally, Python can be used directly. Some requirements must be satisfied:
+
+* [`tfcmd`](https://github.com/threefoldtech/tfgrid-sdk-go/tree/development/grid-cli) is installed (or using local composer)
+* TF Chain account funded and ready to create deployments
+* A Telegram bot (see @BotFather)
+* [uv](https://github.com/astral-sh/uv) (you can get by without it if you know what you're doing, but really, it's great)
+
+Make a venv, install the dependencies, and run the code with minimal config:
+
+```bash
+uv venv
+uv pip install listener/requirements.text
+TELEGRAM_BOT_TOKEN="ABC:123" TF_MNEMONIC="your words here" TF_NODE_ID="13" ALLOWED_USERNAMES="your_tg_username" uv run main.py
+```
+
+The node id will be used to deploy the composers that will perform the transcription. It's also possible to use a predeployed composer, such as a Docker container, via an override IP as described below. There are many more config parameters--see the top of `main.py` for reference.
+
+Telemuze will put some files under `~/.telemuze` if you run the listener locally. Sry, will fix that later.
+
+## Composer override
+
+Mainly for testing purposes, it's possible to configure an IP address to be used as the composer. This could be a Docker container, which is useful for local testing.
+
+Set `COMPOSER_IP_OVERRIDE`, and then the listener won't attempt to deploy a composer. It will instead simply attempt to connect to the provided IP address over SSH.
+
+There's also `SSH_KEY_OVERRIDE_PATH`, to set the path to an SSH private key file to use when connecting to the composer VM. Telemuze generates its own SSH key on first run and stores it under `~/.telemuze` for subsequent runs. Just using that probably makes more sense than overriding the key. This might be removed later.
+
+You are responsible for making sure the SSH key that the listener uses has been loaded into the composer, when using an override IP. The composer image doesn't have anything fancy to help with that, yet. Under normal operation, the listener will inject its key into the composer VM.
 
 ## Docker images
 
@@ -14,100 +49,7 @@ Here's an example of building the containers for local use. To push them remotel
 ```
 docker buildx build -t telemuze-listener -f listener/Dockerfile .
 ```
-- Composer:
+- Composer
 ```
 docker buildx build -t telemuze-listener -f composer/Dockerfile .
 ```
-
-## Deploy the listener VM using tfcmd (CLI)
-
-Prereqs
-- You have `tfcmd` configured with your `TF_MNEMONIC` and network access.
-- Your base image starts zinit and sshd automatically.
-
-Minimal zinit service on the VM
-- File: `/etc/zinit/telemuze-listener.yaml`
-- Content:
-  - name: telemuze-listener
-    exec: ["python3", "-m", "listener.main"]
-    env: /etc/zinit/env/telemuze-listener.env
-
-Minimal env file on the VM
-- File: `/etc/zinit/env/telemuze-listener.env`
-- Required:
-  - `TELEGRAM_BOT_TOKEN=123:ABC`
-  - `TF_MNEMONIC="your mnemonic words ..."` (used by the listener to provision composers)
-- Optional (recommended defaults shown):
-  - `TF_NETWORK=main`
-  - `DEFAULT_MODEL=large-v3`
-  - `DEFAULT_LANGUAGE=auto`
-  - `ALLOWED_USERNAMES=alice,bob` (empty = allow all)
-  - `ALLOWED_USER_IDS=`
-  - `MAX_COMPOSERS=3`
-  - `PER_USER_CONCURRENCY=1`
-  - `JOB_TIMEOUT_SEC=10800`
-  - `CACHE_WARM_INTERVAL_MIN=360`
-  - `COMPOSER_USERNAME=transcriber`
-  - `TF_NODE_ID=` and/or `TF_FARM_ID=`
-
-- Deploy with tfcmd (fill in flags to match your tfcmd version):
-  - tfcmd vm deploy \
-      --name telemuze-listener \
-      --image registry.example.com/telemuze-listener:latest \
-      --cpu 2 \
-      --mem 2048 \
-      --disk 10 \
-      --farm-id <FARM_ID> \    # optional
-      --node-id <NODE_ID> \    # optional
-      --user-data @cloud-init-listener.yaml
-
-Option B: deploy then copy files
-- Deploy the VM image:
-  - tfcmd vm deploy --name telemuze-listener --image registry.example.com/telemuze-listener:latest --cpu 2 --mem 2048 --disk 10 [--farm-id ...] [--node-id ...]
-- Get the VM IP:
-  - tfcmd vm ip --name telemuze-listener
-- SSH in and create:
-  - /etc/zinit/env/telemuze-listener.env (as above)
-  - /etc/zinit/telemuze-listener.yaml (as above)
-- Start:
-  - zinit init && zinit update && zinit start telemuze-listener
-
-3) Local testing with Docker (no Grid)
-
-Goal
-- Run a composer container with sshd.
-- Run the listener locally and point it at the composer via `COMPOSER_IP_OVERRIDE`.
-
-Steps
-- Build:
-  - docker build -f Dockerfile.listener -t telemuze-listener:dev .
-  - docker build -f Dockerfile.composer -t telemuze-composer:dev .
-- Start composer:
-  - docker network create telemuze-net || true
-  - docker run -d --name telemuze-composer --network telemuze-net telemuze-composer:dev
-- Authorize the listener’s SSH key on the composer:
-  - mkdir -p ~/.telemuze
-  - [ -f ~/.telemuze/id_ed25519 ] || ssh-keygen -t ed25519 -N "" -f ~/.telemuze/id_ed25519 -C telemuze
-  - docker exec -u root telemuze-composer bash -lc 'useradd -ms /bin/bash transcriber || true; install -d -m 700 ~transcriber/.ssh'
-  - docker cp ~/.telemuze/id_ed25519.pub telemuze-composer:/tmp/id.pub
-  - docker exec -u root telemuze-composer bash -lc 'cat /tmp/id.pub >> ~transcriber/.ssh/authorized_keys; chown -R transcriber:transcriber ~transcriber/.ssh; chmod 600 ~transcriber/.ssh/authorized_keys'
-- Get composer IP:
-  - COMPOSER_IP=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' telemuze-composer)
-- Run listener:
-
-```bash
-docker run --rm -it --name telemuze-listener \
-  -e TELEGRAM_BOT_TOKEN="123:ABC" \
-  -e TF_MNEMONIC="local-testing" \
-  -e TF_NETWORK="main" \
-  -e DEFAULT_MODEL="large-v3" \
-  -e DEFAULT_LANGUAGE="auto" \
-  -e ALLOWED_USERNAMES="your_tg_username" \
-  telemuze-listener
-  ```
-
-Send a voice/audio/video to your bot on Telegram; you should receive a transcript reply.
-
-Notes
-- Replace image names, resources, and tfcmd flags to match your environment.
-- The listener will still try to provision composers via tfcmd; for local-only testing, set `COMPOSER_IP_OVERRIDE` and, if needed, stub the provisioning step in `listener/main.py` to skip tfcmd when the override is present.
