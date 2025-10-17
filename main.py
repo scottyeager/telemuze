@@ -152,6 +152,7 @@ logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("telemuze.listener")
 
 # ----------------------------
@@ -365,6 +366,7 @@ class Scheduler:
 
             try:
                 vm_ip = await provision_composer(vm_name)
+                log.info("VM %s provisioned with IP %s", vm_name, vm_ip)
                 job.vm_ip = vm_ip
 
                 if job.cancel_event.is_set():
