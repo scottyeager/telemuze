@@ -1,0 +1,1 @@
+exec: bash -c "uv run /opt/telemuze/listener.py &>> /var/log/listener.log"

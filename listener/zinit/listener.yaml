@@ -1,1 +1,0 @@
-exec: bash -c "uv run /opt/telemuze/main.py &>> /var/log/telemuze.log"
