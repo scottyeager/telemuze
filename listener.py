@@ -37,6 +37,7 @@ import asyncssh
 # Grid provisioning (assumed available as per user instruction)
 from grid3 import tfcmd as grid3_tfcmd
 from telegram import (
+    Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
@@ -60,6 +61,9 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 if not TELEGRAM_BOT_TOKEN:
     print("ERROR: TELEGRAM_BOT_TOKEN is required", file=sys.stderr)
     sys.exit(1)
+
+TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID")
+TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH")
 
 # Override composer IP for development
 COMPOSER_IP_OVERRIDE = os.environ.get("COMPOSER_IP_OVERRIDE")
@@ -925,9 +929,16 @@ async def on_shutdown(app: Application):
 
 
 def build_application() -> Application:
+    builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
+
+    # Local bot API server support
+    if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+        log.info("Using local Telegram Bot API server")
+        builder.base_url("http://127.0.0.1:8081/bot")
+        builder.base_file_url("http://127.0.0.1:8081/file/bot")
+
     app = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
+        builder
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
@@ -956,7 +967,29 @@ def build_application() -> Application:
     return app
 
 
+async def logout_from_public_api():
+    """
+    If using a local bot API, we must first log out from the public cloud API.
+    """
+    log.info("Deregistering from public Telegram cloud API...")
+    try:
+        bot = Bot(token=TELEGRAM_BOT_TOKEN)
+        if await bot.log_out():
+            log.info("Successfully deregistered from cloud API.")
+        else:
+            # This can happen if already logged out, not necessarily an error.
+            log.warning("Failed to deregister from cloud API (maybe already done).")
+    except Exception as e:
+        log.error("Error deregistering from cloud API: %s", e)
+        # Exit, as the local bot might not get updates otherwise.
+        sys.exit(1)
+
+
 def main():
+    # If using local API server, log out from cloud first
+    if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+        asyncio.run(logout_from_public_api())
+
     app = build_application()
     # Graceful shutdown on SIGINT/SIGTERM
     try:
