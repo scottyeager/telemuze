@@ -39,17 +39,61 @@ There's also `SSH_KEY_OVERRIDE_PATH`, to set the path to an SSH private key file
 
 You are responsible for making sure the SSH key that the listener uses has been loaded into the composer, when using an override IP. The composer image doesn't have anything fancy to help with that, yet. Under normal operation, the listener will inject its key into the composer VM.
 
-## Docker images
+## Telegram Bot API
 
-There are two Dockerfiles, one for each role. These can be used for local testing or for deployment to the ThreeFold Grid as flists.
+Telegram bots usually rely on an API server provided by Telegram. That server offers a convenient interface with Telegram's backend, but it comes with certain restrictions. Most notably for this project, there is a file size limitation of 20mb for files sent to the bot.
 
-Here's an example of building the containers for local use. To push them remotely, you'll need to adjust the tags according to your username on Docker Hub, for example.
+There are basically two ways around these restrictions:
 
-- Listener
+1. Use a client that communicates directly with the Telegram backend (eg, Telethon)
+2. Host a copy of the Bot API server
+
+Telemuze opts for the second path, allowing users to optionally run the API server alongside the bot.
+
+Along with the regular bot token, this also requires obtaining an app id and hash from https://my.telegram.org/
+
+See the next section for how to launch a Bot API server inside the Telemuze Docker image.
+
+## Docker
+
+This repo contains a single Dockerfile that bundles the following:
+
+* Telemuze listener and composer code and dependencies
+* Whisper tiny and turbo models precached
+* Telegram Bot API server prebuilt binary
+
+The Docker image can be used directly or converted into an flist to run as a VM on the ThreeFold Grid. Prebuilt Docker images are available from the [packages section](https://github.com/scottyeager/telemuze/pkgs/container/telemuze) of this repo.
+
+### Building
+
+To build the Dockerfile yourself, run:
+
 ```
-docker buildx build -t telemuze-listener -f listener/Dockerfile .
+docker buildx build -t telemuze .
 ```
-- Composer
-```
-docker buildx build -t telemuze-listener -f composer/Dockerfile .
-```
+
+### Running
+
+Here's a template invocation, showing the required environment variables. Fill in your own values:
+
+docker run \
+  -e TELEGRAM_BOT_TOKEN="ABC:123" \
+  -e TF_MNEMONIC="your threefold mnemonic here" \
+  -e TF_NODE_ID="13" \
+  -e ALLOWED_USERNAMES="your_telegram_username" \
+  telemuze
+
+### Running with Bot API server
+
+To start and use the bundled Bot API server, just add your credentials as follows:
+
+docker run \
+  -e TELEGRAM_BOT_TOKEN="ABC:123" \
+  -e TF_MNEMONIC="your threefold mnemonic here" \
+  -e TF_NODE_ID="13" \
+  -e ALLOWED_USERNAMES="your_telegram_username" \
+  -e TELEGRAM_API_ID="your_api_id" \
+  -e TELEGRAM_API_HASH="your_api_hash" \
+  telemuze
+
+When both the id and hash are present, the server will start automatically and the listener will use it.
