@@ -76,7 +76,7 @@ docker buildx build -t telemuze .
 
 Here's a template invocation, showing the required environment variables. Fill in your own values:
 
-docker run \
+docker run --rm \
   -e TELEGRAM_BOT_TOKEN="ABC:123" \
   -e TF_MNEMONIC="your threefold mnemonic here" \
   -e TF_NODE_ID="13" \
@@ -87,7 +87,7 @@ docker run \
 
 To start and use the bundled Bot API server, just add your credentials as follows:
 
-docker run \
+docker run --rm \
   -e TELEGRAM_BOT_TOKEN="ABC:123" \
   -e TF_MNEMONIC="your threefold mnemonic here" \
   -e TF_NODE_ID="13" \

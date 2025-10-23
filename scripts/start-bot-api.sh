@@ -1,0 +1,8 @@
+#!/bin/sh
+if [ -n "$TELEGRAM_API_ID" ] && [ -n "$TELEGRAM_API_HASH" ]; then
+/usr/local/bin/telegram-bot-api \
+--api-id="$TELEGRAM_API_ID" \
+--api-hash="$TELEGRAM_API_HASH" \
+--http-port=8081 \
+--local
+fi

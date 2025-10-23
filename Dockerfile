@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libsndfile1 \
     openssh-client \
     ca-certificates \
+    libc++1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -23,6 +24,10 @@ RUN  wget https://github.com/threefoldtech/tfgrid-sdk-go/releases/download/v0.16
     tar -xzf tfgrid-sdk-go_Linux_x86_64.tar.gz -C /usr/local/bin tfcmd && \
     chmod +x /usr/local/bin/tfcmd && \
     rm tfgrid-sdk-go_Linux_x86_64.tar.gz
+
+# Download and install Telegram Bot API binary
+RUN wget -O /usr/local/bin/telegram-bot-api https://github.com/scottyeager/Telegram-Bot-API-Builder/releases/latest/download/telegram-bot-api && \
+    chmod +x /usr/local/bin/telegram-bot-api
 
 # Create a single virtual environment
 RUN uv venv /.venv
@@ -50,6 +55,8 @@ RUN uv run /opt/telemuze/load_models.py
 COPY composer.py /opt/telemuze/
 COPY listener.py /opt/telemuze/
 COPY zinit/* /etc/zinit/
+COPY scripts/start-bot-api.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start-bot-api.sh
 
 # Create state dir for SSH keys/db
 RUN mkdir -p /root/.telemuze /tmp/telemuze && chmod 700 /root/.telemuze

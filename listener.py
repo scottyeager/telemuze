@@ -117,7 +117,7 @@ MAX_COMPOSERS = int(os.environ.get("MAX_COMPOSERS", "1"))
 PER_USER_CONCURRENCY = int(os.environ.get("PER_USER_CONCURRENCY", "1"))
 
 # Defaults
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "large-v3")
+DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "turbo")
 DEFAULT_LANGUAGE = os.environ.get("DEFAULT_LANGUAGE", "auto")
 
 # Limits/timeouts
@@ -148,6 +148,12 @@ COMPOSER_USERNAME = "root"
 # Telegram message char limit
 TELEGRAM_TEXT_LIMIT = 4096
 
+LANG_RE = re.compile(r"^[a-z]{2}(-[A-Z]{2})?$")
+
+MODEL_CHOICES = {"tiny", "turbo"}
+
+DB_PATH = STATE_DIR / "db.sqlite"
+
 # ----------------------------
 # Logging
 # ----------------------------
@@ -162,8 +168,6 @@ log = logging.getLogger("telemuze.listener")
 # ----------------------------
 # User settings storage (SQLite)
 # ----------------------------
-
-DB_PATH = STATE_DIR / "db.sqlite"
 
 
 def _db_init():
@@ -542,15 +546,6 @@ class Scheduler:
                     os.unlink(tmp_path)
 
 
-scheduler = Scheduler()
-
-# ----------------------------
-# Grid3 provisioning wrappers
-# ----------------------------
-
-tfcmd = grid3_tfcmd.TFCmd()
-
-
 async def provision_composer(vm_name: str) -> str:
     """
     Provision a composer VM and return its IP address or hostname.
@@ -700,9 +695,6 @@ async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-MODEL_CHOICES = {"tiny", "base", "small", "medium", "large-v3", "turbo"}
-
-
 async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
@@ -712,20 +704,17 @@ async def model_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not context.args:
         await update.effective_message.reply_text(
-            "Usage: /model <tiny|base|small|medium|large-v3>"
+            f"Usage: /model <{'|'.join(MODEL_CHOICES)}>"
         )
         return
     model = context.args[0].strip().lower()
     if model not in MODEL_CHOICES:
         await update.effective_message.reply_text(
-            "Invalid model. Choose one of: tiny, base, small, medium, large-v3"
+            f"Invalid model. Choose one of: {', '.join(MODEL_CHOICES)}"
         )
         return
     set_user_model(user.id, user.username, model)
     await update.effective_message.reply_text(f"Model set to: {model}")
-
-
-LANG_RE = re.compile(r"^[a-z]{2}(-[A-Z]{2})?$")
 
 
 async def language_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -936,13 +925,10 @@ def build_application() -> Application:
         log.info("Using local Telegram Bot API server")
         builder.base_url("http://127.0.0.1:8081/bot")
         builder.base_file_url("http://127.0.0.1:8081/file/bot")
+        builder.local_mode(True)
+        builder.read_timeout(300)
 
-    app = (
-        builder
-        .post_init(on_startup)
-        .post_shutdown(on_shutdown)
-        .build()
-    )
+    app = builder.post_init(on_startup).post_shutdown(on_shutdown).build()
 
     # Commands
     app.add_handler(CommandHandler("start", start_cmd))
@@ -981,11 +967,15 @@ async def logout_from_public_api():
             log.warning("Failed to deregister from cloud API (maybe already done).")
     except Exception as e:
         log.error("Error deregistering from cloud API: %s", e)
-        # Exit, as the local bot might not get updates otherwise.
-        sys.exit(1)
 
 
 def main():
+    global scheduler, tfcmd
+    scheduler = Scheduler()
+
+    tfcmd = grid3_tfcmd.TFCmd()
+    tfcmd.login(TF_MNEMONIC)
+
     # If using local API server, log out from cloud first
     if TELEGRAM_API_ID and TELEGRAM_API_HASH:
         asyncio.run(logout_from_public_api())
