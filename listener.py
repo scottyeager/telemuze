@@ -111,6 +111,8 @@ COMPOSER_ENTRYPOINT = os.environ.get(
 COMPOSER_CPUS = int(os.environ.get("COMPOSER_CPUS", "4"))
 # Memory in GB
 COMPOSER_RAM = int(os.environ.get("COMPOSER_RAM", "8"))
+# Root FS size in GB
+COMPOSER_ROOTFS = int(os.environ.get("COMPOSER_ROOTFS", "20"))
 
 # Concurrency (TODO: remove. We only support one composer)
 MAX_COMPOSERS = int(os.environ.get("MAX_COMPOSERS", "1"))
@@ -568,6 +570,7 @@ async def provision_composer(vm_name: str) -> str:
         flist=COMPOSER_FLIST,
         cpu=COMPOSER_CPUS,
         memory=COMPOSER_RAM,
+        rootfs=COMPOSER_ROOTFS,
         entrypoint=COMPOSER_ENTRYPOINT,
     )
     vm_ip = vm_info.get("mycelium_ip")
