@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 import string
 import subprocess
@@ -915,7 +916,58 @@ async def cache_warmer_task(app: Application):
 # ----------------------------
 
 
+async def cleanup_leftovers():
+    """Cleans up leftover VMs and temporary files from previous runs."""
+    # Clean up old temp files
+    log.info("Cleaning up temporary file directory: %s", TMP_DIR)
+    try:
+        if TMP_DIR.exists():
+            shutil.rmtree(TMP_DIR)
+        TMP_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        log.error("Failed to clean up temporary directory %s: %s", TMP_DIR, e)
+
+    # Clean up old VMs
+    if COMPOSER_IP_OVERRIDE:
+        log.info("Composer IP override set; skipping VM cleanup.")
+        return
+
+    log.info("Searching for leftover composer VMs...")
+    try:
+        # Assumes tfcmd.list() returns a list of deployment names
+        all_deployments = await asyncio.to_thread(tfcmd.list)
+        composer_vms = [name for name in all_deployments if name.startswith("cmp")]
+
+        if not composer_vms:
+            log.info("No leftover composer VMs found.")
+            return
+
+        log.info(
+            "Found %d leftover composer VMs: %s",
+            len(composer_vms),
+            ", ".join(composer_vms),
+        )
+        cleanup_tasks = [destroy_composer(vm_name) for vm_name in composer_vms]
+        results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+
+        for vm_name, result in zip(composer_vms, results):
+            if isinstance(result, Exception):
+                log.error("Failed to destroy leftover VM %s: %s", vm_name, result)
+            else:
+                log.info("Cleaned up leftover VM: %s", vm_name)
+
+    except AttributeError:
+        log.error(
+            "Failed to clean up leftover VMs: `tfcmd.list` method not found. Please check grid3.tfcmd library version."
+        )
+    except Exception as e:
+        log.error("Failed to clean up leftover VMs: %s", e)
+
+
 async def on_startup(app: Application):
+    # Disabled until we can check the implementation
+    # await cleanup_leftovers()
+
     _db_init()
     ensure_ssh_keypair()
     log.info("Allowed usernames: %s", ", ".join(sorted(ALLOWED_USERNAMES)))
