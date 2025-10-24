@@ -294,6 +294,7 @@ class Job:
     model: str
     language: str
     status_message_id: Optional[int] = None
+    preliminary_message_id: Optional[int] = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     # runtime fields
@@ -518,45 +519,87 @@ class Scheduler:
     ):
         text = transcript_text.strip()
         if not text:
-            await app.bot.send_message(
-                chat_id=job.chat_id,
-                text="ℹ️ Transcription completed, but no speech was detected.",
-                reply_to_message_id=job.original_message_id,
-            )
-            return
-
-        if len(text) <= TELEGRAM_TEXT_LIMIT:
-            await app.bot.send_message(
-                chat_id=job.chat_id,
-                text=text,
-                reply_to_message_id=job.original_message_id,
-            )
-        else:
-            # Send truncated text first
-            truncated = text[:TELEGRAM_TEXT_LIMIT]
-            await app.bot.send_message(
-                chat_id=job.chat_id,
-                text=truncated,
-                reply_to_message_id=job.original_message_id,
-            )
-            # Attach full transcript as .txt
-            with tempfile.NamedTemporaryFile(
-                "w+", encoding="utf-8", delete=False, suffix=".txt"
-            ) as tf:
-                tf.write(text)
-                tmp_path = tf.name
-            try:
-                await app.bot.send_document(
+            # If there's a preliminary message, edit it. Otherwise, send a new one.
+            if job.preliminary_message_id:
+                await app.bot.edit_message_text(
                     chat_id=job.chat_id,
-                    document=InputFile(
-                        tmp_path, filename=f"transcript-{job.job_id}.txt"
-                    ),
-                    caption="Full transcript",
+                    message_id=job.preliminary_message_id,
+                    text="ℹ️ Transcription completed, but no speech was detected.",
+                )
+            else:
+                await app.bot.send_message(
+                    chat_id=job.chat_id,
+                    text="ℹ️ Transcription completed, but no speech was detected.",
                     reply_to_message_id=job.original_message_id,
                 )
-            finally:
-                with contextlib.suppress(Exception):
-                    os.unlink(tmp_path)
+            return
+
+        # If we have a preliminary message, we edit it.
+        if job.preliminary_message_id:
+            if len(text) <= TELEGRAM_TEXT_LIMIT:
+                await app.bot.edit_message_text(
+                    chat_id=job.chat_id,
+                    message_id=job.preliminary_message_id,
+                    text=text,
+                )
+            else:
+                # Send truncated text in the edited message
+                truncated = text[:TELEGRAM_TEXT_LIMIT]
+                await app.bot.edit_message_text(
+                    chat_id=job.chat_id,
+                    message_id=job.preliminary_message_id,
+                    text=truncated,
+                )
+                # Attach full transcript as a new message, replying to the original
+                with tempfile.NamedTemporaryFile(
+                    "w+", encoding="utf-8", delete=False, suffix=".txt"
+                ) as tf:
+                    tf.write(text)
+                    tmp_path = tf.name
+                try:
+                    await app.bot.send_document(
+                        chat_id=job.chat_id,
+                        document=InputFile(
+                            tmp_path, filename=f"transcript-{job.job_id}.txt"
+                        ),
+                        caption="Full transcript",
+                        reply_to_message_id=job.original_message_id,
+                    )
+                finally:
+                    with contextlib.suppress(Exception):
+                        os.unlink(tmp_path)
+        else:
+            # Standard behavior: send as a new message
+            if len(text) <= TELEGRAM_TEXT_LIMIT:
+                await app.bot.send_message(
+                    chat_id=job.chat_id,
+                    text=text,
+                    reply_to_message_id=job.original_message_id,
+                )
+            else:
+                truncated = text[:TELEGRAM_TEXT_LIMIT]
+                await app.bot.send_message(
+                    chat_id=job.chat_id,
+                    text=truncated,
+                    reply_to_message_id=job.original_message_id,
+                )
+                with tempfile.NamedTemporaryFile(
+                    "w+", encoding="utf-8", delete=False, suffix=".txt"
+                ) as tf:
+                    tf.write(text)
+                    tmp_path = tf.name
+                try:
+                    await app.bot.send_document(
+                        chat_id=job.chat_id,
+                        document=InputFile(
+                            tmp_path, filename=f"transcript-{job.job_id}.txt"
+                        ),
+                        caption="Full transcript",
+                        reply_to_message_id=job.original_message_id,
+                    )
+                finally:
+                    with contextlib.suppress(Exception):
+                        os.unlink(tmp_path)
 
 
 async def provision_composer(vm_name: str) -> str:
@@ -780,6 +823,105 @@ async def cancel_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text("Unable to cancel.")
 
 
+async def run_local_transcription(job: Job) -> Optional[Path]:
+    """Run composer.py locally for a quick first pass."""
+    try:
+        # We need to set environment variables to override the default /job/* paths
+        # since we're running this on the listener VM, not in a composer.
+        local_job_dir = TMP_DIR / job.job_id
+        local_out_dir = local_job_dir / "output"
+        local_log_dir = local_job_dir / "logs"
+        local_out_dir.mkdir(parents=True, exist_ok=True)
+        local_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # The composer.py script expects to be run from the project root.
+        project_root = Path(__file__).parent.resolve()
+        composer_script = project_root / "composer.py"
+
+        cmd = [
+            sys.executable,
+            str(composer_script),
+            "--in",
+            str(job.local_input_path),
+            "--model",
+            "tiny",  # Always use tiny for the fast pass
+            "--language",
+            job.language,
+            "--job-id",
+            job.job_id,
+        ]
+
+        env = os.environ.copy()
+        env["JOB_ID"] = job.job_id
+        env["OUT_ROOT"] = str(local_out_dir)
+        env["LOG_DIR"] = str(local_log_dir)
+        # We don't need to override IN_ROOT as the full path is passed.
+
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            log.error(
+                "Local transcription failed for job %s: %s",
+                job.job_id,
+                stderr.decode(),
+            )
+            return None
+
+        # The last line of stdout should be the JSON result
+        lines = stdout.decode().strip().splitlines()
+        if not lines:
+            log.error("Local transcription produced no output for job %s", job.job_id)
+            return None
+
+        result = json.loads(lines[-1])
+        if result.get("ok") and result.get("text_path"):
+            return Path(result["text_path"])
+        else:
+            log.error(
+                "Local transcription failed for job %s: %s",
+                job.job_id,
+                result.get("error", "Unknown error"),
+            )
+            return None
+
+    except Exception as e:
+        log.exception("Error running local transcription for job %s: %s", job.job_id, e)
+        return None
+
+
+async def _update_preliminary_transcript(
+    app: Application, job: Job, preliminary_msg_id: int
+):
+    """Task to run local transcription and update the preliminary message."""
+    transcript_path = await run_local_transcription(job)
+    if transcript_path and transcript_path.exists():
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            text = f.read().strip()
+        if text:
+            # Note: We don't do the full text splitting logic here,
+            # just send the preliminary text, truncated if necessary.
+            # The final reply will handle it properly.
+            if len(text) > TELEGRAM_TEXT_LIMIT:
+                text = text[: TELEGRAM_TEXT_LIMIT - 3] + "..."
+            await app.bot.edit_message_text(
+                chat_id=job.chat_id,
+                message_id=preliminary_msg_id,
+                text=f"**Preliminary Transcript (tiny model):**\n\n{text}",
+            )
+        else:
+            await app.bot.edit_message_text(
+                chat_id=job.chat_id,
+                message_id=preliminary_msg_id,
+                text="ℹ️ Preliminary transcript was empty.",
+            )
+
+
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     user = update.effective_user
@@ -789,7 +931,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text("Access denied.")
         return
 
-    # Identify the file
     tg_file_id, inferred_name = extract_file_id_and_name(message)
     if not tg_file_id:
         await message.reply_text(
@@ -797,16 +938,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Fetch user settings
     model, lang = get_user_settings(user.id, user.username)
-
-    # Prepare local path
     job_id = str(uuid.uuid4())
     job_dir = TMP_DIR / job_id / "input"
     job_dir.mkdir(parents=True, exist_ok=True)
     local_path = job_dir / inferred_name
 
-    # Download from Telegram
     status_msg = await message.reply_text(
         "Downloading...", reply_to_message_id=message.message_id
     )
@@ -817,13 +954,6 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log.exception("Download failed: %s", e)
         await status_msg.edit_text("Failed to download the file from Telegram.")
         return
-
-    # Queue job and send status
-    pos = scheduler.queue_position()
-    await status_msg.edit_text(
-        f"Queued (position {pos})",
-        reply_markup=build_cancel_keyboard(job_id),
-    )
 
     job = Job(
         job_id=job_id,
@@ -837,7 +967,31 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         language=lang,
         status_message_id=status_msg.message_id,
     )
+
+    # --- Two-phase transcription logic ---
+    preliminary_task = None
+    if model == "turbo":
+        preliminary_msg = await message.reply_text(
+            "Generating preliminary transcript (tiny model)...",
+            reply_to_message_id=message.message_id,
+        )
+        job.preliminary_message_id = preliminary_msg.message_id
+        preliminary_task = asyncio.create_task(
+            _update_preliminary_transcript(context.application, job, preliminary_msg.message_id)
+        )
+
+    # We always queue the main job, regardless of whether a preliminary one was started.
+    pos = scheduler.queue_position()
+    await status_msg.edit_text(
+        f"Queued (position {pos})",
+        reply_markup=build_cancel_keyboard(job_id),
+    )
     await scheduler.submit(job)
+
+    if preliminary_task:
+        # We can optionally wait for the preliminary task to finish here if we want to
+        # ensure it completes before the function returns, but it's not strictly necessary.
+        pass
 
 
 def extract_file_id_and_name(message) -> Tuple[Optional[str], str]:
