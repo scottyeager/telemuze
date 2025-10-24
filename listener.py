@@ -1079,8 +1079,8 @@ async def cache_warmer_task(app: Application):
                         try:
                             await run_ssh_command(
                                 conn,
-                                "/usr/local/bin/reset-model-atimes.sh",
-                                timeout=120,
+                                "/usr/bin/uv run /opt/telemuze/load_models.py",
+                                timeout=300,
                             )
                         finally:
                             conn.close()
@@ -1093,16 +1093,17 @@ async def cache_warmer_task(app: Application):
                 else:
                     try:
                         proc = await asyncio.create_subprocess_exec(
-                            "/usr/local/bin/reset-model-atimes.sh",
+                            "/usr/bin/uv run",
+                            "/opt/telemuze/load_models.py",
                         )
                         rc = await proc.wait()
                         if rc != 0:
                             log.warning(
-                                "Local reset-model-atimes.sh failed with exit code %d",
+                                "Local load_models.py failed with exit code %d",
                                 rc,
                             )
                     except Exception as e:
-                        log.warning("Local reset-model-atimes.sh failed: %s", e)
+                        log.warning("Local load_models.py failed: %s", e)
                 # Reset last activity to now to avoid back-to-back warmers
                 scheduler.last_cache_warm_ts = time.time()
             await asyncio.sleep(60)

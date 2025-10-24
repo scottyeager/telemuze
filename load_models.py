@@ -1,5 +1,7 @@
 # We want to cache the model(s) inside the Docker image, so that we can cache
 # them on the node. See here for available models and stats: https://github.com/openai/whisper?tab=readme-ov-file#available-models-and-languages
+# This script can also be used to warm the cache after deployment, by forcing
+# the node to load the models
 
 
 import whisperx

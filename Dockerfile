@@ -57,8 +57,7 @@ COPY zinit/* /etc/zinit/
 
 # Copy and make scripts executable
 COPY scripts/start-bot-api.sh /usr/local/bin/
-COPY scripts/reset-model-atimes.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/start-bot-api.sh /usr/local/bin/reset-model-atimes.sh
+RUN chmod +x /usr/local/bin/start-bot-api.sh
 
 # Create remaining dirs here, to avoid busting cache if we need to add some
 RUN mkdir -p /job/input \
