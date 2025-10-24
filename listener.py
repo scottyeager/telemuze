@@ -380,104 +380,94 @@ class Scheduler:
             vm_name = f"cmp{job.job_id[:8]}"
             job.vm_name = vm_name
 
+            vm_ip = await provision_composer(vm_name)
+            log.info("VM %s provisioned with IP %s", vm_name, vm_ip)
+            job.vm_ip = vm_ip
+
+            if job.cancel_event.is_set():
+                await self._set_status(app, job, "Canceled")
+                return
+
+            # Connect via SSH (retry while VM boots)
+            await self._set_status(app, job, "Connecting to worker…")
+            conn = await connect_ssh_with_retries(vm_ip)
+
             try:
-                vm_ip = await provision_composer(vm_name)
-                log.info("VM %s provisioned with IP %s", vm_name, vm_ip)
-                job.vm_ip = vm_ip
+                # Prepare remote dirs
+                remote_input_dir = f"/job/input/{job.job_id}"
+                remote_output_dir = f"/job/output/{job.job_id}"
+                remote_logs_dir = "/job/logs"
+                await run_ssh_command(
+                    conn,
+                    f"mkdir -p {remote_input_dir} {remote_output_dir} {remote_logs_dir}",
+                )
+
+                # Upload file
+                await self._set_status(app, job, "Uploading...")
+                remote_input_path = (
+                    f"{remote_input_dir}/{sanitize_filename(job.original_filename)}"
+                )
+                await asyncssh.scp(
+                    str(job.local_input_path),
+                    (conn, remote_input_path),
+                    recurse=False,
+                    preserve=True,
+                )
 
                 if job.cancel_event.is_set():
                     await self._set_status(app, job, "Canceled")
-                    self._cleanup_local(job)
                     return
 
-                # Connect via SSH (retry while VM boots)
-                await self._set_status(app, job, "Connecting to worker…")
-                conn = await connect_ssh_with_retries(vm_ip)
+                # Run transcription
+                await self._set_status(app, job, "Transcribing…")
+                cmd = (
+                    f"/usr/bin/uv run /opt/telemuze/composer.py "
+                    f"--in {sh_quote(remote_input_path)} "
+                    f"--model {sh_quote(job.model)} "
+                    f"--language {sh_quote(job.language)} "
+                    f"--job-id {sh_quote(job.job_id)}"
+                )
+                # Wrap with timeout
+                json_result = await run_ssh_command_with_json(
+                    conn, cmd, timeout=JOB_TIMEOUT_SEC
+                )
 
-                try:
-                    # Prepare remote dirs
-                    remote_input_dir = f"/job/input/{job.job_id}"
-                    remote_output_dir = f"/job/output/{job.job_id}"
-                    remote_logs_dir = "/job/logs"
+                if job.cancel_event.is_set():
+                    await self._set_status(app, job, "Canceled")
+                    return
+
+                if not json_result.get("ok"):
+                    err = json_result.get("error", "Transcription failed")
+                    await self._send_error_reply(
+                        app, job, f"Transcription failed: {err}"
+                    )
+                    return
+
+                text_path = json_result.get("text_path")
+                if not text_path:
+                    await self._send_error_reply(app, job, "No transcript produced.")
+                    return
+
+                # Fetch transcript text via cat
+                transcript_text = await run_ssh_command(
+                    conn,
+                    f"cat {sh_quote(text_path)}",
+                    timeout=SSH_CMD_IDLE_TIMEOUT_SEC,
+                )
+
+                # Send transcript to Telegram
+                await self._send_transcript_reply(app, job, transcript_text)
+
+                await self._set_status(app, job, "Done ✅")
+            finally:
+                # Cleanup remote files
+                with contextlib.suppress(Exception):
                     await run_ssh_command(
                         conn,
-                        f"mkdir -p {remote_input_dir} {remote_output_dir} {remote_logs_dir}",
+                        f"rm -rf /job/input/{job.job_id} /job/output/{job.job_id}",
+                        timeout=60,
                     )
-
-                    # Upload file
-                    await self._set_status(app, job, "Uploading...")
-                    remote_input_path = (
-                        f"{remote_input_dir}/{sanitize_filename(job.original_filename)}"
-                    )
-                    await asyncssh.scp(
-                        str(job.local_input_path),
-                        (conn, remote_input_path),
-                        recurse=False,
-                        preserve=True,
-                    )
-
-                    if job.cancel_event.is_set():
-                        await self._set_status(app, job, "Canceled")
-                        return
-
-                    # Run transcription
-                    await self._set_status(app, job, "Transcribing…")
-                    cmd = (
-                        f"/usr/bin/uv run /opt/telemuze/composer.py "
-                        f"--in {sh_quote(remote_input_path)} "
-                        f"--model {sh_quote(job.model)} "
-                        f"--language {sh_quote(job.language)} "
-                        f"--job-id {sh_quote(job.job_id)}"
-                    )
-                    # Wrap with timeout
-                    json_result = await run_ssh_command_with_json(
-                        conn, cmd, timeout=JOB_TIMEOUT_SEC
-                    )
-
-                    if job.cancel_event.is_set():
-                        await self._set_status(app, job, "Canceled")
-                        return
-
-                    if not json_result.get("ok"):
-                        err = json_result.get("error", "Transcription failed")
-                        await self._send_error_reply(
-                            app, job, f"Transcription failed: {err}"
-                        )
-                        return
-
-                    text_path = json_result.get("text_path")
-                    if not text_path:
-                        await self._send_error_reply(
-                            app, job, "No transcript produced."
-                        )
-                        return
-
-                    # Fetch transcript text via cat
-                    transcript_text = await run_ssh_command(
-                        conn,
-                        f"cat {sh_quote(text_path)}",
-                        timeout=SSH_CMD_IDLE_TIMEOUT_SEC,
-                    )
-
-                    # Send transcript to Telegram
-                    await self._send_transcript_reply(app, job, transcript_text)
-
-                    await self._set_status(app, job, "Done ✅")
-                finally:
-                    # Cleanup remote files
-                    with contextlib.suppress(Exception):
-                        await run_ssh_command(
-                            conn,
-                            f"rm -rf /job/input/{job.job_id} /job/output/{job.job_id}",
-                            timeout=60,
-                        )
-                    conn.close()
-            finally:
-                # and destroy VM
-                await destroy_composer(job.vm_name)
-
-            # Cleanup local
-            self._cleanup_local(job)
+                conn.close()
 
         except asyncio.TimeoutError:
             await self._send_error_reply(
@@ -491,6 +481,10 @@ class Scheduler:
                 app, job, "An internal error occurred while processing your file."
             )
         finally:
+            self._cleanup_local(job)
+            if job.vm_name:
+                await destroy_composer(job.vm_name)
+
             self.tasks.pop(job.job_id, None)
             self.jobs.pop(job.job_id, None)
             self.global_sem.release()
