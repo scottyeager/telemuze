@@ -977,7 +977,9 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         job.preliminary_message_id = preliminary_msg.message_id
         preliminary_task = asyncio.create_task(
-            _update_preliminary_transcript(context.application, job, preliminary_msg.message_id)
+            _update_preliminary_transcript(
+                context.application, job, preliminary_msg.message_id
+            )
         )
 
     # We always queue the main job, regardless of whether a preliminary one was started.
@@ -1130,7 +1132,7 @@ async def cleanup_leftovers():
 
 async def on_startup(app: Application):
     # Disabled until we can check the implementation
-    # await cleanup_leftovers()
+    await cleanup_leftovers()
 
     _db_init()
     ensure_ssh_keypair()
