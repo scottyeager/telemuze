@@ -640,8 +640,10 @@ async def destroy_composer(vm_name: str):
         return
 
     log.info("Destroying VM %s", vm_name)
-    with contextlib.suppress(Exception):
-        await asyncio.to_thread(tfcmd.cancel_vm, vm_name)
+    try:
+        await asyncio.to_thread(tfcmd.cancel, vm_name)
+    except Exception as e:
+        log.exception("Failed to destroy VM %s: %s", vm_name, e)
 
 
 # ----------------------------
