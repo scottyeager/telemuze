@@ -23,7 +23,6 @@ import os
 import re
 import shutil
 import sqlite3
-import string
 import subprocess
 import sys
 import tempfile
@@ -296,6 +295,7 @@ class Job:
     language: str
     status_message_id: Optional[int] = None
     preliminary_message_id: Optional[int] = None
+    preliminary_notice_message_id: Optional[int] = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
 
     # runtime fields
@@ -358,7 +358,7 @@ class Scheduler:
         self._stop_event.set()
         # Do not cancel running jobs abruptly; allow graceful stop.
 
-    async def _set_status(self, app: Application, job: Job, text: string):
+    async def _set_status(self, app: Application, job: Job, text: str):
         if job.status_message_id is None:
             return
         try:
@@ -366,9 +366,11 @@ class Scheduler:
                 chat_id=job.chat_id,
                 message_id=job.status_message_id,
                 text=f"{text}",
+                # reply_markup=build_cancel_keyboard(job.job_id),
             )
         except Exception as e:
-            log.warning("Failed to edit status message: %s", e)
+            if "Message is not modified" not in str(e):
+                log.warning("Failed to edit status message: %s", e)
 
     def _cleanup_local(self, job: Job):
         with contextlib.suppress(Exception):
@@ -461,7 +463,16 @@ class Scheduler:
                 # Send transcript to Telegram
                 await self._send_transcript_reply(app, job, transcript_text)
 
-                await self._set_status(app, job, "Done ✅")
+                if job.status_message_id:
+                    with contextlib.suppress(Exception):
+                        await app.bot.delete_message(
+                            chat_id=job.chat_id, message_id=job.status_message_id
+                        )
+                await app.bot.send_message(
+                    chat_id=job.chat_id,
+                    text="Done ✅",
+                    reply_to_message_id=job.original_message_id,
+                )
             finally:
                 # Cleanup remote files
                 with contextlib.suppress(Exception):
@@ -518,13 +529,23 @@ class Scheduler:
     async def _send_transcript_reply(
         self, app: Application, job: Job, transcript_text: str
     ):
+        # Delete the preliminary notice message if it exists
+        if job.preliminary_notice_message_id:
+            with contextlib.suppress(Exception):
+                await app.bot.delete_message(
+                    chat_id=job.chat_id, message_id=job.preliminary_notice_message_id
+                )
+
         text = transcript_text.strip()
+
+        # If we have a preliminary message, we edit it. Otherwise, send a new message.
+        edit_message_id = job.preliminary_message_id
+
         if not text:
-            # If there's a preliminary message, edit it. Otherwise, send a new one.
-            if job.preliminary_message_id:
+            if edit_message_id:
                 await app.bot.edit_message_text(
                     chat_id=job.chat_id,
-                    message_id=job.preliminary_message_id,
+                    message_id=edit_message_id,
                     text="ℹ️ Transcription completed, but no speech was detected.",
                 )
             else:
@@ -535,12 +556,11 @@ class Scheduler:
                 )
             return
 
-        # If we have a preliminary message, we edit it.
-        if job.preliminary_message_id:
+        if edit_message_id:
             if len(text) <= TELEGRAM_TEXT_LIMIT:
                 await app.bot.edit_message_text(
                     chat_id=job.chat_id,
-                    message_id=job.preliminary_message_id,
+                    message_id=edit_message_id,
                     text=text,
                 )
             else:
@@ -548,7 +568,7 @@ class Scheduler:
                 truncated = text[:TELEGRAM_TEXT_LIMIT]
                 await app.bot.edit_message_text(
                     chat_id=job.chat_id,
-                    message_id=job.preliminary_message_id,
+                    message_id=edit_message_id,
                     text=truncated,
                 )
                 # Attach full transcript as a new message, replying to the original
@@ -898,10 +918,16 @@ async def run_local_transcription(job: Job) -> Optional[Path]:
         return None
 
 
-async def _update_preliminary_transcript(
-    app: Application, job: Job, preliminary_msg_id: int
-):
-    """Task to run local transcription and update the preliminary message."""
+async def _update_preliminary_transcript(app: Application, job: Job):
+    """Task to run local transcription and send the result in a new message."""
+    # Send a notice that we're starting
+    notice_msg = await app.bot.send_message(
+        chat_id=job.chat_id,
+        parse_mode="HTML",
+        text="Preliminary transcript in progress...",
+    )
+    job.preliminary_notice_message_id = notice_msg.message_id
+
     transcript_path = await run_local_transcription(job)
     if transcript_path and transcript_path.exists():
         with open(transcript_path, "r", encoding="utf-8") as f:
@@ -912,17 +938,21 @@ async def _update_preliminary_transcript(
             # The final reply will handle it properly.
             if len(text) > TELEGRAM_TEXT_LIMIT:
                 text = text[: TELEGRAM_TEXT_LIMIT - 3] + "..."
+
+            # Edit the notice to be a header
             await app.bot.edit_message_text(
                 chat_id=job.chat_id,
-                message_id=preliminary_msg_id,
-                text=f"**Preliminary Transcript (tiny model):**\n\n{text}",
+                message_id=notice_msg.message_id,
+                parse_mode="HTML",
+                text="Preliminary Transcript (tiny model):",
             )
-        else:
-            await app.bot.edit_message_text(
+            # Send the transcript as a new message
+            transcript_msg = await app.bot.send_message(
                 chat_id=job.chat_id,
-                message_id=preliminary_msg_id,
-                text="ℹ️ Preliminary transcript was empty.",
+                text=text,
+                reply_to_message_id=job.original_message_id,
             )
+            job.preliminary_message_id = transcript_msg.message_id
 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -978,22 +1008,15 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- Two-phase transcription logic ---
     preliminary_task = None
     if model == "turbo":
-        preliminary_msg = await message.reply_text(
-            "Generating preliminary transcript (tiny model)...",
-            reply_to_message_id=message.message_id,
-        )
-        job.preliminary_message_id = preliminary_msg.message_id
         preliminary_task = asyncio.create_task(
-            _update_preliminary_transcript(
-                context.application, job, preliminary_msg.message_id
-            )
+            _update_preliminary_transcript(context.application, job)
         )
 
     # We always queue the main job, regardless of whether a preliminary one was started.
     pos = scheduler.queue_position()
     await status_msg.edit_text(
         f"Queued (position {pos})",
-        reply_markup=build_cancel_keyboard(job_id),
+        # reply_markup=build_cancel_keyboard(job_id),
     )
     await scheduler.submit(job)
 
