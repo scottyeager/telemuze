@@ -802,19 +802,21 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
     local_path = job_dir / inferred_name
 
     # Download from Telegram
+    status_msg = await message.reply_text(
+        "Downloading...", reply_to_message_id=message.message_id
+    )
     try:
         tg_file = await context.bot.get_file(tg_file_id)
         await tg_file.download_to_drive(custom_path=str(local_path))
     except Exception as e:
         log.exception("Download failed: %s", e)
-        await message.reply_text("Failed to download the file from Telegram.")
+        await status_msg.edit_text("Failed to download the file from Telegram.")
         return
 
     # Queue job and send status
     pos = scheduler.queue_position()
-    status_msg = await message.reply_text(
+    await status_msg.edit_text(
         f"Queued (position {pos})",
-        reply_to_message_id=message.message_id,
         reply_markup=build_cancel_keyboard(job_id),
     )
 
