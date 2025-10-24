@@ -65,6 +65,7 @@ if not TELEGRAM_BOT_TOKEN:
 
 TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH")
+USING_LOCAL_BOT_API = bool(TELEGRAM_API_ID and TELEGRAM_API_HASH)
 
 # Override composer IP for development
 COMPOSER_IP_OVERRIDE = os.environ.get("COMPOSER_IP_OVERRIDE")
@@ -950,8 +951,12 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Downloading...", reply_to_message_id=message.message_id
     )
     try:
-        tg_file = await context.bot.get_file(tg_file_id)
-        await tg_file.download_to_drive(custom_path=str(local_path))
+        if USING_LOCAL_BOT_API:
+            tg_file = await context.bot.get_file(tg_file_id)
+            shutil.move(tg_file.file_path, str(local_path))
+        else:
+            tg_file = await context.bot.get_file(tg_file_id)
+            await tg_file.download_to_drive(custom_path=str(local_path))
     except Exception as e:
         log.exception("Download failed: %s", e)
         await status_msg.edit_text("Failed to download the file from Telegram.")
@@ -1165,7 +1170,7 @@ def build_application() -> Application:
     builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN)
 
     # Local bot API server support
-    if TELEGRAM_API_ID and TELEGRAM_API_HASH:
+    if USING_LOCAL_BOT_API:
         log.info("Using local Telegram Bot API server")
         builder.base_url("http://127.0.0.1:8081/bot")
         builder.base_file_url("http://127.0.0.1:8081/file/bot")
