@@ -1069,9 +1069,15 @@ async def cache_warmer_task(app: Application):
                     await destroy_composer(vm_name)
                 else:
                     try:
-                        subprocess.run(
-                            ["/usr/local/bin/reset-model-atimes.sh"], check=True
+                        proc = await asyncio.create_subprocess_exec(
+                            "/usr/local/bin/reset-model-atimes.sh",
                         )
+                        rc = await proc.wait()
+                        if rc != 0:
+                            log.warning(
+                                "Local reset-model-atimes.sh failed with exit code %d",
+                                rc,
+                            )
                     except Exception as e:
                         log.warning("Local reset-model-atimes.sh failed: %s", e)
                 # Reset last activity to now to avoid back-to-back warmers

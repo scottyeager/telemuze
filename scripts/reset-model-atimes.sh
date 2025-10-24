@@ -12,8 +12,10 @@
 # Read first byte of every file in /models
 for dir in /models /.venv; do
     if [ -d "$dir" ]; then
-        find "$dir" -type f -exec head -c 1 {} \; -print0 2>/dev/null | while IFS= read -r -d '' file; do
-            echo "Warning: Failed to read first byte of $file" >&2
+        find "$dir" -type f -print0 | while IFS= read -r -d '' file; do
+            if ! head -c 1 "$file" >/dev/null 2>&1; then
+                echo "Warning: Failed to read first byte of $file" >&2
+            fi
         done
     fi
 done
