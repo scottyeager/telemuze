@@ -42,8 +42,7 @@ RUN uv pip install \
 COPY requirements.txt /opt/telemuze/requirements.txt
 RUN uv pip install --no-cache-dir -r /opt/telemuze/requirements.txt
 
-# Runtime directories
-RUN mkdir -p /job/input /job/output /job/logs /models /opt/telemuze
+RUN mkdir -p /opt/telemuze /models
 
 # Copy composer files
 COPY load_models.py /opt/telemuze/
@@ -61,5 +60,11 @@ COPY scripts/start-bot-api.sh /usr/local/bin/
 COPY scripts/reset-model-atimes.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/start-bot-api.sh /usr/local/bin/reset-model-atimes.sh
 
-# Create state dir for SSH keys/db
-RUN mkdir -p /root/.telemuze /tmp/telemuze && chmod 700 /root/.telemuze
+# Create remaining dirs here, to avoid busting cache if we need to add some
+RUN mkdir -p /job/input \
+    /job/output \
+    /job/logs \
+    /opt/telegram-bot-api \
+    /root/.telemuze \
+    /tmp/telemuze
+RUN chmod 700 /root/.telemuze
