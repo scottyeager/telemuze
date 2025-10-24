@@ -128,8 +128,15 @@ FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", str(20 * 60)))  # 
 SSH_CONNECT_TIMEOUT_SEC = int(os.environ.get("SSH_CONNECT_TIMEOUT_SEC", "90"))
 SSH_CMD_IDLE_TIMEOUT_SEC = int(os.environ.get("SSH_CMD_IDLE_TIMEOUT_SEC", "300"))
 
-# Cache warmer
-CACHE_WARM_INTERVAL_MIN = int(os.environ.get("CACHE_WARM_INTERVAL_MIN", "360"))
+# Interval for warming both the local cache and the remote cache, if applicable
+CACHE_WARM_INTERVAL_HOURs = int(os.environ.get("CACHE_WARM_INTERVAL_MIN", "12"))
+# Should be enabled if the composer runs on a separate node
+CACHE_WARM_DEPLOY = os.environ.get("CACHE_WARM_DEPLOY", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # File and SSH paths
 HOME_DIR = Path.home()
@@ -300,7 +307,7 @@ class Scheduler:
         self.user_sems: Dict[int, asyncio.Semaphore] = {}
         self.jobs: Dict[str, Job] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
-        self.last_activity_ts = time.time()
+        self.last_cache_warm_ts = 0
         self._stop_event = asyncio.Event()
 
     def get_user_sem(self, user_id: int) -> asyncio.Semaphore:
@@ -368,7 +375,6 @@ class Scheduler:
 
     async def _run_job(self, app: Application, job: Job, user_sem: asyncio.Semaphore):
         try:
-            self.last_activity_ts = time.time()
             # Provision composer
             await self._set_status(app, job, "Provisioning worker…")
             vm_name = f"cmp{job.job_id[:8]}"
@@ -866,21 +872,37 @@ async def cache_warmer_task(app: Application):
     while True:
         try:
             now = time.time()
-            idle_sec = now - scheduler.last_activity_ts
+            idle_sec = now - scheduler.last_cache_warm_ts
             if idle_sec > CACHE_WARM_INTERVAL_MIN * 60 and scheduler.queue.empty():
                 vm_name = f"cmpwrm{int(now)}"
                 log.info("Running cache warmer: %s", vm_name)
-                try:
-                    vm_ip = await provision_composer(vm_name)
-                except Exception as e:
-                    log.warning("Warm provision failed: %s", e)
+                if CACHE_WARM_DEPLOY:
+                    try:
+                        vm_ip = await provision_composer(vm_name)
+                        conn = await connect_ssh_with_retries(vm_ip)
+                        try:
+                            await run_ssh_command(
+                                conn,
+                                "/usr/local/bin/reset-model-atimes.sh",
+                                timeout=120,
+                            )
+                        finally:
+                            conn.close()
+                    except Exception as e:
+                        log.warning("Warm provision failed: %s", e)
+                        await destroy_composer(vm_name)
+                        await asyncio.sleep(60)
+                        continue
                     await destroy_composer(vm_name)
-                    await asyncio.sleep(60)
-                    continue
-
-                await destroy_composer(vm_name)
+                else:
+                    try:
+                        subprocess.run(
+                            ["/usr/local/bin/reset-model-atimes.sh"], check=True
+                        )
+                    except Exception as e:
+                        log.warning("Local reset-model-atimes.sh failed: %s", e)
                 # Reset last activity to now to avoid back-to-back warmers
-                scheduler.last_activity_ts = time.time()
+                scheduler.last_cache_warm_ts = time.time()
             await asyncio.sleep(60)
         except asyncio.CancelledError:
             break

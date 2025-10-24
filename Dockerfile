@@ -48,15 +48,18 @@ RUN mkdir -p /job/input /job/output /job/logs /models /opt/telemuze
 # Copy composer files
 COPY load_models.py /opt/telemuze/
 
-# Cache models so they are there immediately on deployment
+# Cache models so we can cache them on the node
 RUN uv run /opt/telemuze/load_models.py
 
 # Copy listener code and zinit configs
 COPY composer.py /opt/telemuze/
 COPY listener.py /opt/telemuze/
 COPY zinit/* /etc/zinit/
+
+# Copy and make scripts executable
 COPY scripts/start-bot-api.sh /usr/local/bin/
-RUN chmod +x /usr/local/bin/start-bot-api.sh
+COPY scripts/reset-model-atimes.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/start-bot-api.sh /usr/local/bin/reset-model-atimes.sh
 
 # Create state dir for SSH keys/db
 RUN mkdir -p /root/.telemuze /tmp/telemuze && chmod 700 /root/.telemuze
