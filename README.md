@@ -4,15 +4,35 @@ Telemuze is a Telegram bot that transcribes audio/video to plain text using Whis
 
 ## Quickstart
 
+> Note, this bot creates deployments for you, using your ThreeFold mnemonic seed phrase. Please use your own node or a node from a farmer that you trust.
+
+1. Get a Telegram bot token from @BotFather
+2. Install [`tfcmd`](https://github.com/threefoldtech/tfgrid-sdk-go/tree/development/grid-cli)
+3. Start listener VM, replacing values with your own:
+
 ```
-TODO: Provide instructions here based on prebuilt flists available from TF Hub
+tfcmd deploy vm \
+  --name telemuze$(shuf -i 1000-9999 -n 1) \
+  --flist https://hub.threefold.me/scott.3bot/ghcr.io-scottyeager-telemuze-latest.flist \
+  --entrypoint "/sbin/zinit init" \
+  --node 13 \
+  --rootfs 20 \
+  --ssh ~/.ssh/id_rsa.pub \
+  -e TELEGRAM_BOT_TOKEN="ABC:123" \
+  -e TF_MNEMONIC="your threefold mnemonic here" \
+  -e TF_NODE_ID="13" \
+  -e ALLOWED_USERNAMES="your_telegram_username" \
 ```
+ 4. Go and chat with your bot
+
+ Note that a bot deployed this way will have fairly low file size restrictions. To lift those restrictions, see the  "Telegram Bot API" section below.
 
 ## Run with local listener
 
 To run the listener locally, Python can be used directly. Some requirements must be satisfied:
 
 * [`tfcmd`](https://github.com/threefoldtech/tfgrid-sdk-go/tree/development/grid-cli) is installed (or using local composer)
+* [Mycelium](https://github.com/threefoldtech/mycelium) must be installed and running
 * TF Chain account funded and ready to create deployments
 * A Telegram bot (see @BotFather)
 * [uv](https://github.com/astral-sh/uv) (you can get by without it if you know what you're doing, but really, it's great)
@@ -31,7 +51,7 @@ Telemuze will put some files under `~/.telemuze` if you run the listener locally
 
 ## Composer override
 
-Mainly for testing purposes, it's possible to configure an IP address to be used as the composer. This could be a Docker container, which is useful for local testing.
+Mainly for testing purposes, it's possible to configure an IP address to be used as the composer. This could be a Docker container (see below for Docker image info), which is useful for local testing.
 
 Set `COMPOSER_IP_OVERRIDE`, and then the listener won't attempt to deploy a composer. It will instead simply attempt to connect to the provided IP address over SSH.
 
@@ -101,3 +121,27 @@ docker run --rm \
 ```
 
 When both the id and hash are present, the server will start automatically and the listener will use it.
+
+## Deploy to ThreeFold Grid
+
+The best deployment configuration is that both the listener and the composers run on the same ThreeFold node. Transfers between the two VMs will be fast, and keeping the STT models cached will be simpler. If your composer will run on a different node than the listener, set the environment variable `CACHE_WARM_DEPLOY=true`.
+
+The listener is a simple deployment that can be created with tfcmd like this:
+
+```
+tfcmd deploy vm \
+  --name telemuze$(shuf -i 1000-9999 -n 1) \
+  --flist https://hub.threefold.me/scott.3bot/ghcr.io-scottyeager-telemuze-latest.flist \
+  --entrypoint "/sbin/zinit init" \
+  --node 13 \
+  --rootfs 20 \
+  --ssh ~/.ssh/id_rsa.pub \
+  -e TELEGRAM_BOT_TOKEN="ABC:123" \
+  -e TF_MNEMONIC="your threefold mnemonic here" \
+  -e TF_NODE_ID="13" \
+  -e ALLOWED_USERNAMES="your_telegram_username" \
+  -e TELEGRAM_API_ID="your_api_id" \
+  -e TELEGRAM_API_HASH="your_api_hash"
+```
+
+You can also fill in the same values to a micro VM deployment on the ThreeFold Dashboard, if you wish.
