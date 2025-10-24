@@ -492,16 +492,26 @@ class Scheduler:
             user_sem.release()
 
     async def _send_error_reply(self, app: Application, job: Job, text: str):
-        try:
-            await app.bot.send_message(
-                chat_id=job.chat_id,
-                text=f"❌ {text}",
-                reply_to_message_id=job.original_message_id,
-            )
-        except Exception as e:
-            log.warning("Failed to send error reply: %s", e)
-        with contextlib.suppress(Exception):
-            await self._set_status(app, job, "Failed ❌")
+        full_text = f"Failed ❌\n{text}"
+        if job.status_message_id:
+            try:
+                await app.bot.edit_message_text(
+                    chat_id=job.chat_id,
+                    message_id=job.status_message_id,
+                    text=full_text,
+                )
+            except Exception as e:
+                log.warning("Failed to edit status message for error: %s", e)
+        else:
+            # Fallback if there is no status message for some reason
+            try:
+                await app.bot.send_message(
+                    chat_id=job.chat_id,
+                    text=full_text,
+                    reply_to_message_id=job.original_message_id,
+                )
+            except Exception as e:
+                log.warning("Failed to send error reply: %s", e)
 
     async def _send_transcript_reply(
         self, app: Application, job: Job, transcript_text: str
