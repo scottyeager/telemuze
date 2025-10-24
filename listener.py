@@ -1136,9 +1136,13 @@ async def cleanup_leftovers():
 
     log.info("Searching for leftover composer VMs...")
     try:
-        # Assumes tfcmd.list() returns a list of deployment names
-        all_deployments = await asyncio.to_thread(tfcmd.list)
-        composer_vms = [name for name in all_deployments if name.startswith("cmp")]
+        # Use tfcmd.get_contracts() to get deployment list
+        contracts_output = await asyncio.to_thread(tfcmd.get_contracts)
+        composer_vms = []
+        for line in contracts_output.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and parts[2] == "vm" and parts[3].startswith("cmp"):
+                composer_vms.append(parts[3])
 
         if not composer_vms:
             log.info("No leftover composer VMs found.")
