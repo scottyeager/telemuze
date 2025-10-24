@@ -129,7 +129,7 @@ SSH_CONNECT_TIMEOUT_SEC = int(os.environ.get("SSH_CONNECT_TIMEOUT_SEC", "90"))
 SSH_CMD_IDLE_TIMEOUT_SEC = int(os.environ.get("SSH_CMD_IDLE_TIMEOUT_SEC", "300"))
 
 # Interval for warming both the local cache and the remote cache, if applicable
-CACHE_WARM_INTERVAL_HOURs = int(os.environ.get("CACHE_WARM_INTERVAL_MIN", "12"))
+CACHE_WARM_INTERVAL_HOURS = int(os.environ.get("CACHE_WARM_INTERVAL_MIN", "12"))
 # Should be enabled if the composer runs on a separate node
 CACHE_WARM_DEPLOY = os.environ.get("CACHE_WARM_DEPLOY", "false").strip().lower() in {
     "1",
@@ -875,7 +875,10 @@ async def cache_warmer_task(app: Application):
         try:
             now = time.time()
             idle_sec = now - scheduler.last_cache_warm_ts
-            if idle_sec > CACHE_WARM_INTERVAL_MIN * 60 and scheduler.queue.empty():
+            if (
+                idle_sec > CACHE_WARM_INTERVAL_HOURS * 60 * 60
+                and scheduler.queue.empty()
+            ):
                 vm_name = f"cmpwrm{int(now)}"
                 log.info("Running cache warmer: %s", vm_name)
                 if CACHE_WARM_DEPLOY:
