@@ -1079,7 +1079,7 @@ async def cache_warmer_task(app: Application):
                         try:
                             await run_ssh_command(
                                 conn,
-                                "/usr/bin/uv run /opt/telemuze/load_models.py",
+                                "/usr/bin/uv run /opt/telemuze/load_models.py --warm",
                                 timeout=300,
                             )
                         finally:
@@ -1093,8 +1093,10 @@ async def cache_warmer_task(app: Application):
                 else:
                     try:
                         proc = await asyncio.create_subprocess_exec(
-                            "/usr/bin/uv run",
+                            "/usr/bin/uv",
+                            "run",
                             "/opt/telemuze/load_models.py",
+                            "--warm",
                         )
                         rc = await proc.wait()
                         if rc != 0:
