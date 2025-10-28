@@ -129,16 +129,6 @@ FFMPEG_TIMEOUT_SEC = int(os.environ.get("FFMPEG_TIMEOUT_SEC", str(20 * 60)))  # 
 SSH_CONNECT_TIMEOUT_SEC = int(os.environ.get("SSH_CONNECT_TIMEOUT_SEC", "90"))
 SSH_CMD_IDLE_TIMEOUT_SEC = int(os.environ.get("SSH_CMD_IDLE_TIMEOUT_SEC", "300"))
 
-# Interval for warming both the local cache and the remote cache, if applicable
-CACHE_WARM_INTERVAL_HOURS = int(os.environ.get("CACHE_WARM_INTERVAL_MIN", "12"))
-# Should be enabled if the composer runs on a separate node
-CACHE_WARM_DEPLOY = os.environ.get("CACHE_WARM_DEPLOY", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "on",
-}
-
 # File and SSH paths
 HOME_DIR = Path.home()
 STATE_DIR = HOME_DIR / ".telemuze"
@@ -310,7 +300,6 @@ class Scheduler:
         self.user_sems: Dict[int, asyncio.Semaphore] = {}
         self.jobs: Dict[str, Job] = {}
         self.tasks: Dict[str, asyncio.Task] = {}
-        self.last_cache_warm_ts = 0
         self._stop_event = asyncio.Event()
 
     def get_user_sem(self, user_id: int) -> asyncio.Semaphore:
@@ -1054,69 +1043,6 @@ def extract_file_id_and_name(message) -> Tuple[Optional[str], str]:
 
 
 # ----------------------------
-# Cache warmer
-# ----------------------------
-
-
-async def cache_warmer_task(app: Application):
-    """
-    Periodically spin a composer to keep the composer flist cached on the node. Activity timestamp is also reset by regular composer deployments.
-    """
-    while True:
-        try:
-            now = time.time()
-            idle_sec = now - scheduler.last_cache_warm_ts
-            if (
-                idle_sec > CACHE_WARM_INTERVAL_HOURS * 60 * 60
-                and scheduler.queue.empty()
-            ):
-                vm_name = f"cmpwrm{int(now)}"
-                log.info("Running cache warmer: %s", vm_name)
-                if CACHE_WARM_DEPLOY:
-                    try:
-                        vm_ip = await provision_composer(vm_name)
-                        conn = await connect_ssh_with_retries(vm_ip)
-                        try:
-                            await run_ssh_command(
-                                conn,
-                                "/usr/bin/uv run /opt/telemuze/load_models.py --warm",
-                                timeout=300,
-                            )
-                        finally:
-                            conn.close()
-                    except Exception as e:
-                        log.warning("Warm provision failed: %s", e)
-                        await destroy_composer(vm_name)
-                        await asyncio.sleep(60)
-                        continue
-                    await destroy_composer(vm_name)
-                else:
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            "/usr/bin/uv",
-                            "run",
-                            "/opt/telemuze/load_models.py",
-                            "--warm",
-                        )
-                        rc = await proc.wait()
-                        if rc != 0:
-                            log.warning(
-                                "Local load_models.py failed with exit code %d",
-                                rc,
-                            )
-                    except Exception as e:
-                        log.warning("Local load_models.py failed: %s", e)
-                # Reset last activity to now to avoid back-to-back warmers
-                scheduler.last_cache_warm_ts = time.time()
-            await asyncio.sleep(60)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            log.warning("Cache warmer error: %s", e)
-            await asyncio.sleep(60)
-
-
-# ----------------------------
 # Application lifecycle
 # ----------------------------
 
@@ -1184,22 +1110,16 @@ async def on_startup(app: Application):
 
     # Start scheduler
     app.bot_data["scheduler_task"] = asyncio.create_task(scheduler.run(app))
-    # Start cache warmer
-    if COMPOSER_IP_OVERRIDE:
-        log.info("Composer IP override set; cache warmer disabled.")
-    else:
-        app.bot_data["warmer_task"] = asyncio.create_task(cache_warmer_task(app))
 
 
 async def on_shutdown(app: Application):
     await scheduler.shutdown()
-    # Cancel background tasks
-    for key in ("scheduler_task", "warmer_task"):
-        task: Optional[asyncio.Task] = app.bot_data.get(key)
-        if task:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+    # Cancel background task
+    task: Optional[asyncio.Task] = app.bot_data.get("scheduler_task")
+    if task:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def build_application() -> Application:

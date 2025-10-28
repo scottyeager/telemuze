@@ -6,8 +6,6 @@
 # RAM to load turbo. We warm the turbo model just by reading the first byte,
 # since this will cause the node to download the full file.
 
-import argparse
-import os
 
 import whisperx
 
@@ -17,26 +15,7 @@ compute_type = "int8"  # CPU-friendly
 
 models = ["tiny", "turbo"]
 
-parser = argparse.ArgumentParser()
-parser.add_argument("--warm", action="store_true", help="Warm the cache only")
-args = parser.parse_args()
-
-if not args.warm:
-    for model in models:
-        model = whisperx.load_model(
-            model, device, compute_type=compute_type, download_root=model_dir
-        )
-else:
+for model in models:
     model = whisperx.load_model(
-        "tiny", device, compute_type=compute_type, download_root=model_dir
+        model, device, compute_type=compute_type, download_root=model_dir
     )
-
-    # Just check every file, to make sure we hit the turbo model
-    for root, _, files in os.walk(model_dir):
-        for name in files:
-            path = os.path.join(root, name)
-            try:
-                with open(path, "rb") as f:
-                    f.read(1)
-            except Exception:
-                pass

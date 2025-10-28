@@ -1,0 +1,1 @@
+exec: bash -c "while true; do dd if=/dependencies.tar bs=1 count=1 2>/dev/null; sleep 3600; done"
