@@ -40,7 +40,7 @@ COPY --from=dependencies dependencies.tar /
 
 # System deps: python, pip, ffmpeg, libsndfile for torchaudio, ssh client, certificates
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-venv python3-pip \
+    python3 \
     ffmpeg \
     libsndfile1 \
     openssh-client \
