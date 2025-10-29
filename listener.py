@@ -567,14 +567,15 @@ class Scheduler:
                     tf.write(text)
                     tmp_path = tf.name
                 try:
-                    await app.bot.send_document(
-                        chat_id=job.chat_id,
-                        document=InputFile(
-                            tmp_path, filename=f"transcript-{job.job_id}.txt"
-                        ),
-                        caption="Full transcript",
-                        reply_to_message_id=job.original_message_id,
-                    )
+                    with open(tmp_path, "rb") as f:
+                        await app.bot.send_document(
+                            chat_id=job.chat_id,
+                            document=InputFile(
+                                f, filename=f"transcript-{job.job_id}.txt"
+                            ),
+                            caption="Full transcript",
+                            reply_to_message_id=job.original_message_id,
+                        )
                 finally:
                     with contextlib.suppress(Exception):
                         os.unlink(tmp_path)
@@ -599,14 +600,15 @@ class Scheduler:
                     tf.write(text)
                     tmp_path = tf.name
                 try:
-                    await app.bot.send_document(
-                        chat_id=job.chat_id,
-                        document=InputFile(
-                            tmp_path, filename=f"transcript-{job.job_id}.txt"
-                        ),
-                        caption="Full transcript",
-                        reply_to_message_id=job.original_message_id,
-                    )
+                    with open(tmp_path, "rb") as f:
+                        await app.bot.send_document(
+                            chat_id=job.chat_id,
+                            document=InputFile(
+                                f, filename=f"transcript-{job.job_id}.txt"
+                            ),
+                            caption="Full transcript",
+                            reply_to_message_id=job.original_message_id,
+                        )
                 finally:
                     with contextlib.suppress(Exception):
                         os.unlink(tmp_path)
