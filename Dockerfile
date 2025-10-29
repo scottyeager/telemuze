@@ -1,6 +1,7 @@
-# In this stage we download python code and models then put them into a tar
-# archive to copy to the second stage. This supports our caching strategy by
-# having a single file for the cache warmer to touch
+# In this stage we download python code (which is rather large itself) and
+# models. While not strictly necessary, this helps to isolate the stage where we
+# have a lot of big downloads to do. We can also abandon any unnecessary caches
+# (uv, huggingface) cleanly this way.
 FROM ghcr.io/scottyeager/ubuntu:24.04 AS dependencies
 
 # We don't actually need python in this stage, but installing it will ensure
@@ -19,10 +20,6 @@ RUN uv pip install \
     --index https://download.pytorch.org/whl/cpu \
     torchaudio~=2.8.0 whisperx
 
-# Python deps for the listener
-COPY requirements.txt /opt/telemuze/requirements.txt
-RUN uv pip install --no-cache-dir -r /opt/telemuze/requirements.txt
-
 COPY load_models.py /
 
 # Download the models
@@ -36,7 +33,8 @@ RUN tar -cf dependencies.tar .venv /models
 # Combined Dockerfile for Telemuze Composer and Listener
 FROM ghcr.io/scottyeager/ubuntu:24.04
 
-COPY --from=dependencies dependencies.tar /
+COPY --from=dependencies .venv /.venv
+COPY --from=dependencies /models /models
 
 # System deps: python, pip, ffmpeg, libsndfile for torchaudio, ssh client, certificates
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -50,6 +48,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Remaining Python deps
+COPY requirements.txt /opt/telemuze/requirements.txt
+RUN uv pip install --no-cache-dir -r /opt/telemuze/requirements.txt
 
 # Download and install tfcmd
 RUN  wget https://github.com/threefoldtech/tfgrid-sdk-go/releases/download/v0.16.11/tfgrid-sdk-go_Linux_x86_64.tar.gz && \
@@ -70,7 +72,6 @@ COPY zinit/* /etc/zinit/
 COPY scripts/start-bot-api.sh /usr/local/bin/
 RUN chmod +x /usr/local/bin/start-bot-api.sh
 
-# Create remaining dirs here, to avoid busting cache if we need to add some
 RUN mkdir -p /job/input \
     /job/output \
     /job/logs \

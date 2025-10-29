@@ -1,2 +1,0 @@
-exec: bash -c "[ ! -d /models ] && tar -xf dependencies.tar"
-oneshot: true
