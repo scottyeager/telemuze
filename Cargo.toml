@@ -1,0 +1,45 @@
+[package]
+name = "telemuze"
+version = "0.1.0"
+edition = "2021"
+description = "Self-hosted AI dictation and transcription server"
+
+[dependencies]
+# Web framework
+axum = { version = "0.8", features = ["multipart"] }
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Audio pipeline
+symphonia = { version = "0.5", features = ["all"] }
+rubato = "0.16"
+
+# STT engine
+transcribe-rs = { version = "0.3", features = ["onnx"] }
+
+# VAD engine
+vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
+
+# LLM engine — calls a local OpenAI-compatible API (e.g., mistral.rs server)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Model downloading
+futures-util = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Utilities
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+tempfile = "3"
+dirs-next = "2"
+bytes = "1"
+
+# Telegram bot (MTProto)
+grammers-client = "0.9"
+grammers-session = "0.9"
