@@ -49,6 +49,11 @@ pub struct Config {
     /// Telegram bot token (from @BotFather)
     #[arg(long, env = "TELEGRAM_BOT_TOKEN", default_value = "")]
     pub telegram_bot_token: String,
+
+    /// Comma-separated list of Telegram usernames allowed to use the bot.
+    /// If empty, all users are allowed.
+    #[arg(long, env = "TELEGRAM_ALLOWED_USERS", default_value = "")]
+    pub telegram_allowed_users: String,
 }
 
 impl Config {

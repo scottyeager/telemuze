@@ -48,6 +48,7 @@ All options can be set via CLI flags or environment variables.
 | `--telegram-api-id` | `TELEGRAM_API_ID` | | Telegram API ID (from https://my.telegram.org) |
 | `--telegram-api-hash` | `TELEGRAM_API_HASH` | | Telegram API hash |
 | `--telegram-bot-token` | `TELEGRAM_BOT_TOKEN` | | Telegram bot token (from @BotFather) |
+| `--telegram-allowed-users` | `TELEGRAM_ALLOWED_USERS` | *(all users)* | Comma-separated list of Telegram usernames allowed to use the bot |
 
 ## API Endpoints
 

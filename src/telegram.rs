@@ -67,6 +67,26 @@ async fn handle_message(
     message: &grammers_client::update::Message,
     state: &AppState,
 ) -> Result<()> {
+    // Check if the sender is in the allowed users list.
+    if !state.telegram_allowed_users.is_empty() {
+        let allowed = message
+            .sender()
+            .and_then(|peer| peer.username())
+            .is_some_and(|username| {
+                state
+                    .telegram_allowed_users
+                    .contains(&username.to_lowercase())
+            });
+
+        if !allowed {
+            info!(
+                "Telegram: rejecting message from unauthorized user {:?}",
+                message.sender_id()
+            );
+            return Ok(());
+        }
+    }
+
     let media = match message.media() {
         Some(m) => m,
         None => {

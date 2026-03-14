@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashSet;
 use std::sync::Mutex;
 use tracing::info;
 
@@ -17,6 +18,7 @@ pub struct AppState {
     pub llm_engine: LlmEngine,
     pub vad_engine: Mutex<VadEngine>,
     pub custom_terms: Vec<String>,
+    pub telegram_allowed_users: HashSet<String>,
 }
 
 impl AppState {
@@ -68,11 +70,23 @@ impl AppState {
             info!("Custom dictionary terms: {:?}", custom_terms);
         }
 
+        let telegram_allowed_users: HashSet<String> = config
+            .telegram_allowed_users
+            .split(',')
+            .map(|s| s.trim().trim_start_matches('@').to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if !telegram_allowed_users.is_empty() {
+            info!("Telegram allowed users: {:?}", telegram_allowed_users);
+        }
+
         Ok(Self {
             stt_engine: Mutex::new(stt_engine),
             llm_engine,
             vad_engine: Mutex::new(vad_engine),
             custom_terms,
+            telegram_allowed_users,
         })
     }
 }
