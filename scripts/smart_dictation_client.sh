@@ -11,11 +11,10 @@
 #
 # Configuration via environment variables:
 #   TELEMUZE_URL  - Server URL (default: http://127.0.0.1:7313)
-#   TELEMUZE_TYPE - "wayland" or "x11" (auto-detected if unset)
+#   TELEMUZE_TYPE  - "wayland" or "x11" (auto-detected if unset)
+#   TELEMUZE_SOUND - Set to "1" to enable notification sounds (default: off)
 
 set -euo pipefail
-exec 2>/tmp/dictation.log
-set -x
 
 PID_FILE="/tmp/dictation.pid"
 AUDIO_FILE="/tmp/dictation.wav"
@@ -72,8 +71,9 @@ type_text() {
     fi
 }
 
-# Play a notification sound (optional, fails silently)
+# Play a notification sound (only when TELEMUZE_SOUND=1)
 play_sound() {
+    [ "${TELEMUZE_SOUND:-0}" = "1" ] || return 0
     local sound="$1"
     paplay "/usr/share/sounds/freedesktop/stereo/${sound}.oga" 2>/dev/null || true
 }
@@ -105,9 +105,10 @@ if [ -f "$PID_FILE" ]; then
 
     # Send to Telemuze server
     # The /v1/dictate/smart endpoint returns plain text (no JSON)
-    FINAL_TEXT=$(curl -s -X POST "$SERVER_URL" \
+    CURL_ERR=$(mktemp)
+    FINAL_TEXT=$(curl -sS -X POST "$SERVER_URL" \
         -F file="@${AUDIO_FILE}" \
-        --max-time 30) || true
+        --max-time 30 2>"$CURL_ERR") || true
 
     # Clean up audio file
     rm -f "$AUDIO_FILE"
@@ -120,8 +121,11 @@ if [ -f "$PID_FILE" ]; then
         type_text "$FINAL_TEXT"
         play_sound "message-new-instant"
     else
+        ERR_MSG=$(cat "$CURL_ERR")
+        show_notification "Dictation failed" "${ERR_MSG:-No response from server}" >/dev/null
         play_sound "dialog-error"
     fi
+    rm -f "$CURL_ERR"
 else
     # === START RECORDING ===
 
