@@ -35,12 +35,18 @@ pub struct Config {
     pub llm_api_url: String,
 
     /// Path to a GGUF model file for native LLM inference.
-    /// If omitted (and no --llm-api-url), Qwen3.5-0.8B is auto-downloaded.
+    /// If omitted (and no --llm-api-url), the model selected by
+    /// --llm-model-size is auto-downloaded.
     #[arg(long, env = "TELEMUZE_LLM_MODEL_PATH")]
     pub llm_model_path: Option<PathBuf>,
 
+    /// LLM model size for auto-download: "0.8b" or "2b".
+    #[arg(long, env = "TELEMUZE_LLM_MODEL_SIZE", default_value = "2b",
+           value_parser = clap::builder::PossibleValuesParser::new(["0.8b", "2b"]))]
+    pub llm_model_size: String,
+
     /// Path to a terms file for smart dictation correction.
-    /// Each line: CorrectSpelling = misspelling1, misspelling2, ...
+    /// One term per line — the LLM matches sound-alikes automatically.
     /// Defaults to ~/.config/telemuze/terms.txt
     #[arg(long, env = "TELEMUZE_TERMS_FILE")]
     pub terms_file: Option<PathBuf>,

@@ -45,6 +45,7 @@ struct ModelFile {
 #[derive(Debug, Clone)]
 pub struct ModelInfo {
     pub id: &'static str,
+    #[allow(dead_code)]
     pub name: &'static str,
     /// Directory name (for multi-file models) or filename (for single-file).
     pub dirname: &'static str,
@@ -108,19 +109,37 @@ const SILERO_VAD: ModelInfo = ModelInfo {
 // Qwen3.5-0.8B GGUF — quantized by lmstudio-community
 // Original model: https://huggingface.co/Qwen/Qwen3.5-0.8B
 // GGUF: https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF
-const QWEN_LLM_FILES: &[ModelFile] = &[ModelFile {
+const QWEN_0_8B_FILES: &[ModelFile] = &[ModelFile {
     url: "https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf",
     filename: "Qwen3.5-0.8B-Q8_0.gguf",
 }];
 
-const QWEN_LLM: ModelInfo = ModelInfo {
+const QWEN_0_8B: ModelInfo = ModelInfo {
     id: "qwen3.5-0.8b",
     name: "Qwen3.5-0.8B (Q8_0)",
     dirname: "Qwen3.5-0.8B-Q8_0.gguf",
     is_directory: false,
     kind: ModelKind::Llm,
     is_downloaded: false,
-    files: QWEN_LLM_FILES,
+    files: QWEN_0_8B_FILES,
+};
+
+// Qwen3.5-2B GGUF — quantized by lmstudio-community
+// Original model: https://huggingface.co/Qwen/Qwen3.5-2B
+// GGUF: https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF
+const QWEN_2B_FILES: &[ModelFile] = &[ModelFile {
+    url: "https://huggingface.co/lmstudio-community/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q8_0.gguf",
+    filename: "Qwen3.5-2B-Q8_0.gguf",
+}];
+
+const QWEN_2B: ModelInfo = ModelInfo {
+    id: "qwen3.5-2b",
+    name: "Qwen3.5-2B (Q8_0)",
+    dirname: "Qwen3.5-2B-Q8_0.gguf",
+    is_directory: false,
+    kind: ModelKind::Llm,
+    is_downloaded: false,
+    files: QWEN_2B_FILES,
 };
 
 /// All models that Telemuze knows about.
@@ -128,7 +147,8 @@ fn default_models() -> HashMap<&'static str, ModelInfo> {
     let mut m = HashMap::new();
     m.insert(PARAKEET.id, PARAKEET);
     m.insert(SILERO_VAD.id, SILERO_VAD);
-    m.insert(QWEN_LLM.id, QWEN_LLM);
+    m.insert(QWEN_0_8B.id, QWEN_0_8B);
+    m.insert(QWEN_2B.id, QWEN_2B);
     m
 }
 
@@ -160,11 +180,13 @@ impl ModelManager {
     }
 
     /// Directory where models are stored.
+    #[allow(dead_code)]
     pub fn models_dir(&self) -> &Path {
         &self.models_dir
     }
 
     /// Return the on-disk path for a model.
+    #[allow(dead_code)]
     pub fn model_path(&self, model_id: &str) -> Result<PathBuf> {
         let models = self.models.lock().unwrap();
         let info = models.get(model_id).context("Unknown model id")?;
@@ -193,15 +215,14 @@ impl ModelManager {
         bail!("No VAD model downloaded")
     }
 
-    /// Return the LLM GGUF model file path (first downloaded LLM model).
-    pub fn llm_model_path(&self) -> Result<PathBuf> {
+    /// Return the on-disk path for a specific LLM model by id.
+    pub fn llm_model_path(&self, model_id: &str) -> Result<PathBuf> {
         let models = self.models.lock().unwrap();
-        for info in models.values() {
-            if matches!(info.kind, ModelKind::Llm) && info.is_downloaded {
-                return Ok(self.models_dir.join(info.dirname));
-            }
+        let info = models.get(model_id).context("Unknown LLM model id")?;
+        if !info.is_downloaded {
+            bail!("LLM model {} is not downloaded", model_id);
         }
-        bail!("No LLM model downloaded")
+        Ok(self.models_dir.join(info.dirname))
     }
 
     /// Check whether all required models (at least one STT + one VAD) are
@@ -218,20 +239,15 @@ impl ModelManager {
         has_stt && has_vad
     }
 
-    /// Check whether the LLM GGUF model is downloaded.
-    pub fn llm_model_available(&self) -> bool {
+    /// Download a specific LLM model if not already present.
+    pub async fn ensure_llm_model(&self, model_id: &str) -> Result<()> {
         let models = self.models.lock().unwrap();
-        models
-            .values()
-            .any(|m| matches!(m.kind, ModelKind::Llm) && m.is_downloaded)
-    }
-
-    /// Download just the LLM model if not already present.
-    pub async fn ensure_llm_model(&self) -> Result<()> {
-        if self.llm_model_available() {
+        let info = models.get(model_id).context("Unknown LLM model id")?;
+        if info.is_downloaded {
             return Ok(());
         }
-        self.download_model(QWEN_LLM.id).await
+        drop(models);
+        self.download_model(model_id).await
     }
 
     /// Ensure all required (non-LLM) models are downloaded. Downloads any
@@ -334,6 +350,7 @@ impl ModelManager {
     }
 
     /// Cancel an in-progress download.
+    #[allow(dead_code)]
     pub fn cancel_download(&self, model_id: &str) {
         let flags = self.cancel_flags.lock().unwrap();
         if let Some(flag) = flags.get(model_id) {

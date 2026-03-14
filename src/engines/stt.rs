@@ -46,6 +46,7 @@ impl SttEngine {
     }
 
     /// Transcribe with timestamps, returning segments.
+    #[allow(dead_code)]
     pub fn transcribe_with_timestamps(&mut self, pcm_16khz: &[f32]) -> Result<Vec<TranscriptSegment>> {
         let result = self
             .engine
@@ -74,6 +75,7 @@ impl SttEngine {
 }
 
 /// A timestamped segment of transcribed text.
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TranscriptSegment {
     pub start: f64,

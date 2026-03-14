@@ -54,7 +54,7 @@ impl AppState {
         // Initialize LLM engine:
         // - If --llm-api-url is set, use HTTP backend
         // - If --llm-model-path is set, use native with that GGUF
-        // - Otherwise, auto-download Qwen3.5-0.8B and use native
+        // - Otherwise, auto-download based on --llm-model-size
         info!("Initializing LLM engine...");
         let llm_engine = if !config.llm_api_url.is_empty() {
             LlmEngine::new_http(&config.llm_api_url)
@@ -62,9 +62,10 @@ impl AppState {
             let gguf_path = if let Some(ref path) = config.llm_model_path {
                 path.clone()
             } else {
-                info!("Downloading LLM model...");
-                mgr.ensure_llm_model().await?;
-                mgr.llm_model_path()?
+                let model_id = format!("qwen3.5-{}", config.llm_model_size);
+                info!("Ensuring LLM model {} is available...", model_id);
+                mgr.ensure_llm_model(&model_id).await?;
+                mgr.llm_model_path(&model_id)?
             };
             LlmEngine::new_native(&gguf_path, config.llm_temperature)?
         };

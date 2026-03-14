@@ -1,11 +1,7 @@
-//! Endpoint B: Smart dictation endpoint.
+//! Smart dictation endpoints.
 //!
-//! `POST /v1/dictate/smart`
-//!
-//! The primary endpoint for desktop dictation. Audio is transcribed via STT
-//! then passed through the local LLM for context-aware grammar correction
-//! and custom term injection. Returns plain text (no JSON) for zero-overhead
-//! client-side processing.
+//! `POST /v1/dictate/smart`  — Audio → STT → LLM correction → plain text
+//! `POST /v1/dictate/correct` — Text → LLM correction → plain text (no audio)
 
 use axum::extract::{Multipart, State};
 use axum::http::StatusCode;
@@ -13,13 +9,15 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::audio;
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
-    Router::new().route("/v1/dictate/smart", post(handle_smart_dictation))
+    Router::new()
+        .route("/v1/dictate/smart", post(handle_smart_dictation))
+        .route("/v1/dictate/correct", post(handle_correct))
 }
 
 async fn handle_smart_dictation(
@@ -97,6 +95,43 @@ async fn handle_smart_dictation(
     info!("Corrected: '{}'", corrected);
 
     // Return plain text — no JSON wrapper needed
+    Response::builder()
+        .header("content-type", "text/plain; charset=utf-8")
+        .body(corrected)
+        .unwrap()
+        .into_response()
+}
+
+/// Text-only LLM correction — skips audio/STT, useful for testing.
+async fn handle_correct(
+    State(state): State<Arc<AppState>>,
+    body: String,
+) -> impl IntoResponse {
+    let raw_text = body.trim();
+    if raw_text.is_empty() {
+        return (StatusCode::BAD_REQUEST, "Empty input").into_response();
+    }
+
+    debug!("Correct request: '{}'", raw_text);
+
+    let corrected = match state
+        .llm_engine
+        .correct_dictation(raw_text, &state.terms_content)
+        .await
+    {
+        Ok(text) => text,
+        Err(e) => {
+            error!("LLM correction failed: {e}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("LLM correction failed: {e}"),
+            )
+                .into_response();
+        }
+    };
+
+    info!("Correct: '{}' -> '{}'", raw_text, corrected);
+
     Response::builder()
         .header("content-type", "text/plain; charset=utf-8")
         .body(corrected)

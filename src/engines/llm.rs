@@ -63,6 +63,7 @@ enum LlmInner {
         client: reqwest::Client,
         api_url: String,
     },
+    #[allow(dead_code)]
     Disabled,
 }
 
@@ -147,6 +148,7 @@ impl LlmEngine {
     }
 
     /// Create a disabled LLM engine (returns raw STT text).
+    #[allow(dead_code)]
     pub fn disabled() -> Self {
         warn!("LLM engine disabled — smart dictation will return raw STT output");
         Self {
@@ -328,19 +330,27 @@ impl LlmEngine {
 }
 
 /// Build the system prompt for dictation correction.
+///
+/// The terms file is a simple list of correct terms (one per line).
+/// The model is expected to recognize when STT output contains words
+/// that sound like these terms and substitute the correct spelling.
 fn build_system_prompt(terms_content: &str) -> String {
     let terms_section = if terms_content.is_empty() {
         String::from("No custom terms configured.")
     } else {
-        format!(
-            "Custom terms (correct spelling = common misspellings):\n{terms_content}"
-        )
+        let terms: Vec<&str> = terms_content
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .collect();
+        format!("Custom terms:\n{}", terms.join("\n"))
     };
 
     format!(
-        "You are a dictation post-processor. Replace misspelled words using the custom terms list below. \
-        Do NOT fix grammar, punctuation, or capitalization. Do NOT add, remove, or rephrase anything. \
-        Output ONLY the corrected text with no commentary.\n\
+        "You are a speech-to-text post-processor. The input may contain words or phrases \
+        that were misrecognized by speech recognition. When a word or phrase sounds like \
+        one of the custom terms below, replace it with the correct term. \
+        Do NOT change anything else. Output ONLY the corrected text.\n\
         \n\
         {terms_section}"
     )
