@@ -10,10 +10,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use grammers_client::client::{Client, UpdatesConfiguration};
 use grammers_client::media::Media;
+use grammers_client::message::{InputMessage, Message as GrammersMessage};
 use grammers_client::update::Update;
 use grammers_client::SenderPool;
 use grammers_session::storages::MemorySession;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::audio;
 use crate::state::AppState;
@@ -58,6 +59,36 @@ pub async fn run_bot(
                 });
             }
             _ => {}
+        }
+    }
+}
+
+/// A status message that can be updated and eventually deleted.
+struct StatusMessage {
+    msg: GrammersMessage,
+}
+
+impl StatusMessage {
+    /// Send an initial status reply to the user's message.
+    async fn new(
+        reply_to: &grammers_client::update::Message,
+        text: &str,
+    ) -> Result<Self> {
+        let msg = reply_to.reply(text).await?;
+        Ok(Self { msg })
+    }
+
+    /// Update the status message text.
+    async fn update(&self, text: &str) {
+        if let Err(e) = self.msg.edit(InputMessage::new().text(text)).await {
+            warn!("Failed to update status message: {e}");
+        }
+    }
+
+    /// Delete the status message.
+    async fn delete(self) {
+        if let Err(e) = self.msg.delete().await {
+            warn!("Failed to delete status message: {e}");
         }
     }
 }
@@ -108,15 +139,17 @@ async fn handle_message(
                     "Telegram: voice note from {:?}",
                     message.sender_id()
                 );
+                let status = StatusMessage::new(message, "Receiving voice note...").await?;
                 let bytes = download_media(client, &media).await?;
-                transcribe_and_reply(message, &bytes, state, "voice note").await?;
+                transcribe_and_reply(client, message, &bytes, state, "voice note", status).await?;
             } else if is_audio_video {
                 info!(
                     "Telegram: audio/video file ({mime}) from {:?}",
                     message.sender_id()
                 );
+                let status = StatusMessage::new(message, "Receiving file...").await?;
                 let bytes = download_media(client, &media).await?;
-                transcribe_and_reply(message, &bytes, state, "long-form").await?;
+                transcribe_and_reply(client, message, &bytes, state, "long-form", status).await?;
             } else {
                 message
                     .reply(format!("Unsupported file type: {mime}"))
@@ -145,28 +178,44 @@ async fn download_media(client: &Client, media: &Media) -> Result<Vec<u8>> {
 
 /// Transcribe audio bytes via VAD+STT and reply with the result.
 async fn transcribe_and_reply(
+    client: &Client,
     message: &grammers_client::update::Message,
     bytes: &[u8],
     state: &AppState,
     label: &str,
+    status: StatusMessage,
 ) -> Result<()> {
+    status.update("Decoding audio...").await;
     let pcm = audio::decode_to_pcm(bytes)?;
     let duration_secs = pcm.len() as f64 / 16_000.0;
     info!("Telegram {label}: {:.1}s of audio", duration_secs);
 
+    let duration_display = format_duration(duration_secs);
+    status
+        .update(&format!("Transcribing {duration_display} of audio..."))
+        .await;
+
     let segments = state.vad_transcribe(&pcm)?;
-    let full_text: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+    let full_text: String = segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    status.delete().await;
 
     if full_text.is_empty() {
         message.reply("No speech detected.").await?;
     } else {
-        send_long_reply(message, &full_text).await?;
+        send_reply(client, message, &full_text).await?;
     }
     Ok(())
 }
 
-/// Split text into chunks of at most TELEGRAM_MAX_LEN and send each as a reply.
-async fn send_long_reply(
+/// Send the transcript as a reply. If it fits in a single message, send as text.
+/// If it exceeds the Telegram limit, upload as a .txt file instead.
+async fn send_reply(
+    client: &Client,
     message: &grammers_client::update::Message,
     text: &str,
 ) -> Result<()> {
@@ -175,48 +224,31 @@ async fn send_long_reply(
         return Ok(());
     }
 
-    for chunk in split_text(text, TELEGRAM_MAX_LEN) {
-        message.reply(chunk).await?;
-    }
+    // Too long for a message — send as a text file.
+    let bytes = text.as_bytes();
+    let mut cursor = std::io::Cursor::new(bytes);
+    let uploaded = client
+        .upload_stream(&mut cursor, bytes.len(), "transcript.txt".into())
+        .await?;
+    let input = InputMessage::new()
+        .text("Transcript too long for a message — sent as file.")
+        .file(uploaded);
+    message.reply(input).await?;
+
     Ok(())
 }
 
-fn split_text(text: &str, max_len: usize) -> Vec<&str> {
-    let mut chunks = Vec::new();
-    let mut start = 0;
-
-    while start < text.len() {
-        let remaining = text.len() - start;
-        if remaining <= max_len {
-            chunks.push(&text[start..]);
-            break;
-        }
-
-        // Find a split point at a space boundary within max_len
-        let end = start + max_len;
-        let split_at = text[start..end]
-            .rfind(' ')
-            .map(|pos| start + pos)
-            .unwrap_or(end);
-
-        // Ensure we're at a char boundary
-        let split_at = if !text.is_char_boundary(split_at) {
-            let mut pos = split_at;
-            while pos > start && !text.is_char_boundary(pos) {
-                pos -= 1;
-            }
-            pos
-        } else {
-            split_at
-        };
-
-        chunks.push(&text[start..split_at]);
-        start = if split_at < text.len() && text.as_bytes()[split_at] == b' ' {
-            split_at + 1
-        } else {
-            split_at
-        };
+/// Format a duration in seconds into a human-readable string.
+fn format_duration(secs: f64) -> String {
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    if h > 0 {
+        format!("{h}h {m:02}m {s:02}s")
+    } else if m > 0 {
+        format!("{m}m {s:02}s")
+    } else {
+        format!("{s}s")
     }
-
-    chunks
 }
