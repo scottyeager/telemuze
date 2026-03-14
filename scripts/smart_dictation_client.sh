@@ -117,13 +117,13 @@ if [ -f "$PID_FILE" ]; then
     dismiss_notification "$NOTIFY_ID"
     rm -f "$NOTIFY_ID_FILE"
 
-    if [ -n "$FINAL_TEXT" ]; then
+    ERR_MSG=$(cat "$CURL_ERR")
+    if [ -n "$ERR_MSG" ]; then
+        show_notification "Dictation failed" "$ERR_MSG" >/dev/null
+        play_sound "dialog-error"
+    elif [ -n "$FINAL_TEXT" ]; then
         type_text "$FINAL_TEXT"
         play_sound "message-new-instant"
-    else
-        ERR_MSG=$(cat "$CURL_ERR")
-        show_notification "Dictation failed" "${ERR_MSG:-No response from server}" >/dev/null
-        play_sound "dialog-error"
     fi
     rm -f "$CURL_ERR"
 else
