@@ -14,6 +14,9 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 use tracing::debug;
 
+/// Maximum Opus frame size at 48kHz (120ms).
+const OPUS_MAX_FRAME_SIZE_48K: usize = 5760;
+
 /// Target sample rate for all STT models.
 const TARGET_SAMPLE_RATE: u32 = 16_000;
 
@@ -25,6 +28,15 @@ const TARGET_SAMPLE_RATE: u32 = 16_000;
 /// 3. Rubato resamples to exactly 16kHz
 /// 4. Multi-channel audio is mixed down to mono
 pub fn decode_to_pcm(data: &[u8]) -> Result<Vec<f32>> {
+    // Try OGG/Opus first (Telegram voice notes use this format,
+    // and symphonia doesn't support the Opus codec).
+    if data.starts_with(b"OggS") {
+        if let Ok(samples) = decode_ogg_opus(data) {
+            return Ok(samples);
+        }
+        // Not Opus inside OGG — fall through to symphonia (e.g. Vorbis)
+    }
+
     let cursor = std::io::Cursor::new(data.to_vec());
     let mss = MediaSourceStream::new(Box::new(cursor), Default::default());
 
@@ -113,6 +125,85 @@ pub fn decode_to_pcm(data: &[u8]) -> Result<Vec<f32>> {
     } else {
         debug!(
             "Resampling from {}Hz to {}Hz",
+            source_sample_rate, TARGET_SAMPLE_RATE
+        );
+        resample(&mono_samples, source_sample_rate, TARGET_SAMPLE_RATE)
+    }
+}
+
+/// Decode OGG/Opus audio using ogg demuxer + libopus (via audiopus).
+fn decode_ogg_opus(data: &[u8]) -> Result<Vec<f32>> {
+    use audiopus::coder::Decoder as OpusDecoder;
+    use audiopus::{Channels, SampleRate};
+    use ogg::PacketReader;
+
+    let cursor = std::io::Cursor::new(data.to_vec());
+    let mut packet_reader = PacketReader::new(cursor);
+
+    // First packet is the OpusHead header — extract channel count.
+    let head_packet = packet_reader
+        .read_packet()
+        .context("Failed to read OGG packets")?
+        .context("Empty OGG stream")?;
+
+    let head = &head_packet.data;
+    anyhow::ensure!(
+        head.len() >= 19 && &head[..8] == b"OpusHead",
+        "Not an Opus stream"
+    );
+    let ch_count = head[9] as usize;
+    let channels = if ch_count >= 2 {
+        Channels::Stereo
+    } else {
+        Channels::Mono
+    };
+    // Opus always decodes at 48kHz internally.
+    let source_sample_rate = 48_000u32;
+
+    debug!("OGG/Opus: {} channel(s)", ch_count);
+
+    let mut decoder = OpusDecoder::new(SampleRate::Hz48000, channels)
+        .context("Failed to create Opus decoder")?;
+
+    // Second packet is the OpusTags comment header — skip it.
+    let _ = packet_reader.read_packet()?;
+
+    // Decode all remaining packets.
+    let mut all_samples: Vec<f32> = Vec::new();
+    let ch = ch_count.max(1);
+    let mut pcm_buf = vec![0.0f32; OPUS_MAX_FRAME_SIZE_48K * ch];
+
+    loop {
+        match packet_reader.read_packet() {
+            Ok(Some(pkt)) => {
+                match decoder.decode_float(Some(pkt.data.as_slice()), &mut pcm_buf, false) {
+                    Ok(samples_per_channel) => {
+                        let total = samples_per_channel * ch;
+                        all_samples.extend_from_slice(&pcm_buf[..total]);
+                    }
+                    Err(_) => continue, // skip corrupt packets
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
+
+    anyhow::ensure!(!all_samples.is_empty(), "No Opus samples decoded");
+
+    // Mixdown to mono if multi-channel
+    let mono_samples = if ch > 1 {
+        mixdown_to_mono(&all_samples, ch)
+    } else {
+        all_samples
+    };
+
+    // Resample from 48kHz to 16kHz
+    if source_sample_rate == TARGET_SAMPLE_RATE {
+        Ok(mono_samples)
+    } else {
+        debug!(
+            "Resampling Opus from {}Hz to {}Hz",
             source_sample_rate, TARGET_SAMPLE_RATE
         );
         resample(&mono_samples, source_sample_rate, TARGET_SAMPLE_RATE)

@@ -143,7 +143,7 @@ async fn download_media(client: &Client, media: &Media) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Smart dictation pipeline: STT -> LLM correction (mirrors /v1/dictate/smart)
+/// Dictation pipeline: STT only (skips LLM correction for Telegram)
 async fn handle_voice_note(
     message: &grammers_client::update::Message,
     bytes: &[u8],
@@ -151,20 +151,8 @@ async fn handle_voice_note(
 ) -> Result<()> {
     let pcm = audio::decode_to_pcm(bytes)?;
 
-    let raw_text = state.stt_engine.lock().unwrap().transcribe(&pcm)?;
-    info!("Telegram voice STT: '{raw_text}'");
-
-    let text = match state
-        .llm_engine
-        .correct_dictation(&raw_text, &state.terms_content)
-        .await
-    {
-        Ok(corrected) => corrected,
-        Err(e) => {
-            error!("LLM correction failed, returning raw STT: {e}");
-            raw_text
-        }
-    };
+    let text = state.stt_engine.lock().unwrap().transcribe(&pcm)?;
+    info!("Telegram voice STT: '{text}'");
 
     send_long_reply(message, &text).await?;
     Ok(())
