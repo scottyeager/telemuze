@@ -6,7 +6,7 @@ use tracing::{error, info};
 use crate::config::Config;
 use crate::engines::llm::LlmEngine;
 use crate::engines::stt::SttEngine;
-use crate::engines::vad::VadEngine;
+use crate::engines::vad::{SpeechSegment, VadEngine};
 use crate::models::ModelManager;
 
 /// A transcribed speech segment with timestamps.
@@ -147,5 +147,38 @@ impl AppState {
         }
 
         Ok(results)
+    }
+
+    /// Run VAD segmentation only, returning the speech segments for
+    /// callers that want to drive STT themselves (e.g. with progress updates).
+    pub fn vad_segment(&self, pcm: &[f32]) -> Result<Vec<SpeechSegment>> {
+        let segments = self.vad_engine.lock().unwrap().segment_audio(pcm)?;
+        info!("VAD found {} speech segments", segments.len());
+        Ok(segments)
+    }
+
+    /// Transcribe a single speech segment, returning the text (or empty on failure).
+    pub fn transcribe_segment(&self, seg: &SpeechSegment, index: usize, total: usize) -> Option<TranscribedSegment> {
+        match self.stt_engine.lock().unwrap().transcribe(&seg.samples) {
+            Ok(text) if !text.trim().is_empty() => {
+                info!(
+                    "Segment {}/{}: [{:.1}s - {:.1}s] '{text}'",
+                    index + 1,
+                    total,
+                    seg.start_secs,
+                    seg.end_secs,
+                );
+                Some(TranscribedSegment {
+                    start_secs: seg.start_secs,
+                    end_secs: seg.end_secs,
+                    text,
+                })
+            }
+            Ok(_) => None,
+            Err(e) => {
+                error!("STT failed for segment {}: {e}", index + 1);
+                None
+            }
+        }
     }
 }

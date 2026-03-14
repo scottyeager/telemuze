@@ -195,8 +195,28 @@ async fn transcribe_and_reply(
         .update(&format!("Transcribing {duration_display} of audio..."))
         .await;
 
-    let segments = state.vad_transcribe(&pcm)?;
-    let full_text: String = segments
+    let segments = state.vad_segment(&pcm)?;
+    let total = segments.len();
+
+    let mut results = Vec::with_capacity(total);
+    for (i, seg) in segments.iter().enumerate() {
+        // Update progress for multi-segment transcriptions.
+        if total > 1 {
+            let position = format_duration(seg.start_secs);
+            status
+                .update(&format!(
+                    "Transcribing {duration_display} of audio... (segment {}/{total}, {position})",
+                    i + 1,
+                ))
+                .await;
+        }
+
+        if let Some(result) = state.transcribe_segment(seg, i, total) {
+            results.push(result);
+        }
+    }
+
+    let full_text: String = results
         .iter()
         .map(|s| s.text.as_str())
         .collect::<Vec<_>>()
