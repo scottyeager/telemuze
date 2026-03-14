@@ -51,10 +51,15 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_TERMS_FILE")]
     pub terms_file: Option<PathBuf>,
 
-    /// Temperature for LLM sampling (native backend).
+    /// Temperature for LLM sampling during dictation post-processing.
     /// Qwen3.5 recommends 1.0 for non-thinking mode.
     #[arg(long, env = "TELEMUZE_LLM_TEMPERATURE", default_value_t = 1.0)]
     pub llm_temperature: f32,
+
+    /// Temperature for LLM sampling during transcript summarization.
+    /// Lower values produce more focused, faithful summaries.
+    #[arg(long, env = "TELEMUZE_LLM_SUMMARY_TEMPERATURE", default_value_t = 0.7)]
+    pub llm_summary_temperature: f32,
 
     /// Telegram API ID (from https://my.telegram.org)
     #[arg(long, env = "TELEGRAM_API_ID", default_value_t = 0)]

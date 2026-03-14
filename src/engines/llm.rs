@@ -30,6 +30,10 @@ const MAX_OUTPUT_TOKENS: i32 = 512;
 /// Context size for native inference. Covers prompt + output.
 const CONTEXT_SIZE: u32 = 2048;
 
+/// Maximum input characters for summarization. Leaves room for the system
+/// prompt (~100 tokens) and output (~512 tokens) within the context window.
+const MAX_SUMMARY_INPUT_CHARS: usize = 5000;
+
 /// LLM engine with pluggable backends.
 pub struct LlmEngine {
     inner: LlmInner,
@@ -169,37 +173,89 @@ impl LlmEngine {
             return Ok(String::new());
         }
 
+        let system_prompt = build_dictation_prompt(terms_content);
+        let temperature = match &self.inner {
+            LlmInner::Native(state) => state.temperature,
+            _ => 0.1,
+        };
+
+        let result = self.generate(&system_prompt, raw_text, temperature).await?;
+        debug!("LLM correction: '{}' -> '{}'", raw_text, result);
+        Ok(result)
+    }
+
+    /// Summarize a transcript that is too long for a single Telegram message.
+    ///
+    /// Truncates the input if it exceeds the context window capacity.
+    /// Returns the summary text, or the original text unchanged if the
+    /// engine is disabled.
+    pub async fn summarize(
+        &self,
+        text: &str,
+        temperature: f32,
+    ) -> Result<String> {
+        if text.trim().is_empty() {
+            return Ok(String::new());
+        }
+
+        let system_prompt = build_summary_prompt();
+
+        // Truncate input to fit the context window
+        let input = if text.len() > MAX_SUMMARY_INPUT_CHARS {
+            let truncated = &text[..text.floor_char_boundary(MAX_SUMMARY_INPUT_CHARS)];
+            format!(
+                "{truncated}\n\n[Transcript truncated — {total} characters total]",
+                total = text.len()
+            )
+        } else {
+            text.to_string()
+        };
+
+        let result = self.generate(&system_prompt, &input, temperature).await?;
+        debug!(
+            "LLM summary: {} chars input -> {} chars output",
+            text.len(),
+            result.len()
+        );
+        Ok(result)
+    }
+
+    // ── Shared inference ────────────────────────────────────────────────
+
+    async fn generate(
+        &self,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
+    ) -> Result<String> {
         match &self.inner {
             LlmInner::Native(state) => {
-                Self::correct_native(state, raw_text, terms_content)
+                Self::generate_native(state, system_prompt, user_text, temperature)
             }
             LlmInner::Http { client, api_url } => {
-                Self::correct_http(client, api_url, raw_text, terms_content)
+                Self::generate_http(client, api_url, system_prompt, user_text, temperature)
                     .await
             }
             LlmInner::Disabled => {
-                debug!("LLM disabled — returning raw STT text");
-                Ok(raw_text.to_string())
+                debug!("LLM disabled — returning input text unchanged");
+                Ok(user_text.to_string())
             }
         }
     }
 
     // ── Native backend ──────────────────────────────────────────────────
 
-    fn correct_native(
+    fn generate_native(
         state: &NativeState,
-        raw_text: &str,
-        terms_content: &str,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
     ) -> Result<String> {
-        let system_prompt = build_system_prompt(terms_content);
-
-        // Build the prompt manually using ChatML format with a pre-closed
-        // <think> block to suppress Qwen3.5's thinking mode. The model's
-        // template does this when enable_thinking=false — an empty
-        // <think></think> signals the model to skip reasoning.
+        // Build the prompt using ChatML format with a pre-closed <think>
+        // block to suppress Qwen3.5's thinking mode.
         let prompt = format!(
             "<|im_start|>system\n{system_prompt}<|im_end|>\n\
-             <|im_start|>user\n{raw_text}<|im_end|>\n\
+             <|im_start|>user\n{user_text}<|im_end|>\n\
              <|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
 
@@ -228,7 +284,7 @@ impl LlmEngine {
             .map_err(|e| anyhow::anyhow!("Failed to decode prompt: {e:?}"))?;
 
         // Sample output tokens using Qwen3.5 recommended non-thinking params:
-        // top_k=20, presence_penalty=2.0, temperature from config
+        // top_k=20, presence_penalty=2.0, temperature from caller
         let mut sampler = LlamaSampler::chain_simple([
             LlamaSampler::penalties(
                 256,  // penalty_last_n: look back window
@@ -237,7 +293,7 @@ impl LlmEngine {
                 2.0,  // penalty_present
             ),
             LlamaSampler::top_k(20),
-            LlamaSampler::temp(state.temperature),
+            LlamaSampler::temp(temperature),
             LlamaSampler::dist(1234),
         ]);
 
@@ -269,34 +325,31 @@ impl LlmEngine {
                 .map_err(|e| anyhow::anyhow!("Failed to decode token: {e:?}"))?;
         }
 
-        let result = output.trim().to_string();
-        debug!("LLM correction: '{}' -> '{}'", raw_text, result);
-        Ok(result)
+        Ok(output.trim().to_string())
     }
 
     // ── HTTP backend ────────────────────────────────────────────────────
 
-    async fn correct_http(
+    async fn generate_http(
         client: &reqwest::Client,
         api_url: &str,
-        raw_text: &str,
-        terms_content: &str,
+        system_prompt: &str,
+        user_text: &str,
+        temperature: f32,
     ) -> Result<String> {
-        let system_prompt = build_system_prompt(terms_content);
-
         let request = ChatRequest {
             model: "local".to_string(),
             messages: vec![
                 ChatMessage {
                     role: "system".to_string(),
-                    content: system_prompt,
+                    content: system_prompt.to_string(),
                 },
                 ChatMessage {
                     role: "user".to_string(),
-                    content: raw_text.to_string(),
+                    content: user_text.to_string(),
                 },
             ],
-            temperature: 0.1,
+            temperature,
             max_tokens: 2048,
         };
 
@@ -322,9 +375,8 @@ impl LlmEngine {
             .choices
             .first()
             .map(|c| c.message.content.trim().to_string())
-            .unwrap_or_else(|| raw_text.to_string());
+            .unwrap_or_else(|| user_text.to_string());
 
-        debug!("LLM correction: '{}' -> '{}'", raw_text, text);
         Ok(text)
     }
 }
@@ -334,7 +386,7 @@ impl LlmEngine {
 /// The terms file is a simple list of correct terms (one per line).
 /// The model is expected to recognize when STT output contains words
 /// that sound like these terms and substitute the correct spelling.
-fn build_system_prompt(terms_content: &str) -> String {
+fn build_dictation_prompt(terms_content: &str) -> String {
     let terms_section = if terms_content.is_empty() {
         String::from("No custom terms configured.")
     } else {
@@ -353,6 +405,15 @@ fn build_system_prompt(terms_content: &str) -> String {
         Do NOT change anything else. Output ONLY the corrected text.\n\
         \n\
         {terms_section}"
+    )
+}
+
+/// Build the system prompt for transcript summarization.
+fn build_summary_prompt() -> String {
+    String::from(
+        "You are a transcript summarizer. The input is a speech-to-text transcript. \
+        Write a concise summary capturing the key points, main topics, and any \
+        important details or decisions. Output ONLY the summary text, nothing else."
     )
 }
 

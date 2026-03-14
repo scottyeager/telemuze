@@ -27,6 +27,7 @@ pub struct AppState {
     pub vad_engine: Mutex<VadEngine>,
     pub terms_content: String,
     pub telegram_allowed_users: HashSet<String>,
+    pub summary_temperature: f32,
 }
 
 impl AppState {
@@ -112,6 +113,7 @@ impl AppState {
             vad_engine: Mutex::new(vad_engine),
             terms_content,
             telegram_allowed_users,
+            summary_temperature: config.llm_summary_temperature,
         })
     }
 
