@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use tracing::{error, info};
 
 use crate::config::Config;
+use crate::engines::dictionary::{Dictionary, PipelineConfig};
 use crate::engines::llm::LlmEngine;
 use crate::engines::stt::SttEngine;
 use crate::engines::vad::{SpeechSegment, VadEngine};
@@ -26,6 +27,9 @@ pub struct AppState {
     pub llm_engine: LlmEngine,
     pub vad_engine: Mutex<VadEngine>,
     pub terms_content: String,
+    pub dictionary: Dictionary,
+    pub pipeline_config: PipelineConfig,
+    pub disable_llm_correction: bool,
     pub telegram_allowed_users: HashSet<String>,
 }
 
@@ -102,6 +106,22 @@ impl AppState {
             .filter(|s| !s.is_empty())
             .collect();
 
+        // Build phonetic dictionary from terms
+        let dictionary = Dictionary::from_terms_content(&terms_content);
+
+        let pipeline_config = PipelineConfig {
+            phonetic_enabled: !config.disable_phonetic_match,
+            fuzzy_enabled: !config.disable_fuzzy_match,
+            fuzzy_threshold: config.fuzzy_threshold,
+        };
+        info!(
+            "Dictionary pipeline: phonetic={}, fuzzy={} (threshold={:.2}), llm={}",
+            pipeline_config.phonetic_enabled,
+            pipeline_config.fuzzy_enabled,
+            pipeline_config.fuzzy_threshold,
+            !config.disable_llm_correction,
+        );
+
         if !telegram_allowed_users.is_empty() {
             info!("Telegram allowed users: {:?}", telegram_allowed_users);
         }
@@ -111,6 +131,9 @@ impl AppState {
             llm_engine,
             vad_engine: Mutex::new(vad_engine),
             terms_content,
+            dictionary,
+            pipeline_config,
+            disable_llm_correction: config.disable_llm_correction,
             telegram_allowed_users,
         })
     }

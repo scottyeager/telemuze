@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 
 use crate::audio;
+use crate::engines::dictionary;
 use crate::state::AppState;
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -78,17 +79,29 @@ async fn handle_smart_dictation(
 
     info!("Raw STT: '{}'", raw_text);
 
-    // Step 3: LLM correction with custom dictionary
-    let corrected = match state
-        .llm_engine
-        .correct_dictation(&raw_text, &state.terms_content)
-        .await
-    {
-        Ok(text) => text,
-        Err(e) => {
-            error!("LLM correction failed, returning raw STT: {e}");
-            // Graceful degradation: return raw STT if LLM fails
-            raw_text
+    // Step 3: Phonetic/fuzzy dictionary pipeline
+    let candidates = state.dictionary.find_candidates(&raw_text, &state.pipeline_config);
+    let candidate_hints = if candidates.is_empty() {
+        None
+    } else {
+        Some(dictionary::format_candidates_for_llm(&candidates))
+    };
+
+    // Step 4: LLM correction (with candidate hints if available)
+    let corrected = if state.disable_llm_correction {
+        debug!("LLM correction disabled, returning raw STT");
+        raw_text
+    } else {
+        match state
+            .llm_engine
+            .correct_dictation(&raw_text, &state.terms_content, candidate_hints.as_deref())
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                error!("LLM correction failed, returning raw STT: {e}");
+                raw_text
+            }
         }
     };
 
@@ -114,19 +127,32 @@ async fn handle_correct(
 
     debug!("Correct request: '{}'", raw_text);
 
-    let corrected = match state
-        .llm_engine
-        .correct_dictation(raw_text, &state.terms_content)
-        .await
-    {
-        Ok(text) => text,
-        Err(e) => {
-            error!("LLM correction failed: {e}");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("LLM correction failed: {e}"),
-            )
-                .into_response();
+    // Run phonetic/fuzzy pipeline
+    let candidates = state.dictionary.find_candidates(raw_text, &state.pipeline_config);
+    let candidate_hints = if candidates.is_empty() {
+        None
+    } else {
+        Some(dictionary::format_candidates_for_llm(&candidates))
+    };
+
+    let corrected = if state.disable_llm_correction {
+        debug!("LLM correction disabled, returning input text");
+        raw_text.to_string()
+    } else {
+        match state
+            .llm_engine
+            .correct_dictation(raw_text, &state.terms_content, candidate_hints.as_deref())
+            .await
+        {
+            Ok(text) => text,
+            Err(e) => {
+                error!("LLM correction failed: {e}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("LLM correction failed: {e}"),
+                )
+                    .into_response();
+            }
         }
     };
 

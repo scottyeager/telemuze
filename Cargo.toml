@@ -19,6 +19,10 @@ transcribe-rs = { version = "0.3", features = ["onnx"] }
 # VAD engine
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 
+# Phonetic dictionary pipeline
+rphonetic = "3"
+strsim = "0.11"
+
 # LLM engine — native inference via llama.cpp, or HTTP to external API
 llama-cpp-2 = "0.1"
 encoding_rs = "0.8"
