@@ -83,7 +83,7 @@ async fn handle_smart_dictation(
     // Step 3: LLM correction with custom dictionary
     let corrected = match state
         .llm_engine
-        .correct_dictation(&raw_text, &state.custom_terms)
+        .correct_dictation(&raw_text, &state.terms_content)
         .await
     {
         Ok(text) => text,

@@ -21,7 +21,9 @@ transcribe-rs = { version = "0.3", features = ["onnx"] }
 # VAD engine
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 
-# LLM engine — calls a local OpenAI-compatible API (e.g., mistral.rs server)
+# LLM engine — native inference via llama.cpp, or HTTP to external API
+llama-cpp-2 = "0.1"
+encoding_rs = "0.8"
 reqwest = { version = "0.12", features = ["json", "stream"] }
 
 # Model downloading

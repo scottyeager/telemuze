@@ -30,6 +30,8 @@ pub enum ModelKind {
     Stt,
     /// Voice Activity Detection (Silero VAD single ONNX file).
     Vad,
+    /// Large Language Model (GGUF file for native inference).
+    Llm,
 }
 
 /// A single file to download as part of a model.
@@ -103,11 +105,30 @@ const SILERO_VAD: ModelInfo = ModelInfo {
     files: SILERO_VAD_FILES,
 };
 
+// Qwen3.5-0.8B GGUF — quantized by lmstudio-community
+// Original model: https://huggingface.co/Qwen/Qwen3.5-0.8B
+// GGUF: https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF
+const QWEN_LLM_FILES: &[ModelFile] = &[ModelFile {
+    url: "https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF/resolve/main/Qwen3.5-0.8B-Q8_0.gguf",
+    filename: "Qwen3.5-0.8B-Q8_0.gguf",
+}];
+
+const QWEN_LLM: ModelInfo = ModelInfo {
+    id: "qwen3.5-0.8b",
+    name: "Qwen3.5-0.8B (Q8_0)",
+    dirname: "Qwen3.5-0.8B-Q8_0.gguf",
+    is_directory: false,
+    kind: ModelKind::Llm,
+    is_downloaded: false,
+    files: QWEN_LLM_FILES,
+};
+
 /// All models that Telemuze knows about.
 fn default_models() -> HashMap<&'static str, ModelInfo> {
     let mut m = HashMap::new();
     m.insert(PARAKEET.id, PARAKEET);
     m.insert(SILERO_VAD.id, SILERO_VAD);
+    m.insert(QWEN_LLM.id, QWEN_LLM);
     m
 }
 
@@ -172,8 +193,20 @@ impl ModelManager {
         bail!("No VAD model downloaded")
     }
 
+    /// Return the LLM GGUF model file path (first downloaded LLM model).
+    pub fn llm_model_path(&self) -> Result<PathBuf> {
+        let models = self.models.lock().unwrap();
+        for info in models.values() {
+            if matches!(info.kind, ModelKind::Llm) && info.is_downloaded {
+                return Ok(self.models_dir.join(info.dirname));
+            }
+        }
+        bail!("No LLM model downloaded")
+    }
+
     /// Check whether all required models (at least one STT + one VAD) are
-    /// present on disk.
+    /// present on disk. LLM is optional (native inference is not required
+    /// when an HTTP backend is configured).
     pub fn all_models_available(&self) -> bool {
         let models = self.models.lock().unwrap();
         let has_stt = models
@@ -185,14 +218,31 @@ impl ModelManager {
         has_stt && has_vad
     }
 
-    /// Ensure all required models are downloaded. Downloads any that are
-    /// missing.
+    /// Check whether the LLM GGUF model is downloaded.
+    pub fn llm_model_available(&self) -> bool {
+        let models = self.models.lock().unwrap();
+        models
+            .values()
+            .any(|m| matches!(m.kind, ModelKind::Llm) && m.is_downloaded)
+    }
+
+    /// Download just the LLM model if not already present.
+    pub async fn ensure_llm_model(&self) -> Result<()> {
+        if self.llm_model_available() {
+            return Ok(());
+        }
+        self.download_model(QWEN_LLM.id).await
+    }
+
+    /// Ensure all required (non-LLM) models are downloaded. Downloads any
+    /// that are missing. LLM models are handled separately via
+    /// `ensure_llm_model()`.
     pub async fn ensure_models(&self) -> Result<()> {
         let to_download: Vec<String> = {
             let models = self.models.lock().unwrap();
             models
                 .iter()
-                .filter(|(_, info)| !info.is_downloaded)
+                .filter(|(_, info)| !info.is_downloaded && !matches!(info.kind, ModelKind::Llm))
                 .map(|(id, _)| id.to_string())
                 .collect()
         };

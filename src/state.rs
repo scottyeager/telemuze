@@ -17,7 +17,7 @@ pub struct AppState {
     pub stt_engine: Mutex<SttEngine>,
     pub llm_engine: LlmEngine,
     pub vad_engine: Mutex<VadEngine>,
-    pub custom_terms: Vec<String>,
+    pub terms_content: String,
     pub telegram_allowed_users: HashSet<String>,
 }
 
@@ -25,6 +25,10 @@ impl AppState {
     pub async fn new(config: &Config) -> Result<Self> {
         // Resolve model paths — use explicit paths if given, otherwise
         // auto-download to the models directory.
+        let models_dir = config.resolved_models_dir();
+        info!("Models directory: {}", models_dir.display());
+        let mgr = ModelManager::new(models_dir)?;
+
         let (stt_path, vad_path) = if config.stt_model_path.is_some() && config.vad_model_path.is_some()
         {
             (
@@ -32,12 +36,8 @@ impl AppState {
                 config.vad_model_path.clone().unwrap(),
             )
         } else {
-            let models_dir = config.resolved_models_dir();
-            info!("Models directory: {}", models_dir.display());
-
-            let mgr = ModelManager::new(models_dir)?;
             if !mgr.all_models_available() {
-                info!("Downloading missing models...");
+                info!("Downloading missing STT/VAD models...");
                 mgr.ensure_models().await?;
             }
 
@@ -51,24 +51,40 @@ impl AppState {
         let stt_engine = SttEngine::new(&stt_path)?;
         info!("STT model loaded.");
 
+        // Initialize LLM engine:
+        // - If --llm-api-url is set, use HTTP backend
+        // - If --llm-model-path is set, use native with that GGUF
+        // - Otherwise, auto-download Qwen3.5-0.8B and use native
         info!("Initializing LLM engine...");
-        let llm_engine = LlmEngine::new(&config.llm_api_url).await?;
-        info!("LLM engine ready.");
+        let llm_engine = if !config.llm_api_url.is_empty() {
+            LlmEngine::new_http(&config.llm_api_url)
+        } else {
+            let gguf_path = if let Some(ref path) = config.llm_model_path {
+                path.clone()
+            } else {
+                info!("Downloading LLM model...");
+                mgr.ensure_llm_model().await?;
+                mgr.llm_model_path()?
+            };
+            LlmEngine::new_native(&gguf_path, config.llm_temperature)?
+        };
 
         info!("Loading VAD model from {:?}...", vad_path);
         let vad_engine = VadEngine::new(&vad_path)?;
         info!("VAD model loaded.");
 
-        let custom_terms: Vec<String> = config
-            .custom_terms
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        if !custom_terms.is_empty() {
-            info!("Custom dictionary terms: {:?}", custom_terms);
-        }
+        // Load terms file
+        let terms_file = config.resolved_terms_file();
+        let terms_content = match std::fs::read_to_string(&terms_file) {
+            Ok(content) => {
+                info!("Loaded terms from {}", terms_file.display());
+                content
+            }
+            Err(_) => {
+                info!("No terms file at {} — LLM will correct without custom terms", terms_file.display());
+                String::new()
+            }
+        };
 
         let telegram_allowed_users: HashSet<String> = config
             .telegram_allowed_users
@@ -85,7 +101,7 @@ impl AppState {
             stt_engine: Mutex::new(stt_engine),
             llm_engine,
             vad_engine: Mutex::new(vad_engine),
-            custom_terms,
+            terms_content,
             telegram_allowed_users,
         })
     }

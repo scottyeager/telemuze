@@ -30,13 +30,25 @@ pub struct Config {
 
     /// URL of an OpenAI-compatible chat completions API for LLM correction.
     /// Example: http://127.0.0.1:8081/v1/chat/completions
-    /// Leave empty to disable LLM correction (raw STT output returned).
+    /// When set, uses the HTTP backend instead of native inference.
     #[arg(long, env = "TELEMUZE_LLM_API_URL", default_value = "")]
     pub llm_api_url: String,
 
-    /// Custom dictionary terms for smart dictation (comma-separated)
-    #[arg(long, env = "TELEMUZE_CUSTOM_TERMS", default_value = "")]
-    pub custom_terms: String,
+    /// Path to a GGUF model file for native LLM inference.
+    /// If omitted (and no --llm-api-url), Qwen3.5-0.8B is auto-downloaded.
+    #[arg(long, env = "TELEMUZE_LLM_MODEL_PATH")]
+    pub llm_model_path: Option<PathBuf>,
+
+    /// Path to a terms file for smart dictation correction.
+    /// Each line: CorrectSpelling = misspelling1, misspelling2, ...
+    /// Defaults to ~/.config/telemuze/terms.txt
+    #[arg(long, env = "TELEMUZE_TERMS_FILE")]
+    pub terms_file: Option<PathBuf>,
+
+    /// Temperature for LLM sampling (native backend).
+    /// Qwen3.5 recommends 1.0 for non-thinking mode.
+    #[arg(long, env = "TELEMUZE_LLM_TEMPERATURE", default_value_t = 1.0)]
+    pub llm_temperature: f32,
 
     /// Telegram API ID (from https://my.telegram.org)
     #[arg(long, env = "TELEGRAM_API_ID", default_value_t = 0)]
@@ -67,6 +79,19 @@ impl Config {
                 .unwrap_or_else(|| PathBuf::from("."))
                 .join("telemuze")
                 .join("models")
+        }
+    }
+
+    /// Resolved terms file path, defaulting to
+    /// `~/.config/telemuze/terms.txt`.
+    pub fn resolved_terms_file(&self) -> PathBuf {
+        if let Some(ref path) = self.terms_file {
+            path.clone()
+        } else {
+            dirs_next::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("telemuze")
+                .join("terms.txt")
         }
     }
 }
