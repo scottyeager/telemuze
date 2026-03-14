@@ -5,6 +5,7 @@
 //! Voice notes go through the smart dictation pipeline (STT + LLM),
 //! while audio/video file attachments use the long-form pipeline (VAD + STT).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,9 +14,9 @@ use grammers_client::client::{Client, UpdatesConfiguration};
 use grammers_client::media::Media;
 use grammers_client::message::{InputMessage, Message as GrammersMessage};
 use grammers_client::update::Update;
-use grammers_client::SenderPool;
 use grammers_client::InvocationError;
-use grammers_session::storages::MemorySession;
+use grammers_client::SenderPool;
+use grammers_session::storages::SqliteSession;
 use tokio::time::sleep;
 use tracing::{error, info, warn};
 
@@ -27,6 +28,14 @@ const TELEGRAM_MAX_LEN: usize = 4096;
 
 /// Default delay before reconnecting after an error.
 const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Return the path used to persist the Telegram MTProto session.
+fn session_path() -> PathBuf {
+    dirs_next::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("telemuze")
+        .join("telegram.session")
+}
 
 /// Run the Telegram bot, reconnecting automatically on errors.
 pub async fn run_bot(
@@ -70,7 +79,11 @@ async fn run_bot_once(
     token: String,
     state: &Arc<AppState>,
 ) -> Result<()> {
-    let session = Arc::new(MemorySession::default());
+    let path = session_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let session = Arc::new(SqliteSession::open(&path).await?);
     let pool = SenderPool::new(Arc::clone(&session), api_id);
 
     let client = Client::new(pool.handle);
@@ -78,7 +91,11 @@ async fn run_bot_once(
     // The runner drives all network I/O; it must be spawned.
     tokio::spawn(pool.runner.run());
 
-    client.bot_sign_in(&token, &api_hash).await?;
+    // Reuse existing session if still authorized; only sign in when needed.
+    if !client.is_authorized().await? {
+        info!("Signing in to Telegram...");
+        client.bot_sign_in(&token, &api_hash).await?;
+    }
     info!("Telegram bot connected");
 
     let mut update_stream = client
