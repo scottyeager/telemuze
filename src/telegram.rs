@@ -53,8 +53,8 @@ pub async fn run_bot(
                 let state = state.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_message(&client, &message, &state).await {
-                        error!("Error handling Telegram message: {e}");
-                        let _ = message.reply(format!("Error: {e}")).await;
+                        error!("Error handling Telegram message: {e:#}");
+                        let _ = message.reply(format!("Error: {e:#}")).await;
                     }
                 });
             }

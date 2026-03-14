@@ -5,7 +5,21 @@
 //! files into manageable pieces with accurate timestamps.
 
 use anyhow::{Context, Result};
+use tracing::warn;
 use vad_rs::Vad;
+
+const SAMPLE_RATE: usize = 16_000;
+const FRAME_SIZE: usize = 30 * SAMPLE_RATE / 1000; // 480 samples = 30ms
+
+const POSITIVE_THRESHOLD: f32 = 0.5;
+const NEGATIVE_THRESHOLD: f32 = 0.35;
+const MIN_SPEECH_FRAMES: usize = 3;
+const REDEMPTION_FRAMES: usize = 20;
+
+/// Maximum frames per chunk before resetting the ORT session.
+/// 5 minutes of audio = 10,000 frames at 30ms each.
+/// Keeps us well under the ~22,500-frame ORT corruption threshold.
+const MAX_CHUNK_FRAMES: usize = 10_000;
 
 /// A detected speech segment with start/end times in seconds.
 #[derive(Debug, Clone)]
@@ -37,15 +51,10 @@ impl VadEngine {
     /// Uses Silero VAD to detect speech/silence transitions, processing
     /// 30ms frames (480 samples at 16kHz). Returns speech segments
     /// typically 5-15 seconds long with accurate timestamps.
+    ///
+    /// Long audio is processed in chunks with VAD resets between them
+    /// to avoid ORT session corruption on extended runs.
     pub fn segment_audio(&mut self, pcm_16khz: &[f32]) -> Result<Vec<SpeechSegment>> {
-        const SAMPLE_RATE: usize = 16_000;
-        const FRAME_SIZE: usize = 30 * SAMPLE_RATE / 1000; // 480 samples = 30ms
-
-        const POSITIVE_THRESHOLD: f32 = 0.5;
-        const NEGATIVE_THRESHOLD: f32 = 0.35;
-        const MIN_SPEECH_FRAMES: usize = 3;
-        const REDEMPTION_FRAMES: usize = 20;
-
         self.vad.reset();
 
         let mut segments = Vec::new();
@@ -54,16 +63,58 @@ impl VadEngine {
         let mut redemption_count: usize = 0;
         let mut in_speech = false;
         let mut pos = 0;
+        let mut frames_since_reset: usize = 0;
 
         while pos + FRAME_SIZE <= pcm_16khz.len() {
+            // Reset the VAD periodically to avoid ORT session corruption.
+            if frames_since_reset >= MAX_CHUNK_FRAMES {
+                // Flush any in-progress speech segment before resetting.
+                if in_speech {
+                    if let Some(start) = speech_start.take() {
+                        segments.push(SpeechSegment {
+                            start_secs: start as f64 / SAMPLE_RATE as f64,
+                            end_secs: pos as f64 / SAMPLE_RATE as f64,
+                            samples: pcm_16khz[start..pos].to_vec(),
+                        });
+                    }
+                    in_speech = false;
+                    speech_frames = 0;
+                    redemption_count = 0;
+                }
+                self.vad.reset();
+                frames_since_reset = 0;
+            }
+
             let frame = &pcm_16khz[pos..pos + FRAME_SIZE];
 
-            let result = self
-                .vad
-                .compute(frame)
-                .map_err(|e| anyhow::anyhow!("{e}"))
-                .context("VAD inference failed")?;
-            let prob = result.prob;
+            let prob = match self.vad.compute(frame) {
+                Ok(result) => result.prob,
+                Err(e) => {
+                    warn!(
+                        "VAD inference failed at {:.1}s, resetting: {e}",
+                        pos as f64 / SAMPLE_RATE as f64
+                    );
+                    // Flush any in-progress segment and reset.
+                    if in_speech {
+                        if let Some(start) = speech_start.take() {
+                            segments.push(SpeechSegment {
+                                start_secs: start as f64 / SAMPLE_RATE as f64,
+                                end_secs: pos as f64 / SAMPLE_RATE as f64,
+                                samples: pcm_16khz[start..pos].to_vec(),
+                            });
+                        }
+                        in_speech = false;
+                        speech_frames = 0;
+                        redemption_count = 0;
+                    }
+                    self.vad.reset();
+                    frames_since_reset = 0;
+                    pos += FRAME_SIZE;
+                    continue;
+                }
+            };
+
+            frames_since_reset += 1;
 
             if !in_speech {
                 if prob > POSITIVE_THRESHOLD {

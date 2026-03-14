@@ -6,16 +6,22 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::process::{Command, Stdio};
+use tempfile::NamedTempFile;
 use tracing::debug;
 
 /// Decode any audio/video file into mono f32 PCM at 16kHz.
 ///
-/// Pipes raw bytes into `ffmpeg` which handles all demuxing, decoding,
-/// resampling, and channel mixdown in a single pass.
+/// Writes input to a tempfile and passes the path to `ffmpeg`, which handles
+/// all demuxing, decoding, resampling, and channel mixdown in a single pass.
 pub fn decode_to_pcm(data: &[u8]) -> Result<Vec<f32>> {
-    let mut child = Command::new("ffmpeg")
+    let mut tmp = NamedTempFile::new().context("Failed to create tempfile")?;
+    tmp.write_all(data)
+        .context("Failed to write audio data to tempfile")?;
+
+    let output = Command::new("ffmpeg")
         .args([
-            "-i", "pipe:0",       // read from stdin
+            "-i",
+            tmp.path().to_str().unwrap(),
             "-f", "f32le",        // output raw 32-bit float little-endian
             "-acodec", "pcm_f32le",
             "-ar", "16000",       // resample to 16kHz
@@ -23,21 +29,10 @@ pub fn decode_to_pcm(data: &[u8]) -> Result<Vec<f32>> {
             "-v", "error",        // suppress banner noise
             "pipe:1",             // write to stdout
         ])
-        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn ffmpeg — is it installed?")?;
-
-    // Write input data to ffmpeg's stdin
-    child
-        .stdin
-        .take()
-        .expect("stdin was piped")
-        .write_all(data)
-        .context("Failed to write to ffmpeg stdin")?;
-
-    let output = child
+        .context("Failed to spawn ffmpeg — is it installed?")?
         .wait_with_output()
         .context("Failed to wait for ffmpeg")?;
 
