@@ -43,11 +43,7 @@ async fn main() -> Result<()> {
         let api_id = config.telegram_api_id;
         let api_hash = config.telegram_api_hash.clone();
         let token = config.telegram_bot_token.clone();
-        tokio::spawn(async move {
-            if let Err(e) = telegram::run_bot(api_id, api_hash, token, bot_state).await {
-                tracing::error!("Telegram bot error: {e}");
-            }
-        });
+        tokio::spawn(telegram::run_bot(api_id, api_hash, token, bot_state));
     } else if has_token || has_api_id || has_api_hash {
         let mut missing = Vec::new();
         if !has_token { missing.push("TELEGRAM_BOT_TOKEN"); }

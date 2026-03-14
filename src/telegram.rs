@@ -6,6 +6,7 @@
 //! while audio/video file attachments use the long-form pipeline (VAD + STT).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use grammers_client::client::{Client, UpdatesConfiguration};
@@ -13,7 +14,9 @@ use grammers_client::media::Media;
 use grammers_client::message::{InputMessage, Message as GrammersMessage};
 use grammers_client::update::Update;
 use grammers_client::SenderPool;
+use grammers_client::InvocationError;
 use grammers_session::storages::MemorySession;
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::audio;
@@ -22,14 +25,51 @@ use crate::state::AppState;
 /// Maximum length for a single Telegram message.
 const TELEGRAM_MAX_LEN: usize = 4096;
 
+/// Default delay before reconnecting after an error.
+const DEFAULT_RETRY_DELAY: Duration = Duration::from_secs(5);
+
+/// Run the Telegram bot, reconnecting automatically on errors.
 pub async fn run_bot(
     api_id: i32,
     api_hash: String,
     token: String,
     state: Arc<AppState>,
-) -> Result<()> {
-    info!("Connecting Telegram bot...");
+) -> ! {
+    loop {
+        match run_bot_once(api_id, api_hash.clone(), token.clone(), &state).await {
+            Ok(()) => {
+                warn!("Telegram bot exited unexpectedly, reconnecting in {DEFAULT_RETRY_DELAY:?}...");
+                sleep(DEFAULT_RETRY_DELAY).await;
+            }
+            Err(e) => {
+                let delay = flood_wait_delay(&e).unwrap_or(DEFAULT_RETRY_DELAY);
+                error!("Telegram bot error: {e:#}, reconnecting in {delay:?}...");
+                sleep(delay).await;
+            }
+        }
+    }
+}
 
+/// Extract the FLOOD_WAIT delay from an error chain, if present.
+fn flood_wait_delay(err: &anyhow::Error) -> Option<Duration> {
+    for cause in err.chain() {
+        if let Some(InvocationError::Rpc(rpc)) = cause.downcast_ref::<InvocationError>() {
+            if rpc.name == "FLOOD_WAIT" {
+                if let Some(secs) = rpc.value {
+                    return Some(Duration::from_secs(secs as u64 + 1));
+                }
+            }
+        }
+    }
+    None
+}
+
+async fn run_bot_once(
+    api_id: i32,
+    api_hash: String,
+    token: String,
+    state: &Arc<AppState>,
+) -> Result<()> {
     let session = Arc::new(MemorySession::default());
     let pool = SenderPool::new(Arc::clone(&session), api_id);
 
