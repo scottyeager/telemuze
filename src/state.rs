@@ -1,13 +1,21 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Mutex;
-use tracing::info;
+use tracing::{error, info};
 
 use crate::config::Config;
 use crate::engines::llm::LlmEngine;
 use crate::engines::stt::SttEngine;
 use crate::engines::vad::VadEngine;
 use crate::models::ModelManager;
+
+/// A transcribed speech segment with timestamps.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TranscribedSegment {
+    pub start_secs: f64,
+    pub end_secs: f64,
+    pub text: String,
+}
 
 /// Shared application state holding all loaded AI models.
 ///
@@ -105,5 +113,39 @@ impl AppState {
             terms_content,
             telegram_allowed_users,
         })
+    }
+
+    /// Run VAD segmentation followed by per-segment STT transcription.
+    ///
+    /// Returns transcribed segments (skipping empty/failed ones).
+    pub fn vad_transcribe(&self, pcm: &[f32]) -> Result<Vec<TranscribedSegment>> {
+        let segments = self.vad_engine.lock().unwrap().segment_audio(pcm)?;
+        info!("VAD found {} speech segments", segments.len());
+
+        let mut results = Vec::with_capacity(segments.len());
+        for (i, seg) in segments.iter().enumerate() {
+            match self.stt_engine.lock().unwrap().transcribe(&seg.samples) {
+                Ok(text) if !text.trim().is_empty() => {
+                    info!(
+                        "Segment {}/{}: [{:.1}s - {:.1}s] '{text}'",
+                        i + 1,
+                        segments.len(),
+                        seg.start_secs,
+                        seg.end_secs,
+                    );
+                    results.push(TranscribedSegment {
+                        start_secs: seg.start_secs,
+                        end_secs: seg.end_secs,
+                        text,
+                    });
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!("STT failed for segment {}: {e}", i + 1);
+                }
+            }
+        }
+
+        Ok(results)
     }
 }

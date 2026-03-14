@@ -89,58 +89,29 @@ async fn handle_long_form(
     let duration_secs = pcm.len() as f64 / 16_000.0;
     info!("Audio duration: {:.1}s", duration_secs);
 
-    // Step 2: VAD segmentation
-    let speech_segments = match state.vad_engine.lock().unwrap().segment_audio(&pcm) {
+    // VAD segmentation + per-segment STT
+    let segments = match state.vad_transcribe(&pcm) {
         Ok(s) => s,
         Err(e) => {
-            error!("VAD segmentation failed: {e}");
+            error!("VAD transcription failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("VAD segmentation failed: {e}")})),
+                Json(serde_json::json!({"error": format!("VAD transcription failed: {e}")})),
             )
                 .into_response();
         }
     };
 
-    info!("VAD found {} speech segments", speech_segments.len());
+    let result_segments: Vec<SegmentResponse> = segments
+        .iter()
+        .map(|s| SegmentResponse {
+            start: s.start_secs,
+            end: s.end_secs,
+            text: s.text.clone(),
+        })
+        .collect();
 
-    // Step 3: Transcribe each segment
-    let mut result_segments = Vec::with_capacity(speech_segments.len());
-    let mut full_text_parts = Vec::with_capacity(speech_segments.len());
-
-    for (i, seg) in speech_segments.iter().enumerate() {
-        match state.stt_engine.lock().unwrap().transcribe(&seg.samples) {
-            Ok(text) => {
-                if !text.trim().is_empty() {
-                    info!(
-                        "Segment {}/{}: [{:.1}s - {:.1}s] '{}'",
-                        i + 1,
-                        speech_segments.len(),
-                        seg.start_secs,
-                        seg.end_secs,
-                        text
-                    );
-                    full_text_parts.push(text.clone());
-                    result_segments.push(SegmentResponse {
-                        start: seg.start_secs,
-                        end: seg.end_secs,
-                        text,
-                    });
-                }
-            }
-            Err(e) => {
-                error!(
-                    "STT failed for segment {} [{:.1}s - {:.1}s]: {e}",
-                    i + 1,
-                    seg.start_secs,
-                    seg.end_secs
-                );
-                // Continue with other segments rather than failing entirely
-            }
-        }
-    }
-
-    let full_text = full_text_parts.join(" ");
+    let full_text: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
     info!(
         "Long-form transcription complete: {} segments, {} chars",
         result_segments.len(),

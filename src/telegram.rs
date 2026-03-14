@@ -109,14 +109,14 @@ async fn handle_message(
                     message.sender_id()
                 );
                 let bytes = download_media(client, &media).await?;
-                handle_voice_note(message, &bytes, state).await?;
+                transcribe_and_reply(message, &bytes, state, "voice note").await?;
             } else if is_audio_video {
                 info!(
                     "Telegram: audio/video file ({mime}) from {:?}",
                     message.sender_id()
                 );
                 let bytes = download_media(client, &media).await?;
-                handle_long_form_file(message, &bytes, state).await?;
+                transcribe_and_reply(message, &bytes, state, "long-form").await?;
             } else {
                 message
                     .reply(format!("Unsupported file type: {mime}"))
@@ -143,61 +143,25 @@ async fn download_media(client: &Client, media: &Media) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Dictation pipeline: STT only (skips LLM correction for Telegram)
-async fn handle_voice_note(
+/// Transcribe audio bytes via VAD+STT and reply with the result.
+async fn transcribe_and_reply(
     message: &grammers_client::update::Message,
     bytes: &[u8],
     state: &AppState,
-) -> Result<()> {
-    let pcm = audio::decode_to_pcm(bytes)?;
-
-    let text = state.stt_engine.lock().unwrap().transcribe(&pcm)?;
-    info!("Telegram voice STT: '{text}'");
-
-    send_long_reply(message, &text).await?;
-    Ok(())
-}
-
-/// Long-form pipeline: VAD -> STT per segment (mirrors /v1/transcribe/long)
-async fn handle_long_form_file(
-    message: &grammers_client::update::Message,
-    bytes: &[u8],
-    state: &AppState,
+    label: &str,
 ) -> Result<()> {
     let pcm = audio::decode_to_pcm(bytes)?;
     let duration_secs = pcm.len() as f64 / 16_000.0;
-    info!("Telegram long-form: {:.1}s of audio", duration_secs);
+    info!("Telegram {label}: {:.1}s of audio", duration_secs);
 
-    let segments = state.vad_engine.lock().unwrap().segment_audio(&pcm)?;
-    info!("VAD found {} speech segments", segments.len());
+    let segments = state.vad_transcribe(&pcm)?;
+    let full_text: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
 
-    let mut parts = Vec::with_capacity(segments.len());
-    for (i, seg) in segments.iter().enumerate() {
-        match state.stt_engine.lock().unwrap().transcribe(&seg.samples) {
-            Ok(text) if !text.trim().is_empty() => {
-                info!(
-                    "Segment {}/{}: [{:.1}s - {:.1}s] '{text}'",
-                    i + 1,
-                    segments.len(),
-                    seg.start_secs,
-                    seg.end_secs,
-                );
-                parts.push(text);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                error!("STT failed for segment {}: {e}", i + 1);
-            }
-        }
-    }
-
-    let full_text = parts.join(" ");
     if full_text.is_empty() {
-        message.reply("No speech detected in the audio.").await?;
+        message.reply("No speech detected.").await?;
     } else {
         send_long_reply(message, &full_text).await?;
     }
-
     Ok(())
 }
 
