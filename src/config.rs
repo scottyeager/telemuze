@@ -56,6 +56,22 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_LLM_TEMPERATURE", default_value_t = 1.0)]
     pub llm_temperature: f32,
 
+    /// Disable phonetic matching (Double Metaphone) in the dictionary pipeline.
+    #[arg(long, env = "TELEMUZE_DISABLE_PHONETIC_MATCH")]
+    pub disable_phonetic_match: bool,
+
+    /// Disable fuzzy string matching (Jaro-Winkler) in the dictionary pipeline.
+    #[arg(long, env = "TELEMUZE_DISABLE_FUZZY_MATCH")]
+    pub disable_fuzzy_match: bool,
+
+    /// Disable LLM correction (only phonetic/fuzzy pipeline runs).
+    #[arg(long, env = "TELEMUZE_DISABLE_LLM_CORRECTION")]
+    pub disable_llm_correction: bool,
+
+    /// Jaro-Winkler similarity threshold for fuzzy matching (0.0–1.0).
+    #[arg(long, env = "TELEMUZE_FUZZY_THRESHOLD", default_value_t = 0.85)]
+    pub fuzzy_threshold: f64,
+
     /// Telegram API ID (from https://my.telegram.org)
     #[arg(long, env = "TELEGRAM_API_ID", default_value_t = 0)]
     pub telegram_api_id: i32,

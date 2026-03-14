@@ -160,10 +160,16 @@ impl LlmEngine {
     ///
     /// `terms_content` is the raw contents of the terms file, passed
     /// verbatim into the system prompt for the LLM to interpret.
+    ///
+    /// `candidate_hints` is an optional pre-computed section from the
+    /// phonetic/fuzzy pipeline describing specific words that may need
+    /// correction. When present, this replaces the full dictionary in
+    /// the prompt, making the LLM's job much easier.
     pub async fn correct_dictation(
         &self,
         raw_text: &str,
         terms_content: &str,
+        candidate_hints: Option<&str>,
     ) -> Result<String> {
         if raw_text.trim().is_empty() {
             return Ok(String::new());
@@ -171,10 +177,10 @@ impl LlmEngine {
 
         match &self.inner {
             LlmInner::Native(state) => {
-                Self::correct_native(state, raw_text, terms_content)
+                Self::correct_native(state, raw_text, terms_content, candidate_hints)
             }
             LlmInner::Http { client, api_url } => {
-                Self::correct_http(client, api_url, raw_text, terms_content)
+                Self::correct_http(client, api_url, raw_text, terms_content, candidate_hints)
                     .await
             }
             LlmInner::Disabled => {
@@ -190,8 +196,9 @@ impl LlmEngine {
         state: &NativeState,
         raw_text: &str,
         terms_content: &str,
+        candidate_hints: Option<&str>,
     ) -> Result<String> {
-        let system_prompt = build_system_prompt(terms_content);
+        let system_prompt = build_system_prompt(terms_content, candidate_hints);
 
         // Build the prompt manually using ChatML format with a pre-closed
         // <think> block to suppress Qwen3.5's thinking mode. The model's
@@ -281,8 +288,9 @@ impl LlmEngine {
         api_url: &str,
         raw_text: &str,
         terms_content: &str,
+        candidate_hints: Option<&str>,
     ) -> Result<String> {
-        let system_prompt = build_system_prompt(terms_content);
+        let system_prompt = build_system_prompt(terms_content, candidate_hints);
 
         let request = ChatRequest {
             model: "local".to_string(),
@@ -331,10 +339,28 @@ impl LlmEngine {
 
 /// Build the system prompt for dictation correction.
 ///
-/// The terms file is a simple list of correct terms (one per line).
-/// The model is expected to recognize when STT output contains words
-/// that sound like these terms and substitute the correct spelling.
-fn build_system_prompt(terms_content: &str) -> String {
+/// When `candidate_hints` is provided (from the phonetic/fuzzy pipeline),
+/// the prompt focuses the LLM on specific suggested corrections rather
+/// than asking it to search through the entire dictionary. This makes
+/// correction much more reliable for small models.
+///
+/// When no candidates are found, falls back to the full dictionary prompt.
+fn build_system_prompt(terms_content: &str, candidate_hints: Option<&str>) -> String {
+    // If we have candidate hints from the phonetic pipeline, use a focused prompt
+    if let Some(hints) = candidate_hints {
+        if !hints.is_empty() {
+            return format!(
+                "You are a speech-to-text post-processor. \
+                Apply the suggested corrections below ONLY if they make sense \
+                in context. If a suggestion does not fit the sentence, keep the original word. \
+                Do NOT change anything else. Output ONLY the corrected text.\n\
+                \n\
+                {hints}"
+            );
+        }
+    }
+
+    // Fallback: full dictionary prompt (no pipeline candidates found)
     let terms_section = if terms_content.is_empty() {
         String::from("No custom terms configured.")
     } else {
