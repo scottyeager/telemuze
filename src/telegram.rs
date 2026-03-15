@@ -286,9 +286,11 @@ async fn transcribe_and_reply(
         status.delete().await;
         message.reply(&full_text).await?;
     } else {
-        // Transcript is too long for a single message — summarize it and
-        // attach the full text as a file.
-        status.update("Summarizing transcript...").await;
+        // Transcript is too long for a single message — send the file
+        // immediately, then update the caption with a summary once ready.
+        status.delete().await;
+
+        let file_msg = send_transcript_file(client, message, &full_text).await?;
 
         let summary = match state
             .llm_engine
@@ -297,45 +299,47 @@ async fn transcribe_and_reply(
         {
             Ok(s) if !s.is_empty() => s,
             Ok(_) => {
-                warn!("LLM returned empty summary — sending file only");
-                String::from("Transcript attached as file.")
+                warn!("LLM returned empty summary");
+                return Ok(());
             }
             Err(e) => {
-                warn!("LLM summarization failed: {e:#} — sending file only");
-                String::from("Transcript attached as file.")
+                warn!("LLM summarization failed: {e:#}");
+                return Ok(());
             }
         };
 
-        status.delete().await;
-        send_summary_with_attachment(client, message, &summary, &full_text).await?;
+        // Truncate summary if it somehow exceeds the Telegram limit
+        let caption = if summary.len() > TELEGRAM_MAX_LEN {
+            &summary[..summary.floor_char_boundary(TELEGRAM_MAX_LEN)]
+        } else {
+            &summary
+        };
+
+        if let Err(e) = file_msg.edit(InputMessage::new().text(caption)).await {
+            warn!("Failed to update transcript message with summary: {e}");
+        }
     }
     Ok(())
 }
 
-/// Send a summary as the message text with the full transcript attached as a file.
-async fn send_summary_with_attachment(
+/// Upload the full transcript as a .txt file and return the sent message
+/// so the caller can later edit its caption with a summary.
+async fn send_transcript_file(
     client: &Client,
     message: &grammers_client::update::Message,
-    summary: &str,
     full_text: &str,
-) -> Result<()> {
+) -> Result<GrammersMessage> {
     let bytes = full_text.as_bytes();
     let mut cursor = std::io::Cursor::new(bytes);
     let uploaded = client
         .upload_stream(&mut cursor, bytes.len(), "transcript.txt".into())
         .await?;
 
-    // Truncate summary if it somehow exceeds the Telegram limit
-    let caption = if summary.len() > TELEGRAM_MAX_LEN {
-        &summary[..summary.floor_char_boundary(TELEGRAM_MAX_LEN)]
-    } else {
-        summary
-    };
-
-    let input = InputMessage::new().text(caption).file(uploaded);
-    message.reply(input).await?;
-
-    Ok(())
+    let input = InputMessage::new()
+        .text("Summarizing transcript...")
+        .file(uploaded);
+    let sent = message.reply(input).await?;
+    Ok(sent)
 }
 
 /// Format a duration in seconds into a human-readable string.
