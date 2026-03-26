@@ -99,7 +99,9 @@ impl Dictionary {
             let lower = term.to_lowercase();
             // For multi-word terms, encode the concatenated form
             let joined: String = lower.split_whitespace().collect();
-            let (dm_primary, dm_alternate) = encoder.double_metaphone(&joined);
+            let dm_result = encoder.double_metaphone(&joined);
+            let dm_primary = dm_result.primary();
+            let dm_alternate = dm_result.alternate();
 
             entries.push(DictionaryEntry {
                 term: term.to_string(),
@@ -182,8 +184,9 @@ impl Dictionary {
                 // For matching: join without spaces (how STT splits relate to real terms)
                 let window_joined: String = window_words
                     .iter()
-                    .flat_map(|w| w.to_lowercase().chars())
-                    .collect();
+                    .map(|w| w.to_lowercase())
+                    .collect::<Vec<_>>()
+                    .concat();
 
                 let candidates = self.match_against_dictionary(
                     &window_text,
@@ -244,11 +247,13 @@ impl Dictionary {
         let mut candidates = Vec::new();
 
         // Compute phonetic code for the joined window text
-        let (window_primary, window_alternate) = if config.phonetic_enabled {
-            self.encoder.double_metaphone(joined_lower)
+        let dm_result = if config.phonetic_enabled {
+            Some(self.encoder.double_metaphone(joined_lower))
         } else {
-            (String::new(), String::new())
+            None
         };
+        let window_primary = dm_result.as_ref().map(|r| r.primary()).unwrap_or_default();
+        let window_alternate = dm_result.as_ref().map(|r| r.alternate()).unwrap_or_default();
 
         for entry in &self.entries {
             // Skip entries that are way too different in length
