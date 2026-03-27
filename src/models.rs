@@ -82,7 +82,7 @@ const PARAKEET_FILES: &[ModelFile] = &[
 ];
 
 const SILERO_VAD_FILES: &[ModelFile] = &[ModelFile {
-    url: "https://raw.githubusercontent.com/snakers4/silero-vad/master/src/silero_vad/data/silero_vad.onnx",
+    url: "https://github.com/thewh1teagle/vad-rs/releases/download/v0.1.0/silero_vad.onnx",
     filename: "silero_vad.onnx",
 }];
 

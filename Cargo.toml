@@ -1,3 +1,7 @@
+[workspace]
+members = [".", "client"]
+resolver = "2"
+
 [package]
 name = "telemuze"
 version = "0.1.0"
