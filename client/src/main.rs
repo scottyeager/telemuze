@@ -357,6 +357,43 @@ fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str) {
     }
 }
 
+fn click_quadrant(right: bool, bottom: bool) {
+    // Get screen dimensions via xdotool
+    let output = match std::process::Command::new("xdotool")
+        .args(["getdisplaygeometry"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Failed to get display geometry: {e}");
+            return;
+        }
+    };
+    let geometry = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = geometry.trim().split_whitespace().collect();
+    if parts.len() < 2 {
+        eprintln!("Unexpected geometry output: {geometry}");
+        return;
+    }
+    let (width, height) = match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+        (Ok(w), Ok(h)) => (w, h),
+        _ => {
+            eprintln!("Failed to parse geometry: {geometry}");
+            return;
+        }
+    };
+
+    let x = if right { width * 3 / 4 } else { width / 4 };
+    let y = if bottom { height * 3 / 4 } else { height / 4 };
+
+    let result = std::process::Command::new("xdotool")
+        .args(["mousemove", "--sync", &x.to_string(), &y.to_string(), "click", "1"])
+        .status();
+    if let Err(e) = result {
+        eprintln!("Mouse click failed: {e}");
+    }
+}
+
 // ── Voice commands ──────────────────────────────────────────────────────
 
 /// An action that a voice command can trigger.
@@ -368,6 +405,13 @@ enum VoiceAction {
     ModifiedKey {
         modifiers: &'static [&'static str],
         key: &'static str,
+    },
+    /// Move the mouse to a screen quadrant and click.
+    ClickQuadrant {
+        /// Horizontal position: false = left, true = right.
+        right: bool,
+        /// Vertical position: false = top, true = bottom.
+        bottom: bool,
     },
 }
 
@@ -424,6 +468,22 @@ fn voice_commands() -> &'static [VoiceCommand] {
         VoiceCommand {
             words: &["press", "right"],
             action: VoiceAction::Key("Right"),
+        },
+        VoiceCommand {
+            words: &["click", "upper", "left"],
+            action: VoiceAction::ClickQuadrant { right: false, bottom: false },
+        },
+        VoiceCommand {
+            words: &["click", "upper", "right"],
+            action: VoiceAction::ClickQuadrant { right: true, bottom: false },
+        },
+        VoiceCommand {
+            words: &["click", "lower", "left"],
+            action: VoiceAction::ClickQuadrant { right: false, bottom: true },
+        },
+        VoiceCommand {
+            words: &["click", "lower", "right"],
+            action: VoiceAction::ClickQuadrant { right: true, bottom: true },
         },
     ];
     COMMANDS
@@ -825,6 +885,15 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                         send_modified_key(modifiers, key, &ctx.display_server);
                                     } else {
                                         println!();
+                                    }
+                                }
+                                TextAction::Command(VoiceAction::ClickQuadrant { right, bottom }) => {
+                                    if ctx.type_text {
+                                        click_quadrant(*right, *bottom);
+                                    } else {
+                                        let h = if *bottom { "lower" } else { "upper" };
+                                        let v = if *right { "right" } else { "left" };
+                                        println!("[click {h} {v}]");
                                     }
                                 }
                             }
