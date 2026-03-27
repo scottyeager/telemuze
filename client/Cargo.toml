@@ -30,6 +30,9 @@ serde_json = "1"
 # Signal handling
 signal-hook = "0.3"
 
+# System tray (XEmbed protocol for X11)
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+
 # Utilities
 anyhow = "1"
 dirs-next = "2"
