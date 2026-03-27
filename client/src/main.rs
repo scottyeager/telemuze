@@ -26,7 +26,7 @@ const FRAME_SIZE: usize = 480; // 30ms at 16kHz
 
 const DEFAULT_POSITIVE_THRESHOLD: f32 = 0.3;
 const DEFAULT_NEGATIVE_THRESHOLD: f32 = 0.3;
-const DEFAULT_MIN_SPEECH_MS: u32 = 60;
+const DEFAULT_MIN_SPEECH_MS: u32 = 250;
 const DEFAULT_SILENCE_MS: u32 = 800;
 const DEFAULT_PREFILL_MS: u32 = 450;
 const DEFAULT_MAX_SPEECH_SECS: u32 = 300;
@@ -900,8 +900,9 @@ fn main() -> Result<()> {
                 // Prevent unbounded memory growth during silence and reset
                 // VAD internal state to avoid accumulated ORT tensor drift.
                 if !vad_state.in_speech && vad_pos > SAMPLE_RATE as usize * 5 {
-                    audio_buf.drain(..vad_pos);
-                    vad_pos = 0;
+                    let keep = vad_cfg.prefill_samples.min(vad_pos);
+                    audio_buf.drain(..vad_pos - keep);
+                    vad_pos = keep;
                     vad.reset();
                 }
             }
