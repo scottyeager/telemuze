@@ -897,10 +897,12 @@ fn main() -> Result<()> {
                     vad_pos += FRAME_SIZE;
                 }
 
-                // Prevent unbounded memory growth during silence
+                // Prevent unbounded memory growth during silence and reset
+                // VAD internal state to avoid accumulated ORT tensor drift.
                 if !vad_state.in_speech && vad_pos > SAMPLE_RATE as usize * 5 {
                     audio_buf.drain(..vad_pos);
                     vad_pos = 0;
+                    vad.reset();
                 }
             }
 
