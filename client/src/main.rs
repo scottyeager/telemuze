@@ -373,8 +373,42 @@ fn voice_commands() -> &'static [VoiceCommand] {
             },
         },
         VoiceCommand {
+            words: &["press", "ctrl", "enter"],
+            action: VoiceAction::ModifiedKey {
+                modifiers: &["ctrl"],
+                key: "Return",
+            },
+        },
+        VoiceCommand {
+            words: &["press", "shift", "tab"],
+            action: VoiceAction::ModifiedKey {
+                modifiers: &["shift"],
+                key: "Tab",
+            },
+        },
+        VoiceCommand {
             words: &["press", "enter"],
             action: VoiceAction::Key("Return"),
+        },
+        VoiceCommand {
+            words: &["press", "tab"],
+            action: VoiceAction::Key("Tab"),
+        },
+        VoiceCommand {
+            words: &["press", "up"],
+            action: VoiceAction::Key("Up"),
+        },
+        VoiceCommand {
+            words: &["press", "down"],
+            action: VoiceAction::Key("Down"),
+        },
+        VoiceCommand {
+            words: &["press", "left"],
+            action: VoiceAction::Key("Left"),
+        },
+        VoiceCommand {
+            words: &["press", "right"],
+            action: VoiceAction::Key("Right"),
         },
     ];
     COMMANDS
@@ -384,6 +418,8 @@ fn voice_commands() -> &'static [VoiceCommand] {
 enum TextAction<'a> {
     /// Literal text to type or print.
     Text(&'a str),
+    /// Transformed text to type or print (owned, from input transformations).
+    OwnedText(String),
     /// A voice command was recognized.
     Command(VoiceAction),
 }
@@ -392,6 +428,37 @@ enum TextAction<'a> {
 /// not purely punctuation/whitespace left over after stripping a command).
 fn has_word_chars(s: &str) -> bool {
     s.chars().any(|c| c.is_alphanumeric())
+}
+
+/// Try to find "slash command <word>" at position `from` in `lower`.
+/// Returns `(start, end, slash_word)` where `slash_word` is the captured word
+/// lowercased with a leading `/`.
+fn find_slash_command(lower: &str, from: usize) -> Option<(usize, usize, String)> {
+    let trigger = &["slash", "command"];
+    if let Some((start, end)) = find_phrase(lower, from, trigger) {
+        // Skip whitespace/punctuation after "slash command"
+        let rest = &lower[end..];
+        let skip = rest
+            .chars()
+            .take_while(|c| {
+                c.is_whitespace()
+                    || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"')
+            })
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        let after = &rest[skip..];
+        // Capture the next word (alphanumeric chars)
+        let word_len = after
+            .chars()
+            .take_while(|c| c.is_alphanumeric())
+            .map(|c| c.len_utf8())
+            .sum::<usize>();
+        if word_len > 0 {
+            let word = &after[..word_len];
+            return Some((start, end + skip + word_len, format!("/{word}")));
+        }
+    }
+    None
 }
 
 /// Scan `text` for voice command phrases (case-insensitive, tolerant of
@@ -414,12 +481,30 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
             }
         }
 
-        if let Some((start, end, action)) = best {
+        // Also try "slash command <word>"
+        let slash = find_slash_command(&lower, cursor);
+
+        // Determine whether a voice command or slash command comes first
+        let use_voice = match (&best, &slash) {
+            (Some((vs, ..)), Some((ss, ..))) => vs <= ss,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if use_voice {
+            let (start, end, action) = best.unwrap();
             let before = text[cursor..start].trim();
             if has_word_chars(before) {
                 actions.push(TextAction::Text(before));
             }
             actions.push(TextAction::Command(action));
+            cursor = end;
+        } else if let Some((start, end, slash_text)) = slash {
+            let before = text[cursor..start].trim();
+            if has_word_chars(before) {
+                actions.push(TextAction::Text(before));
+            }
+            actions.push(TextAction::OwnedText(slash_text));
             cursor = end;
         } else {
             let rest = text[cursor..].trim();
@@ -694,6 +779,13 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                         for action in &actions {
                             match action {
                                 TextAction::Text(t) => {
+                                    if ctx.type_text {
+                                        type_into_window(t, &ctx.display_server);
+                                    } else {
+                                        print!("{t} ");
+                                    }
+                                }
+                                TextAction::OwnedText(t) => {
                                     if ctx.type_text {
                                         type_into_window(t, &ctx.display_server);
                                     } else {
