@@ -8,6 +8,8 @@
 //! Use `toggle` to pause/resume, `flush` to force a segment boundary,
 //! and `stop` to shut down.
 
+mod tray;
+
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -15,6 +17,7 @@ use std::cell::Cell;
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
+use tray::TrayStatus;
 use vad_rs::Vad;
 
 // ── Audio constants ────────────────────────────────────────────────────────
@@ -75,6 +78,10 @@ struct Cli {
     /// Type transcribed text into the focused window instead of printing to stdout.
     #[arg(long)]
     type_text: bool,
+
+    /// Show a system tray icon indicating recording/processing state.
+    #[arg(long)]
+    tray: bool,
 
     /// Show desktop notifications for recording/processing state.
     #[arg(long)]
@@ -244,6 +251,7 @@ struct AppContext {
     sound: bool,
     display_server: String,
     notify_id: Cell<u32>,
+    tray_handle: Option<tray::TrayHandle>,
 }
 
 impl AppContext {
@@ -269,6 +277,13 @@ impl AppContext {
             sound: cli.sound,
             display_server,
             notify_id: Cell::new(0),
+            tray_handle: None,
+        }
+    }
+
+    fn set_tray_status(&self, status: TrayStatus) {
+        if let Some(handle) = &self.tray_handle {
+            handle.update(status);
         }
     }
 }
@@ -768,6 +783,7 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
     let duration_secs = samples.len() as f64 / SAMPLE_RATE as f64;
     eprint!("[{duration_secs:.1}s] ");
 
+    ctx.set_tray_status(TrayStatus::Processing);
     if ctx.notify {
         let id = show_notification("Processing...", "Transcribing audio", ctx.notify_id.get());
         ctx.notify_id.set(id);
@@ -822,6 +838,7 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                     } else {
                         eprintln!("(empty)");
                     }
+                    ctx.set_tray_status(TrayStatus::Listening);
                     if ctx.notify {
                         let id = show_notification(
                             "Listening...",
@@ -833,6 +850,7 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                 }
                 Err(e) => {
                     eprintln!("send error: {e}");
+                    ctx.set_tray_status(TrayStatus::Listening);
                     if ctx.notify {
                         let id = show_notification(
                             "Dictation failed",
@@ -857,6 +875,7 @@ struct SocketGuard<'a> {
     path: &'a str,
     notify_id: &'a Cell<u32>,
     notify: bool,
+    tray_handle: Option<tray::TrayHandle>,
 }
 
 impl Drop for SocketGuard<'_> {
@@ -864,6 +883,9 @@ impl Drop for SocketGuard<'_> {
         let _ = std::fs::remove_file(self.path);
         if self.notify {
             dismiss_notification(self.notify_id.get());
+        }
+        if let Some(handle) = self.tray_handle.take() {
+            handle.shutdown();
         }
     }
 }
@@ -889,18 +911,32 @@ fn main() -> Result<()> {
     let listener = UnixListener::bind(&cli.socket)
         .with_context(|| format!("Failed to bind socket: {}", cli.socket))?;
 
-    let ctx = AppContext::new(&cli);
+    let mut ctx = AppContext::new(&cli);
     let vad_cfg = VadConfig::from_cli(&cli);
+
+    // Unified event channel for audio and IPC
+    let (tx, rx) = mpsc::sync_channel::<Event>(64);
+
+    // Spawn system tray if requested
+    if cli.tray {
+        let initial = if cli.paused {
+            TrayStatus::Idle
+        } else {
+            TrayStatus::Listening
+        };
+        match tray::spawn_tray(tx.clone(), initial) {
+            Ok(handle) => ctx.tray_handle = Some(handle),
+            Err(e) => eprintln!("Tray unavailable: {e}"),
+        }
+    }
 
     // Socket cleanup on exit
     let _guard = SocketGuard {
         path: &cli.socket,
         notify_id: &ctx.notify_id,
         notify: ctx.notify,
+        tray_handle: ctx.tray_handle.clone(),
     };
-
-    // Unified event channel for audio and IPC
-    let (tx, rx) = mpsc::sync_channel::<Event>(64);
 
     // Spawn IPC listener thread (blocks on accept, sends events)
     spawn_ipc_listener(listener, tx.clone());
@@ -1007,6 +1043,7 @@ fn main() -> Result<()> {
 
                     match vad_state.update(prob, vad_pos, &vad_cfg) {
                         VadEvent::SpeechStarted => {
+                            ctx.set_tray_status(TrayStatus::Recording);
                             if ctx.notify {
                                 let id = show_notification(
                                     "Recording...",
@@ -1069,6 +1106,7 @@ fn main() -> Result<()> {
                     vad.reset();
                     listening = false;
                     eprintln!("Paused");
+                    ctx.set_tray_status(TrayStatus::Idle);
                     if ctx.notify {
                         dismiss_notification(ctx.notify_id.get());
                         ctx.notify_id.set(0);
@@ -1078,6 +1116,7 @@ fn main() -> Result<()> {
                     stream.play().ok();
                     listening = true;
                     eprintln!("Listening...");
+                    ctx.set_tray_status(TrayStatus::Listening);
                     if ctx.notify {
                         let id = show_notification(
                             "Listening...",
