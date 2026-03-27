@@ -27,9 +27,9 @@ const FRAME_SIZE: usize = 480; // 30ms at 16kHz
 const DEFAULT_POSITIVE_THRESHOLD: f32 = 0.3;
 const DEFAULT_NEGATIVE_THRESHOLD: f32 = 0.3;
 const DEFAULT_MIN_SPEECH_MS: u32 = 60;
-const DEFAULT_SILENCE_MS: u32 = 450;
+const DEFAULT_SILENCE_MS: u32 = 800;
 const DEFAULT_PREFILL_MS: u32 = 450;
-const DEFAULT_MAX_SPEECH_SECS: u32 = 15;
+const DEFAULT_MAX_SPEECH_SECS: u32 = 300;
 
 const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
 
@@ -298,6 +298,144 @@ fn type_into_window(text: &str, display_server: &str) {
     }
 }
 
+fn send_key(key: &str, display_server: &str) {
+    let result = if display_server == "wayland" {
+        std::process::Command::new("wtype")
+            .args(["-k", key])
+            .status()
+    } else {
+        std::process::Command::new("xdotool")
+            .args(["key", "--clearmodifiers", key])
+            .status()
+    };
+    if let Err(e) = result {
+        eprintln!("Key injection failed: {e}");
+    }
+}
+
+// ── Voice commands ──────────────────────────────────────────────────────
+
+/// An action that a voice command can trigger.
+#[derive(Clone)]
+enum VoiceAction {
+    /// Simulate a keypress (e.g. "Return", "Tab").
+    Key(&'static str),
+}
+
+/// A voice command: a phrase (lowercased words) mapped to an action.
+struct VoiceCommand {
+    /// The trigger words, e.g. &["press", "enter"].
+    words: &'static [&'static str],
+    action: VoiceAction,
+}
+
+fn voice_commands() -> &'static [VoiceCommand] {
+    static COMMANDS: &[VoiceCommand] = &[VoiceCommand {
+        words: &["press", "enter"],
+        action: VoiceAction::Key("Return"),
+    }];
+    COMMANDS
+}
+
+/// A segment of processed transcription output.
+enum TextAction<'a> {
+    /// Literal text to type or print.
+    Text(&'a str),
+    /// A voice command was recognized.
+    Command(VoiceAction),
+}
+
+/// Returns true if `s` contains at least one alphanumeric character (i.e. is
+/// not purely punctuation/whitespace left over after stripping a command).
+fn has_word_chars(s: &str) -> bool {
+    s.chars().any(|c| c.is_alphanumeric())
+}
+
+/// Scan `text` for voice command phrases (case-insensitive, tolerant of
+/// punctuation between words) and split into text segments and command actions.
+fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
+    let lower = text.to_lowercase();
+    let commands = voice_commands();
+    let mut actions: Vec<TextAction<'_>> = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < text.len() {
+        // Try each command at every position
+        let mut best: Option<(usize, usize, VoiceAction)> = None; // (start, end, action)
+
+        for cmd in commands {
+            if let Some((start, end)) = find_phrase(&lower, cursor, cmd.words) {
+                if best.as_ref().is_none_or(|b| start < b.0) {
+                    best = Some((start, end, cmd.action.clone()));
+                }
+            }
+        }
+
+        if let Some((start, end, action)) = best {
+            let before = text[cursor..start].trim();
+            if has_word_chars(before) {
+                actions.push(TextAction::Text(before));
+            }
+            actions.push(TextAction::Command(action));
+            cursor = end;
+        } else {
+            let rest = text[cursor..].trim();
+            if has_word_chars(rest) {
+                actions.push(TextAction::Text(rest));
+            }
+            break;
+        }
+    }
+
+    actions
+}
+
+/// Find a multi-word phrase in `lower` starting from `from`, allowing optional
+/// punctuation and whitespace between words. Returns (start, end) byte offsets
+/// into `lower`.
+fn find_phrase(lower: &str, from: usize, words: &[&str]) -> Option<(usize, usize)> {
+    if words.is_empty() {
+        return None;
+    }
+
+    let haystack = &lower[from..];
+    let first = words[0];
+    let mut search_start = 0;
+
+    while let Some(p) = haystack[search_start..].find(first) {
+        let abs_start = from + search_start + p;
+        let mut pos = search_start + p + first.len();
+
+        let mut matched = true;
+        for &word in &words[1..] {
+            // Skip punctuation and whitespace between words
+            let rest = &haystack[pos..];
+            let skip = rest
+                .chars()
+                .take_while(|c| {
+                    c.is_whitespace()
+                        || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"')
+                })
+                .map(|c| c.len_utf8())
+                .sum::<usize>();
+
+            if skip == 0 || !haystack[pos + skip..].starts_with(word) {
+                matched = false;
+                break;
+            }
+            pos = pos + skip + word.len();
+        }
+
+        if matched {
+            return Some((abs_start, from + pos));
+        }
+
+        search_start = search_start + p + first.len();
+    }
+
+    None
+}
+
 fn show_notification(summary: &str, body: &str, replaces_id: u32) -> u32 {
     let output = std::process::Command::new("gdbus")
         .args([
@@ -509,10 +647,26 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                     let text = text.trim();
                     if !text.is_empty() {
                         eprintln!("OK");
-                        if ctx.type_text {
-                            type_into_window(text, &ctx.display_server);
-                        } else {
-                            println!("{text}");
+                        let actions = process_voice_commands(text);
+                        for action in &actions {
+                            match action {
+                                TextAction::Text(t) => {
+                                    if ctx.type_text {
+                                        type_into_window(t, &ctx.display_server);
+                                    } else {
+                                        print!("{t} ");
+                                    }
+                                }
+                                TextAction::Command(VoiceAction::Key(key)) => {
+                                    if ctx.type_text {
+                                        send_key(key, &ctx.display_server);
+                                    } else {
+                                        println!();
+                                    }
+                                }
+                            }
+                        }
+                        if !ctx.type_text {
                             let _ = io::stdout().flush();
                         }
                         if ctx.sound {
