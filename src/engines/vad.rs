@@ -171,8 +171,8 @@ impl VadEngine {
             });
         }
 
-        // Split any segments longer than 15s into sub-segments
-        let max_samples = 15 * SAMPLE_RATE;
+        // Split any segments longer than 5 minutes into sub-segments
+        let max_samples = 300 * SAMPLE_RATE;
         let mut final_segments = Vec::new();
         for seg in segments {
             if seg.samples.len() > max_samples {
