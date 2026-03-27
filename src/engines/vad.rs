@@ -4,6 +4,8 @@
 //! used by the long-form transcription endpoint to split large
 //! files into manageable pieces with accurate timestamps.
 
+use std::collections::VecDeque;
+
 use anyhow::{Context, Result};
 use tracing::warn;
 use vad_rs::Vad;
@@ -20,6 +22,14 @@ const REDEMPTION_FRAMES: usize = 20;
 /// 5 minutes of audio = 10,000 frames at 30ms each.
 /// Keeps us well under the ~22,500-frame ORT corruption threshold.
 const MAX_CHUNK_FRAMES: usize = 10_000;
+
+/// Maximum speech frames before force-splitting a segment.
+/// Same 5-minute limit as the ORT reset.
+const MAX_SPEECH_FRAMES: usize = 10_000;
+
+/// Number of recent VAD probability frames to keep for smart splitting.
+/// 100 frames × 30ms = 3 seconds of lookback.
+const LOOKBACK_FRAMES: usize = 100;
 
 /// A detected speech segment with start/end times in seconds.
 #[derive(Debug, Clone)]
@@ -64,6 +74,7 @@ impl VadEngine {
         let mut in_speech = false;
         let mut pos = 0;
         let mut frames_since_reset: usize = 0;
+        let mut prob_history: VecDeque<f32> = VecDeque::with_capacity(LOOKBACK_FRAMES);
 
         while pos + FRAME_SIZE <= pcm_16khz.len() {
             // Reset the VAD periodically to avoid ORT session corruption.
@@ -80,6 +91,7 @@ impl VadEngine {
                     in_speech = false;
                     speech_frames = 0;
                     redemption_count = 0;
+                    prob_history.clear();
                 }
                 self.vad.reset();
                 frames_since_reset = 0;
@@ -106,6 +118,7 @@ impl VadEngine {
                         in_speech = false;
                         speech_frames = 0;
                         redemption_count = 0;
+                        prob_history.clear();
                     }
                     self.vad.reset();
                     frames_since_reset = 0;
@@ -126,7 +139,40 @@ impl VadEngine {
             } else {
                 speech_frames += 1;
 
-                if prob < NEGATIVE_THRESHOLD {
+                // Track probability for smart force-splitting.
+                prob_history.push_back(prob);
+                if prob_history.len() > LOOKBACK_FRAMES {
+                    prob_history.pop_front();
+                }
+
+                // Force-split if segment reached max length, choosing the
+                // lowest-probability frame in the lookback window as the
+                // split point (most pause-like moment).
+                if speech_frames >= MAX_SPEECH_FRAMES {
+                    if let Some(start) = speech_start.take() {
+                        let frames_back = if prob_history.is_empty() {
+                            0
+                        } else {
+                            let (min_idx, _) = prob_history
+                                .iter()
+                                .enumerate()
+                                .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                                .unwrap();
+                            prob_history.len() - 1 - min_idx
+                        };
+                        let split_pos = pos + FRAME_SIZE - frames_back * FRAME_SIZE;
+                        segments.push(SpeechSegment {
+                            start_secs: start as f64 / SAMPLE_RATE as f64,
+                            end_secs: split_pos as f64 / SAMPLE_RATE as f64,
+                            samples: pcm_16khz[start..split_pos].to_vec(),
+                        });
+                        // Start a new segment from the split point.
+                        speech_start = Some(split_pos);
+                        speech_frames = frames_back;
+                        redemption_count = 0;
+                        prob_history.clear();
+                    }
+                } else if prob < NEGATIVE_THRESHOLD {
                     redemption_count += 1;
                     if redemption_count > REDEMPTION_FRAMES {
                         if speech_frames >= MIN_SPEECH_FRAMES {
@@ -142,6 +188,7 @@ impl VadEngine {
                         in_speech = false;
                         speech_frames = 0;
                         redemption_count = 0;
+                        prob_history.clear();
                     }
                 } else {
                     redemption_count = 0;
@@ -171,27 +218,6 @@ impl VadEngine {
             });
         }
 
-        // Split any segments longer than 5 minutes into sub-segments
-        let max_samples = 300 * SAMPLE_RATE;
-        let mut final_segments = Vec::new();
-        for seg in segments {
-            if seg.samples.len() > max_samples {
-                let mut offset = 0;
-                let base_start = seg.start_secs;
-                while offset < seg.samples.len() {
-                    let end = (offset + max_samples).min(seg.samples.len());
-                    final_segments.push(SpeechSegment {
-                        start_secs: base_start + offset as f64 / SAMPLE_RATE as f64,
-                        end_secs: base_start + end as f64 / SAMPLE_RATE as f64,
-                        samples: seg.samples[offset..end].to_vec(),
-                    });
-                    offset = end;
-                }
-            } else {
-                final_segments.push(seg);
-            }
-        }
-
-        Ok(final_segments)
+        Ok(segments)
     }
 }

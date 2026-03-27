@@ -14,6 +14,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
@@ -181,11 +182,16 @@ impl VadConfig {
     }
 }
 
+/// Number of recent VAD probability frames to keep for smart splitting.
+/// 100 frames × 30ms = 3 seconds of lookback.
+const LOOKBACK_FRAMES: usize = 100;
+
 struct VadState {
     in_speech: bool,
     speech_start: Option<usize>,
     speech_frames: usize,
     redemption_count: usize,
+    prob_history: VecDeque<f32>,
 }
 
 impl VadState {
@@ -195,6 +201,7 @@ impl VadState {
             speech_start: None,
             speech_frames: 0,
             redemption_count: 0,
+            prob_history: VecDeque::with_capacity(LOOKBACK_FRAMES),
         }
     }
 
@@ -211,6 +218,12 @@ impl VadState {
         } else {
             self.speech_frames += 1;
 
+            // Track probability for smart force-splitting.
+            self.prob_history.push_back(prob);
+            if self.prob_history.len() > LOOKBACK_FRAMES {
+                self.prob_history.pop_front();
+            }
+
             if prob < cfg.negative_threshold {
                 self.redemption_count += 1;
                 if self.redemption_count > cfg.redemption_frames {
@@ -226,6 +239,22 @@ impl VadState {
         }
     }
 
+    /// Find the sample offset (back from current position) of the
+    /// lowest-probability frame in the lookback window.
+    fn best_split_offset(&self) -> usize {
+        let len = self.prob_history.len();
+        if len == 0 {
+            return 0;
+        }
+        let (min_idx, _) = self
+            .prob_history
+            .iter()
+            .enumerate()
+            .min_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .unwrap();
+        (len - 1 - min_idx) * FRAME_SIZE
+    }
+
     fn end_speech(&mut self, cfg: &VadConfig) -> Option<usize> {
         let result = if self.speech_frames >= cfg.min_speech_frames {
             self.speech_start
@@ -236,6 +265,7 @@ impl VadState {
         self.speech_start = None;
         self.speech_frames = 0;
         self.redemption_count = 0;
+        self.prob_history.clear();
         result
     }
 }
@@ -1132,15 +1162,20 @@ fn main() -> Result<()> {
                         VadEvent::None => {}
                     }
 
-                    // Force-flush if speech is too long
+                    // Force-flush if speech is too long, splitting at the
+                    // lowest-probability frame in the lookback window.
                     if vad_state.in_speech {
                         if let Some(start) = vad_state.speech_start {
                             if vad_pos + FRAME_SIZE - start >= vad_cfg.max_speech_samples {
-                                let end = vad_pos + FRAME_SIZE;
-                                flush_segment(&audio_buf[start..end], &ctx);
-                                vad_state.end_speech(&vad_cfg);
-                                audio_buf.drain(..end);
-                                vad_pos = 0;
+                                let offset_back = vad_state.best_split_offset();
+                                let split_end = (vad_pos + FRAME_SIZE) - offset_back;
+                                flush_segment(&audio_buf[start..split_end], &ctx);
+                                let frames_back = offset_back / FRAME_SIZE;
+                                audio_buf.drain(..split_end);
+                                vad_pos = audio_buf.len() - offset_back;
+                                vad_state.speech_start = Some(0);
+                                vad_state.speech_frames = frames_back;
+                                vad_state.prob_history.clear();
                                 vad.reset();
                                 continue;
                             }
