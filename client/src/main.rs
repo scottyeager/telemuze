@@ -4,8 +4,9 @@
 //! detect speech segments, then sends each segment to a Telemuze server for
 //! transcription.
 //!
-//! Toggle behavior: first invocation starts the daemon, second stops it.
-//! A separate `flush` subcommand forces a speech boundary without stopping.
+//! Run with no subcommand to start listening (foreground, for CLI/systemd).
+//! Use `toggle` to pause/resume, `flush` to force a segment boundary,
+//! and `stop` to shut down.
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -40,7 +41,7 @@ const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
 #[command(
     name = "telemuze-listen",
     about = "Streaming transcription client for Telemuze.\n\n\
-             Run once to start listening, run again to stop (toggle)."
+             Run with no subcommand to start the daemon. Use subcommands to control it."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -103,12 +104,28 @@ struct Cli {
     /// Maximum speech segment length in seconds before force-flushing.
     #[arg(long, default_value_t = DEFAULT_MAX_SPEECH_SECS)]
     max_speech_secs: u32,
+
+    /// Start in paused state (model loaded but not listening). Use `toggle` to begin.
+    #[arg(long)]
+    paused: bool,
 }
 
 #[derive(Subcommand)]
 enum Command {
+    /// Toggle listening on/off (pause/resume). Bind to a hotkey.
+    Toggle {
+        /// Unix socket path.
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: String,
+    },
     /// Flush the current speech chunk (keep listening).
     Flush {
+        /// Unix socket path.
+        #[arg(long, default_value = DEFAULT_SOCKET)]
+        socket: String,
+    },
+    /// Stop the daemon (flush any in-progress speech first).
+    Stop {
         /// Unix socket path.
         #[arg(long, default_value = DEFAULT_SOCKET)]
         socket: String,
@@ -426,14 +443,26 @@ fn send_ipc_command(socket_path: &str, command: &str) -> Result<()> {
 
 /// Check the non-blocking listener for incoming IPC commands.
 /// Sets the appropriate atomic flags.
-fn poll_ipc(listener: &UnixListener, flush_flag: &AtomicBool, stop_flag: &AtomicBool) {
+fn poll_ipc(
+    listener: &UnixListener,
+    flush_flag: &AtomicBool,
+    stop_flag: &AtomicBool,
+    toggle_flag: &AtomicBool,
+) {
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                // Set the accepted connection to blocking with a short read timeout
+                // so BufReader works correctly.
+                stream.set_nonblocking(false).ok();
+                stream
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .ok();
                 let mut reader = io::BufReader::new(stream);
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_ok() {
                     match line.trim() {
+                        "toggle" => toggle_flag.store(true, Ordering::Relaxed),
                         "flush" => flush_flag.store(true, Ordering::Relaxed),
                         "stop" => stop_flag.store(true, Ordering::Relaxed),
                         _ => {}
@@ -477,8 +506,12 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                         eprintln!("(empty)");
                     }
                     if ctx.notify {
-                        dismiss_notification(ctx.notify_id.get());
-                        ctx.notify_id.set(0);
+                        let id = show_notification(
+                            "Listening...",
+                            "Telemuze is active",
+                            ctx.notify_id.get(),
+                        );
+                        ctx.notify_id.set(id);
                     }
                 }
                 Err(e) => {
@@ -523,17 +556,12 @@ impl Drop for SocketGuard<'_> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Handle the `flush` subcommand
-    if let Some(Command::Flush { socket }) = &cli.command {
-        return send_ipc_command(socket, "flush");
-    }
-
-    // No subcommand: toggle behavior.
-    // Try connecting to existing daemon → send "stop".
-    // If no daemon, start one.
-    if UnixStream::connect(&cli.socket).is_ok() {
-        eprintln!("Stopping listener...");
-        return send_ipc_command(&cli.socket, "stop");
+    // Handle subcommands that send IPC to a running daemon
+    match &cli.command {
+        Some(Command::Toggle { socket }) => return send_ipc_command(socket, "toggle"),
+        Some(Command::Flush { socket }) => return send_ipc_command(socket, "flush"),
+        Some(Command::Stop { socket }) => return send_ipc_command(socket, "stop"),
+        None => {} // Start the daemon
     }
 
     // ── Start the daemon ───────────────────────────────────────────────
@@ -558,6 +586,7 @@ fn main() -> Result<()> {
     // Signal handling: SIGINT/SIGTERM → graceful shutdown
     let stop_flag = Arc::new(AtomicBool::new(false));
     let flush_flag = Arc::new(AtomicBool::new(false));
+    let toggle_flag = Arc::new(AtomicBool::new(false));
 
     signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop_flag))?;
     signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop_flag))?;
@@ -611,14 +640,21 @@ fn main() -> Result<()> {
         )
         .context("Failed to build audio input stream")?;
 
-    stream.play().context("Failed to start audio stream")?;
+    let mut listening = !cli.paused;
+    if listening {
+        stream.play().context("Failed to start audio stream")?;
+    }
 
-    if ctx.notify {
+    if ctx.notify && listening {
         let id = show_notification("Listening...", "Telemuze is active", 0);
         ctx.notify_id.set(id);
     }
 
-    eprintln!("Listening... (run again to stop)");
+    if listening {
+        eprintln!("Listening... (use `telemuze-listen stop` to shut down)");
+    } else {
+        eprintln!("Ready (paused). Use `telemuze-listen toggle` to start listening.");
+    }
     eprintln!("Endpoint: {}", ctx.endpoint_url);
     eprintln!();
 
@@ -629,7 +665,42 @@ fn main() -> Result<()> {
 
     loop {
         // Poll for IPC commands
-        poll_ipc(&listener, &flush_flag, &stop_flag);
+        poll_ipc(&listener, &flush_flag, &stop_flag, &toggle_flag);
+
+        // Handle toggle (pause/resume)
+        if toggle_flag.swap(false, Ordering::Relaxed) {
+            if listening {
+                // Pause: flush in-progress speech, stop audio capture
+                if let Some(start) = vad_state.end_speech(&vad_cfg) {
+                    let end = vad_pos.min(audio_buf.len());
+                    if start < end {
+                        flush_segment(&audio_buf[start..end], &ctx);
+                    }
+                }
+                stream.pause().ok();
+                // Drain any buffered audio
+                while rx.try_recv().is_ok() {}
+                audio_buf.clear();
+                vad_pos = 0;
+                vad.reset();
+                listening = false;
+                eprintln!("Paused");
+                if ctx.notify {
+                    dismiss_notification(ctx.notify_id.get());
+                    ctx.notify_id.set(0);
+                }
+            } else {
+                // Resume
+                stream.play().ok();
+                listening = true;
+                eprintln!("Listening...");
+                if ctx.notify {
+                    let id =
+                        show_notification("Listening...", "Telemuze is active", ctx.notify_id.get());
+                    ctx.notify_id.set(id);
+                }
+            }
+        }
 
         // Handle manual flush
         if flush_flag.swap(false, Ordering::Relaxed) && vad_state.in_speech {
@@ -704,7 +775,7 @@ fn main() -> Result<()> {
                 VadEvent::None => {}
             }
 
-            // Force-flush if speech is too long (30s)
+            // Force-flush if speech is too long
             if vad_state.in_speech {
                 if let Some(start) = vad_state.speech_start {
                     if vad_pos + FRAME_SIZE - start >= vad_cfg.max_speech_samples {
