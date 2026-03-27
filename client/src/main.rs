@@ -481,8 +481,13 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
             }
         }
 
-        // Also try "slash command <word>"
-        let slash = find_slash_command(&lower, cursor);
+        // Try "slash command <word>" only at the very beginning of the text
+        let slash = if cursor == 0 {
+            find_slash_command(&lower, 0)
+                .filter(|(start, ..)| !has_word_chars(&text[..*start]))
+        } else {
+            None
+        };
 
         // Determine whether a voice command or slash command comes first
         let use_voice = match (&best, &slash) {
