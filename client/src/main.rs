@@ -14,9 +14,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::cell::Cell;
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::sync::mpsc;
 use vad_rs::Vad;
 
 // ── Audio constants ────────────────────────────────────────────────────────
@@ -24,7 +22,7 @@ use vad_rs::Vad;
 const SAMPLE_RATE: u32 = 16_000;
 const FRAME_SIZE: usize = 480; // 30ms at 16kHz
 
-// ── VAD thresholds (matching server defaults) ──────────────────────────────
+// ── VAD defaults ───────────────────────────────────────────────────────────
 
 const DEFAULT_POSITIVE_THRESHOLD: f32 = 0.3;
 const DEFAULT_NEGATIVE_THRESHOLD: f32 = 0.3;
@@ -34,6 +32,19 @@ const DEFAULT_PREFILL_MS: u32 = 450;
 const DEFAULT_MAX_SPEECH_SECS: u32 = 15;
 
 const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
+
+// ── Event types ────────────────────────────────────────────────────────────
+
+enum Event {
+    Audio(Vec<f32>),
+    Ipc(IpcCommand),
+}
+
+enum IpcCommand {
+    Toggle,
+    Flush,
+    Stop,
+}
 
 // ── CLI ────────────────────────────────────────────────────────────────────
 
@@ -137,7 +148,7 @@ enum Command {
 enum VadEvent {
     None,
     SpeechStarted,
-    SpeechEnded(usize), // start sample position
+    SpeechEnded(usize),
 }
 
 struct VadConfig {
@@ -311,7 +322,6 @@ fn show_notification(summary: &str, body: &str, replaces_id: u32) -> u32 {
 
     match output {
         Ok(out) => {
-            // Parse "(uint32 NNN,)" from gdbus output
             let s = String::from_utf8_lossy(&out.stdout);
             s.split_whitespace()
                 .find_map(|tok| {
@@ -349,7 +359,7 @@ fn play_sound(name: &str) {
     let path = format!("/usr/share/sounds/freedesktop/stereo/{name}.oga");
     let _ = std::process::Command::new("paplay")
         .arg(&path)
-        .spawn(); // Fire and forget
+        .spawn();
 }
 
 // ── WAV encoding ───────────────────────────────────────────────────────────
@@ -387,7 +397,7 @@ fn send_to_server(
     let response = client
         .post(url)
         .multipart(form)
-        .timeout(Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30))
         .send()
         .context("Failed to send audio to server")?;
 
@@ -408,7 +418,8 @@ fn send_to_server(
 // ── VAD model download ─────────────────────────────────────────────────────
 
 fn download_vad_model(dest: &std::path::Path) -> Result<()> {
-    const URL: &str = "https://github.com/thewh1teagle/vad-rs/releases/download/v0.1.0/silero_vad.onnx";
+    const URL: &str =
+        "https://github.com/thewh1teagle/vad-rs/releases/download/v0.1.0/silero_vad.onnx";
 
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
@@ -430,49 +441,54 @@ fn download_vad_model(dest: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-// ── IPC helpers ────────────────────────────────────────────────────────────
+// ── IPC ────────────────────────────────────────────────────────────────────
 
 fn send_ipc_command(socket_path: &str, command: &str) -> Result<()> {
-    let mut stream =
-        UnixStream::connect(socket_path).context("No listener running (cannot connect to socket)")?;
+    let mut stream = UnixStream::connect(socket_path)
+        .context("No listener running (cannot connect to socket)")?;
     stream.write_all(command.as_bytes())?;
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
 }
 
-/// Check the non-blocking listener for incoming IPC commands.
-/// Sets the appropriate atomic flags.
-fn poll_ipc(
-    listener: &UnixListener,
-    flush_flag: &AtomicBool,
-    stop_flag: &AtomicBool,
-    toggle_flag: &AtomicBool,
-) {
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                // Set the accepted connection to blocking with a short read timeout
-                // so BufReader works correctly.
-                stream.set_nonblocking(false).ok();
-                stream
-                    .set_read_timeout(Some(Duration::from_millis(100)))
-                    .ok();
-                let mut reader = io::BufReader::new(stream);
-                let mut line = String::new();
-                if reader.read_line(&mut line).is_ok() {
-                    match line.trim() {
-                        "toggle" => toggle_flag.store(true, Ordering::Relaxed),
-                        "flush" => flush_flag.store(true, Ordering::Relaxed),
-                        "stop" => stop_flag.store(true, Ordering::Relaxed),
-                        _ => {}
+/// Spawn a thread that accepts connections on the Unix socket and forwards
+/// parsed commands through the event channel.
+fn spawn_ipc_listener(listener: UnixListener, tx: mpsc::SyncSender<Event>) {
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            let mut reader = io::BufReader::new(stream);
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_ok() {
+                let cmd = match line.trim() {
+                    "toggle" => Some(IpcCommand::Toggle),
+                    "flush" => Some(IpcCommand::Flush),
+                    "stop" => Some(IpcCommand::Stop),
+                    _ => None,
+                };
+                if let Some(cmd) = cmd {
+                    if tx.send(Event::Ipc(cmd)).is_err() {
+                        break; // Main thread gone
                     }
                 }
             }
-            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(_) => break,
         }
-    }
+    });
+}
+
+/// Spawn a thread that translates SIGINT/SIGTERM into Stop events.
+fn spawn_signal_handler(tx: mpsc::SyncSender<Event>) {
+    use signal_hook::iterator::Signals;
+    std::thread::spawn(move || {
+        let mut signals =
+            Signals::new([signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM])
+                .expect("Failed to register signal handlers");
+        for _ in signals.forever() {
+            let _ = tx.send(Event::Ipc(IpcCommand::Stop));
+            break;
+        }
+    });
 }
 
 // ── Segment flushing ───────────────────────────────────────────────────────
@@ -571,7 +587,6 @@ fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&cli.socket)
         .with_context(|| format!("Failed to bind socket: {}", cli.socket))?;
-    listener.set_nonblocking(true)?;
 
     let ctx = AppContext::new(&cli);
     let vad_cfg = VadConfig::from_cli(&cli);
@@ -583,13 +598,14 @@ fn main() -> Result<()> {
         notify: ctx.notify,
     };
 
-    // Signal handling: SIGINT/SIGTERM → graceful shutdown
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let flush_flag = Arc::new(AtomicBool::new(false));
-    let toggle_flag = Arc::new(AtomicBool::new(false));
+    // Unified event channel for audio and IPC
+    let (tx, rx) = mpsc::sync_channel::<Event>(64);
 
-    signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&stop_flag))?;
-    signal_hook::flag::register(signal_hook::consts::SIGTERM, Arc::clone(&stop_flag))?;
+    // Spawn IPC listener thread (blocks on accept, sends events)
+    spawn_ipc_listener(listener, tx.clone());
+
+    // Spawn signal handler thread (SIGINT/SIGTERM → Stop event)
+    spawn_signal_handler(tx.clone());
 
     // Resolve VAD model path
     let vad_path = match &cli.vad_model_path {
@@ -627,13 +643,12 @@ fn main() -> Result<()> {
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let (tx, rx) = mpsc::sync_channel::<Vec<f32>>(64);
-
+    let audio_tx = tx; // Move remaining sender to audio callback
     let stream = device
         .build_input_stream(
             &config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let _ = tx.send(data.to_vec());
+                let _ = audio_tx.send(Event::Audio(data.to_vec()));
             },
             |err| eprintln!("Audio stream error: {err}"),
             None,
@@ -664,139 +679,139 @@ fn main() -> Result<()> {
     let mut vad_state = VadState::new();
 
     loop {
-        // Poll for IPC commands
-        poll_ipc(&listener, &flush_flag, &stop_flag, &toggle_flag);
+        match rx.recv() {
+            Ok(Event::Audio(chunk)) => {
+                if !listening {
+                    continue; // Discard audio while paused
+                }
+                audio_buf.extend_from_slice(&chunk);
 
-        // Handle toggle (pause/resume)
-        if toggle_flag.swap(false, Ordering::Relaxed) {
-            if listening {
-                // Pause: flush in-progress speech, stop audio capture
+                // Process all complete 30ms frames
+                while vad_pos + FRAME_SIZE <= audio_buf.len() {
+                    let frame = &audio_buf[vad_pos..vad_pos + FRAME_SIZE];
+
+                    let prob = match vad.compute(frame) {
+                        Ok(result) => result.prob,
+                        Err(e) => {
+                            eprintln!("VAD error at sample {vad_pos}: {e}");
+                            if let Some(start) = vad_state.end_speech(&vad_cfg) {
+                                flush_segment(&audio_buf[start..vad_pos], &ctx);
+                            }
+                            vad.reset();
+                            audio_buf.drain(..vad_pos + FRAME_SIZE);
+                            vad_pos = 0;
+                            continue;
+                        }
+                    };
+
+                    match vad_state.update(prob, vad_pos, &vad_cfg) {
+                        VadEvent::SpeechStarted => {
+                            if ctx.notify {
+                                let id = show_notification(
+                                    "Recording...",
+                                    "Speech detected",
+                                    ctx.notify_id.get(),
+                                );
+                                ctx.notify_id.set(id);
+                            }
+                        }
+                        VadEvent::SpeechEnded(start) => {
+                            let end = vad_pos + FRAME_SIZE;
+                            flush_segment(&audio_buf[start..end], &ctx);
+                            audio_buf.drain(..end);
+                            vad_pos = 0;
+                            continue;
+                        }
+                        VadEvent::None => {}
+                    }
+
+                    // Force-flush if speech is too long
+                    if vad_state.in_speech {
+                        if let Some(start) = vad_state.speech_start {
+                            if vad_pos + FRAME_SIZE - start >= vad_cfg.max_speech_samples {
+                                let end = vad_pos + FRAME_SIZE;
+                                flush_segment(&audio_buf[start..end], &ctx);
+                                vad_state.end_speech(&vad_cfg);
+                                audio_buf.drain(..end);
+                                vad_pos = 0;
+                                vad.reset();
+                                continue;
+                            }
+                        }
+                    }
+
+                    vad_pos += FRAME_SIZE;
+                }
+
+                // Prevent unbounded memory growth during silence
+                if !vad_state.in_speech && vad_pos > SAMPLE_RATE as usize * 5 {
+                    audio_buf.drain(..vad_pos);
+                    vad_pos = 0;
+                }
+            }
+
+            Ok(Event::Ipc(IpcCommand::Toggle)) => {
+                if listening {
+                    // Pause: flush in-progress speech, stop audio capture
+                    if let Some(start) = vad_state.end_speech(&vad_cfg) {
+                        let end = vad_pos.min(audio_buf.len());
+                        if start < end {
+                            flush_segment(&audio_buf[start..end], &ctx);
+                        }
+                    }
+                    stream.pause().ok();
+                    audio_buf.clear();
+                    vad_pos = 0;
+                    vad.reset();
+                    listening = false;
+                    eprintln!("Paused");
+                    if ctx.notify {
+                        dismiss_notification(ctx.notify_id.get());
+                        ctx.notify_id.set(0);
+                    }
+                } else {
+                    // Resume
+                    stream.play().ok();
+                    listening = true;
+                    eprintln!("Listening...");
+                    if ctx.notify {
+                        let id = show_notification(
+                            "Listening...",
+                            "Telemuze is active",
+                            ctx.notify_id.get(),
+                        );
+                        ctx.notify_id.set(id);
+                    }
+                }
+            }
+
+            Ok(Event::Ipc(IpcCommand::Flush)) => {
+                if vad_state.in_speech {
+                    if let Some(start) = vad_state.end_speech(&vad_cfg) {
+                        let end = vad_pos.min(audio_buf.len());
+                        if start < end {
+                            flush_segment(&audio_buf[start..end], &ctx);
+                        }
+                        audio_buf.drain(..end);
+                        vad_pos = 0;
+                        vad.reset();
+                    }
+                }
+            }
+
+            Ok(Event::Ipc(IpcCommand::Stop)) => {
+                // Flush any in-progress speech
                 if let Some(start) = vad_state.end_speech(&vad_cfg) {
                     let end = vad_pos.min(audio_buf.len());
                     if start < end {
                         flush_segment(&audio_buf[start..end], &ctx);
                     }
                 }
-                stream.pause().ok();
-                // Drain any buffered audio
-                while rx.try_recv().is_ok() {}
-                audio_buf.clear();
-                vad_pos = 0;
-                vad.reset();
-                listening = false;
-                eprintln!("Paused");
-                if ctx.notify {
-                    dismiss_notification(ctx.notify_id.get());
-                    ctx.notify_id.set(0);
-                }
-            } else {
-                // Resume
-                stream.play().ok();
-                listening = true;
-                eprintln!("Listening...");
-                if ctx.notify {
-                    let id =
-                        show_notification("Listening...", "Telemuze is active", ctx.notify_id.get());
-                    ctx.notify_id.set(id);
-                }
-            }
-        }
-
-        // Handle manual flush
-        if flush_flag.swap(false, Ordering::Relaxed) && vad_state.in_speech {
-            if let Some(start) = vad_state.end_speech(&vad_cfg) {
-                let end = vad_pos.min(audio_buf.len());
-                if start < end {
-                    flush_segment(&audio_buf[start..end], &ctx);
-                }
-                audio_buf.drain(..end);
-                vad_pos = 0;
-                vad.reset();
-            }
-        }
-
-        // Handle stop
-        if stop_flag.load(Ordering::Relaxed) {
-            // Flush any in-progress speech
-            if let Some(start) = vad_state.end_speech(&vad_cfg) {
-                let end = vad_pos.min(audio_buf.len());
-                if start < end {
-                    flush_segment(&audio_buf[start..end], &ctx);
-                }
-            }
-            eprintln!("Stopping...");
-            break;
-        }
-
-        // Receive audio with timeout so we can poll signals/IPC
-        let chunk = match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(c) => c,
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        audio_buf.extend_from_slice(&chunk);
-
-        // Process all complete 30ms frames
-        while vad_pos + FRAME_SIZE <= audio_buf.len() {
-            let frame = &audio_buf[vad_pos..vad_pos + FRAME_SIZE];
-
-            let prob = match vad.compute(frame) {
-                Ok(result) => result.prob,
-                Err(e) => {
-                    eprintln!("VAD error at sample {vad_pos}: {e}");
-                    if let Some(start) = vad_state.end_speech(&vad_cfg) {
-                        flush_segment(&audio_buf[start..vad_pos], &ctx);
-                    }
-                    vad.reset();
-                    audio_buf.drain(..vad_pos + FRAME_SIZE);
-                    vad_pos = 0;
-                    continue;
-                }
-            };
-
-            match vad_state.update(prob, vad_pos, &vad_cfg) {
-                VadEvent::SpeechStarted => {
-                    if ctx.notify {
-                        let id = show_notification(
-                            "Recording...",
-                            "Speech detected",
-                            ctx.notify_id.get(),
-                        );
-                        ctx.notify_id.set(id);
-                    }
-                }
-                VadEvent::SpeechEnded(start) => {
-                    let end = vad_pos + FRAME_SIZE;
-                    flush_segment(&audio_buf[start..end], &ctx);
-                    audio_buf.drain(..end);
-                    vad_pos = 0;
-                    continue;
-                }
-                VadEvent::None => {}
+                eprintln!("Stopping...");
+                break;
             }
 
-            // Force-flush if speech is too long
-            if vad_state.in_speech {
-                if let Some(start) = vad_state.speech_start {
-                    if vad_pos + FRAME_SIZE - start >= vad_cfg.max_speech_samples {
-                        let end = vad_pos + FRAME_SIZE;
-                        flush_segment(&audio_buf[start..end], &ctx);
-                        vad_state.end_speech(&vad_cfg);
-                        audio_buf.drain(..end);
-                        vad_pos = 0;
-                        vad.reset();
-                        continue;
-                    }
-                }
-            }
-
-            vad_pos += FRAME_SIZE;
-        }
-
-        // Prevent unbounded memory growth during silence
-        if !vad_state.in_speech && vad_pos > SAMPLE_RATE as usize * 5 {
-            audio_buf.drain(..vad_pos);
-            vad_pos = 0;
+            Err(_) => break, // All senders dropped
         }
     }
 
