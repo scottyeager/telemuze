@@ -30,78 +30,95 @@ pub enum TrayStatus {
     Processing,
 }
 
-/// RGB for each status.
-fn status_rgb(status: TrayStatus) -> (u16, u16, u16) {
+// ── Software-rendered icons ───────────────────────────────────────────────
+
+/// RGB color for each status.
+fn status_rgb(status: TrayStatus) -> (u8, u8, u8) {
     match status {
-        TrayStatus::Idle => (0x88, 0x88, 0x88),      // gray
-        TrayStatus::Listening => (0x4C, 0xAF, 0x50), // green
-        TrayStatus::Recording => (0xF4, 0x43, 0x36), // red
-        TrayStatus::Processing => (0x21, 0x96, 0xF3), // blue
+        TrayStatus::Idle => (0x88, 0x88, 0x88),
+        TrayStatus::Listening => (0x4C, 0xAF, 0x50),
+        TrayStatus::Recording => (0xF4, 0x43, 0x36),
+        TrayStatus::Processing => (0x42, 0xA5, 0xF5),
     }
 }
 
-/// Allocate an X color pixel value.
-fn alloc_pixel(
-    conn: &RustConnection,
-    colormap: Colormap,
-    r: u16,
-    g: u16,
-    b: u16,
-) -> Result<u32, Box<dyn std::error::Error>> {
-    let reply = conn
-        .alloc_color(colormap, r * 257, g * 257, b * 257)?
-        .reply()?;
-    Ok(reply.pixel)
+/// Blend foreground onto background with alpha (0.0–1.0).
+fn blend(fg: u8, bg: u8, a: f32) -> u8 {
+    (fg as f32 * a + bg as f32 * (1.0 - a)) as u8
 }
 
-/// Draw the status icon into a pixmap, then copy to window.
-fn draw_icon(
-    conn: &RustConnection,
-    pixmap: Pixmap,
-    win: Window,
-    gc: Gcontext,
-    bg_pixel: u32,
-    fg_pixel: u32,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Fill background
-    conn.change_gc(gc, &ChangeGCAux::new().foreground(bg_pixel))?;
-    conn.poly_fill_rectangle(
-        pixmap,
-        gc,
-        &[Rectangle {
-            x: 0,
-            y: 0,
-            width: ICON_SIZE,
-            height: ICON_SIZE,
-        }],
-    )?;
-
-    // Draw filled circle
-    conn.change_gc(gc, &ChangeGCAux::new().foreground(fg_pixel))?;
-    let margin: i16 = 4;
-    let diameter = ICON_SIZE as i16 - margin * 2;
-    conn.poly_fill_arc(
-        pixmap,
-        gc,
-        &[Arc {
-            x: margin,
-            y: margin,
-            width: diameter as u16,
-            height: diameter as u16,
-            angle1: 0,
-            angle2: 360 * 64,
-        }],
-    )?;
-
-    // Copy pixmap to window (no expose generation)
-    conn.copy_area(pixmap, win, gc, 0, 0, 0, 0, ICON_SIZE, ICON_SIZE)?;
-    conn.flush()?;
-    Ok(())
+/// Smoothstep for anti-aliased edges: returns 1.0 inside, 0.0 outside,
+/// smooth gradient over ~1px at the boundary.
+fn aa_fill(dist_from_edge: f32) -> f32 {
+    (dist_from_edge + 0.5).clamp(0.0, 1.0)
 }
+
+/// Smoothstep for a ring/stroke: 1.0 on the stroke, 0.0 elsewhere.
+fn aa_ring(dist_from_center: f32, radius: f32, half_width: f32) -> f32 {
+    let outer = aa_fill(radius + half_width - dist_from_center);
+    let inner = aa_fill(dist_from_center - (radius - half_width));
+    outer * inner
+}
+
+/// Render icon to a BGRA pixel buffer (X11 ZPixmap, little-endian 32bpp).
+/// Renders at the given width/height so the icon is always perfectly centered.
+fn render_icon(status: TrayStatus, bg: (u8, u8, u8), w: u16, h: u16) -> Vec<u8> {
+    let fw = w as f32;
+    let fh = h as f32;
+    let cx = fw / 2.0;
+    let cy = fh / 2.0;
+    // Use the smaller axis so the icon fits
+    let s = fw.min(fh);
+    let (fr, fg, fb) = status_rgb(status);
+    let (bgr, bgg, bgb) = bg;
+    let mut data = Vec::with_capacity((w as usize) * (h as usize) * 4);
+
+    for y in 0..h {
+        for x in 0..w {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let dx = px - cx;
+            let dy = py - cy;
+            let dist = (dx * dx + dy * dy).sqrt();
+
+            let a = match status {
+                TrayStatus::Listening => {
+                    let radius = s / 2.0 - 3.0;
+                    aa_fill(radius - dist)
+                }
+                TrayStatus::Recording => {
+                    let radius = s / 2.0 - 2.0;
+                    aa_fill(radius - dist)
+                }
+                TrayStatus::Idle => {
+                    let radius = s / 2.0 - 4.0;
+                    aa_ring(dist, radius, 1.8)
+                }
+                TrayStatus::Processing => {
+                    let outer = aa_ring(dist, s / 2.0 - 3.5, 1.5);
+                    let inner = aa_fill(2.5 - dist);
+                    1.0 - (1.0 - outer) * (1.0 - inner)
+                }
+            };
+
+            let r = blend(fr, bgr, a);
+            let g = blend(fg, bgg, a);
+            let b = blend(fb, bgb, a);
+
+            // X11 ZPixmap 32bpp little-endian: B G R pad
+            data.push(b);
+            data.push(g);
+            data.push(r);
+            data.push(0xFF);
+        }
+    }
+    data
+}
+
+// ── X11 tray handle ──────────────────────────────────────────────────────
 
 pub struct TrayHandle {
     status: std::sync::Arc<Mutex<TrayStatus>>,
-    /// Signal the tray thread to repaint.
     repaint_conn: std::sync::Arc<RustConnection>,
     win: Window,
 }
@@ -122,7 +139,6 @@ impl TrayHandle {
         if *s != status {
             *s = status;
             drop(s);
-            // Send a synthetic expose event to wake the tray thread
             let _ = self.repaint_conn.send_event(
                 false,
                 self.win,
@@ -148,6 +164,8 @@ impl TrayHandle {
     }
 }
 
+// ── Spawn tray ───────────────────────────────────────────────────────────
+
 pub fn spawn_tray(
     tx: mpsc::SyncSender<crate::Event>,
     initial: TrayStatus,
@@ -156,6 +174,7 @@ pub fn spawn_tray(
         RustConnection::connect(None).map_err(|e| anyhow::anyhow!("X11 connect: {e}"))?;
     let screen = conn.setup().roots[screen_num].clone();
     let atoms = Atoms::new(&conn)?.reply()?;
+    let depth = screen.root_depth;
 
     // Find the system tray manager
     let tray_owner = conn
@@ -188,15 +207,9 @@ pub fn spawn_tray(
             ),
     )?;
 
-    // Create an off-screen pixmap for double buffering
+    // Pixmap for double buffering — will be recreated on resize
     let pixmap = conn.generate_id()?;
-    conn.create_pixmap(
-        screen.root_depth,
-        pixmap,
-        win,
-        ICON_SIZE,
-        ICON_SIZE,
-    )?;
+    conn.create_pixmap(depth, pixmap, win, ICON_SIZE, ICON_SIZE)?;
 
     // Set _XEMBED_INFO: version 0, flags XEMBED_MAPPED
     conn.change_property32(
@@ -233,22 +246,7 @@ pub fn spawn_tray(
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win, &CreateGCAux::default())?;
 
-    // Pre-allocate color pixels for all statuses
-    let colormap = screen.default_colormap;
-    let bg_pixel = screen.black_pixel;
-    let pixels: Vec<(TrayStatus, u32)> = [
-        TrayStatus::Idle,
-        TrayStatus::Listening,
-        TrayStatus::Recording,
-        TrayStatus::Processing,
-    ]
-    .iter()
-    .map(|&s| {
-        let (r, g, b) = status_rgb(s);
-        let px = alloc_pixel(&conn, colormap, r, g, b).unwrap_or(screen.white_pixel);
-        (s, px)
-    })
-    .collect();
+    let bg = (0u8, 0u8, 0u8);
 
     // Open a second connection for sending repaint signals from other threads
     let (repaint_conn, _) =
@@ -261,15 +259,31 @@ pub fn spawn_tray(
         win,
     };
 
-    // Spawn the event loop thread
     std::thread::spawn(move || {
-        let pixel_for = |s: TrayStatus| -> u32 {
-            pixels
-                .iter()
-                .find(|(st, _)| *st == s)
-                .map(|(_, px)| *px)
-                .unwrap_or(screen.white_pixel)
-        };
+        // Track actual window size (tray manager may resize us)
+        let mut win_w = ICON_SIZE;
+        let mut win_h = ICON_SIZE;
+        let mut cur_pixmap = pixmap;
+        let mut pm_w = ICON_SIZE;
+        let mut pm_h = ICON_SIZE;
+
+        let ensure_pixmap =
+            |cur: &mut Pixmap,
+             pw: &mut u16,
+             ph: &mut u16,
+             ww: u16,
+             wh: u16|
+             -> Result<(), Box<dyn std::error::Error>> {
+                if ww != *pw || wh != *ph {
+                    conn.free_pixmap(*cur)?;
+                    let new_pm = conn.generate_id()?;
+                    conn.create_pixmap(depth, new_pm, win, ww, wh)?;
+                    *cur = new_pm;
+                    *pw = ww;
+                    *ph = wh;
+                }
+                Ok(())
+            };
 
         loop {
             let event = match conn.wait_for_event() {
@@ -277,9 +291,36 @@ pub fn spawn_tray(
                 Err(_) => break,
             };
             match event {
+                Event::ConfigureNotify(ev) => {
+                    win_w = ev.width;
+                    win_h = ev.height;
+                }
                 Event::Expose(ev) if ev.count == 0 => {
                     let s = *status.lock().unwrap();
-                    let _ = draw_icon(&conn, pixmap, win, gc, bg_pixel, pixel_for(s));
+                    let _ = ensure_pixmap(
+                        &mut cur_pixmap,
+                        &mut pm_w,
+                        &mut pm_h,
+                        win_w,
+                        win_h,
+                    );
+                    let data = render_icon(s, bg, win_w, win_h);
+                    let _ = conn.put_image(
+                        ImageFormat::Z_PIXMAP,
+                        cur_pixmap,
+                        gc,
+                        win_w,
+                        win_h,
+                        0,
+                        0,
+                        0,
+                        depth,
+                        &data,
+                    );
+                    let _ = conn.copy_area(
+                        cur_pixmap, win, gc, 0, 0, 0, 0, win_w, win_h,
+                    );
+                    let _ = conn.flush();
                 }
                 Event::ButtonPress(ev) => {
                     if ev.detail == 1 {
