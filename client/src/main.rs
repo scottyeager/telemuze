@@ -313,6 +313,35 @@ fn send_key(key: &str, display_server: &str) {
     }
 }
 
+fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str) {
+    let result = if display_server == "wayland" {
+        // wtype: -M mod -k key -m mod (press modifier, tap key, release modifier)
+        let mut args: Vec<String> = Vec::new();
+        for m in modifiers {
+            args.push("-M".into());
+            args.push(m.to_string());
+        }
+        args.push("-k".into());
+        args.push(key.into());
+        for m in modifiers.iter().rev() {
+            args.push("-m".into());
+            args.push(m.to_string());
+        }
+        std::process::Command::new("wtype")
+            .args(&args)
+            .status()
+    } else {
+        // xdotool: "ctrl+Return" style
+        let combo = format!("{}+{}", modifiers.join("+"), key);
+        std::process::Command::new("xdotool")
+            .args(["key", "--clearmodifiers", &combo])
+            .status()
+    };
+    if let Err(e) = result {
+        eprintln!("Key injection failed: {e}");
+    }
+}
+
 // ── Voice commands ──────────────────────────────────────────────────────
 
 /// An action that a voice command can trigger.
@@ -320,6 +349,11 @@ fn send_key(key: &str, display_server: &str) {
 enum VoiceAction {
     /// Simulate a keypress (e.g. "Return", "Tab").
     Key(&'static str),
+    /// Simulate a modified keypress (e.g. Ctrl+Return).
+    ModifiedKey {
+        modifiers: &'static [&'static str],
+        key: &'static str,
+    },
 }
 
 /// A voice command: a phrase (lowercased words) mapped to an action.
@@ -330,10 +364,19 @@ struct VoiceCommand {
 }
 
 fn voice_commands() -> &'static [VoiceCommand] {
-    static COMMANDS: &[VoiceCommand] = &[VoiceCommand {
-        words: &["press", "enter"],
-        action: VoiceAction::Key("Return"),
-    }];
+    static COMMANDS: &[VoiceCommand] = &[
+        VoiceCommand {
+            words: &["press", "control", "enter"],
+            action: VoiceAction::ModifiedKey {
+                modifiers: &["ctrl"],
+                key: "Return",
+            },
+        },
+        VoiceCommand {
+            words: &["press", "enter"],
+            action: VoiceAction::Key("Return"),
+        },
+    ];
     COMMANDS
 }
 
@@ -660,6 +703,13 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                 TextAction::Command(VoiceAction::Key(key)) => {
                                     if ctx.type_text {
                                         send_key(key, &ctx.display_server);
+                                    } else {
+                                        println!();
+                                    }
+                                }
+                                TextAction::Command(VoiceAction::ModifiedKey { modifiers, key }) => {
+                                    if ctx.type_text {
+                                        send_modified_key(modifiers, key, &ctx.display_server);
                                     } else {
                                         println!();
                                     }
