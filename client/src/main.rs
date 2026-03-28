@@ -509,11 +509,11 @@ fn scroll(up: bool, ticks: u32) {
 #[derive(Clone, Debug)]
 enum VoiceAction {
     /// Simulate a keypress (e.g. "Return", "Tab").
-    Key(&'static str),
+    Key(String),
     /// Simulate a modified keypress (e.g. Ctrl+Return).
     ModifiedKey {
-        modifiers: &'static [&'static str],
-        key: &'static str,
+        modifiers: Vec<String>,
+        key: String,
     },
     /// Move the mouse to a screen quadrant and click.
     ClickQuadrant {
@@ -545,51 +545,6 @@ struct VoiceCommand {
 
 fn voice_commands() -> &'static [VoiceCommand] {
     static COMMANDS: &[VoiceCommand] = &[
-        VoiceCommand {
-            words: &["press", "control", "enter"],
-            action: VoiceAction::ModifiedKey {
-                modifiers: &["ctrl"],
-                key: "Return",
-            },
-        },
-        VoiceCommand {
-            words: &["press", "ctrl", "enter"],
-            action: VoiceAction::ModifiedKey {
-                modifiers: &["ctrl"],
-                key: "Return",
-            },
-        },
-        VoiceCommand {
-            words: &["press", "shift", "tab"],
-            action: VoiceAction::ModifiedKey {
-                modifiers: &["shift"],
-                key: "Tab",
-            },
-        },
-        VoiceCommand {
-            words: &["press", "enter"],
-            action: VoiceAction::Key("Return"),
-        },
-        VoiceCommand {
-            words: &["press", "tab"],
-            action: VoiceAction::Key("Tab"),
-        },
-        VoiceCommand {
-            words: &["press", "up"],
-            action: VoiceAction::Key("Up"),
-        },
-        VoiceCommand {
-            words: &["press", "down"],
-            action: VoiceAction::Key("Down"),
-        },
-        VoiceCommand {
-            words: &["press", "left"],
-            action: VoiceAction::Key("Left"),
-        },
-        VoiceCommand {
-            words: &["press", "right"],
-            action: VoiceAction::Key("Right"),
-        },
         VoiceCommand {
             words: &["click", "upper", "left"],
             action: VoiceAction::ClickQuadrant { right: false, bottom: false },
@@ -799,6 +754,157 @@ fn find_click_coordinate(lower: &str, from: usize) -> Option<(usize, usize, u32,
     None
 }
 
+/// Modifier names the user might say, mapped to the xdotool/wtype name.
+const MODIFIER_ALIASES: &[(&str, &str)] = &[
+    ("control", "ctrl"),
+    ("ctrl", "ctrl"),
+    ("shift", "shift"),
+    ("alt", "alt"),
+    ("super", "super"),
+    ("command", "super"),
+    ("meta", "super"),
+];
+
+/// Try to find "[press] <modifier> <key>" in `lower` starting from `from`.
+/// Supports any modifier (ctrl, shift, alt, super) and recognises single
+/// letters a–z plus common named keys.
+/// Returns (start_byte, end_byte, VoiceAction) or None.
+fn find_modified_key(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> {
+    let haystack = &lower[from..];
+    let mut best: Option<(usize, usize, VoiceAction)> = None;
+
+    for &(alias, canonical) in MODIFIER_ALIASES {
+        let mut search_start = 0;
+        while let Some(p) = haystack[search_start..].find(alias) {
+            let alias_start = from + search_start + p;
+            let after_alias = alias_start + alias.len();
+
+            // Optionally preceded by "press " — scan backwards for it
+            let actual_start = {
+                let before = &lower[from..alias_start];
+                let trimmed = before.trim_end();
+                if trimmed.ends_with("press") {
+                    let press_offset = trimmed.len() - "press".len();
+                    from + press_offset
+                } else {
+                    alias_start
+                }
+            };
+
+            // Extract the next word after the modifier (skipping separators)
+            if let Some((key_name, word_end)) = next_key_word(lower, after_alias) {
+                let candidate = (
+                    actual_start,
+                    word_end,
+                    VoiceAction::ModifiedKey {
+                        modifiers: vec![canonical.into()],
+                        key: key_name.into(),
+                    },
+                );
+                if best.as_ref().is_none_or(|b| actual_start < b.0) {
+                    best = Some(candidate);
+                }
+            }
+
+            search_start = search_start + p + alias.len();
+        }
+    }
+
+    best
+}
+
+/// Try to find "press <key>" (without a modifier) in `lower` starting from
+/// `from`.  Returns (start_byte, end_byte, VoiceAction) or None.
+fn find_key_press(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> {
+    let haystack = &lower[from..];
+    let mut best: Option<(usize, usize, VoiceAction)> = None;
+
+    let mut search_start = 0;
+    while let Some(p) = haystack[search_start..].find("press") {
+        let press_start = from + search_start + p;
+        let after_press = press_start + "press".len();
+
+        // The word after "press" must not be a modifier — those are handled by
+        // find_modified_key and we don't want "press control c" to fire as
+        // Key("control").
+        if let Some((key_name, word_end)) = next_key_word(lower, after_press) {
+            let candidate = (
+                press_start,
+                word_end,
+                VoiceAction::Key(key_name.into()),
+            );
+            if best.as_ref().is_none_or(|b| press_start < b.0) {
+                best = Some(candidate);
+            }
+        }
+
+        search_start = search_start + p + "press".len();
+    }
+
+    best
+}
+
+/// Skip separators after `pos` in `lower`, read the next word, and try to map
+/// it to a key name.  Returns `(key_name, end_byte_offset)` or None.
+fn next_key_word(lower: &str, pos: usize) -> Option<(&'static str, usize)> {
+    let rest = &lower[pos..];
+    let skip = rest
+        .chars()
+        .take_while(|c| is_separator(*c))
+        .map(|c| c.len_utf8())
+        .sum::<usize>();
+
+    if skip == 0 {
+        return None;
+    }
+
+    let after_sep = pos + skip;
+    let word_end = lower[after_sep..]
+        .find(|c: char| c.is_whitespace() || is_separator(c))
+        .map_or(lower.len(), |i| after_sep + i);
+    let word = &lower[after_sep..word_end];
+
+    key_name(word).map(|k| (k, word_end))
+}
+
+fn is_separator(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"')
+}
+
+/// Map a spoken word to its xdotool/wtype key name.
+/// Returns `None` if the word is not a recognised key.
+fn key_name(word: &str) -> Option<&'static str> {
+    // Single letters a–z
+    if word.len() == 1 && word.as_bytes()[0].is_ascii_lowercase() {
+        return Some(match word {
+            "a" => "a", "b" => "b", "c" => "c", "d" => "d",
+            "e" => "e", "f" => "f", "g" => "g", "h" => "h",
+            "i" => "i", "j" => "j", "k" => "k", "l" => "l",
+            "m" => "m", "n" => "n", "o" => "o", "p" => "p",
+            "q" => "q", "r" => "r", "s" => "s", "t" => "t",
+            "u" => "u", "v" => "v", "w" => "w", "x" => "x",
+            "y" => "y", "z" => "z",
+            _ => unreachable!(),
+        });
+    }
+    // Common named keys
+    match word {
+        "enter" | "return" => Some("Return"),
+        "tab" => Some("Tab"),
+        "space" => Some("space"),
+        "backspace" => Some("BackSpace"),
+        "delete" => Some("Delete"),
+        "escape" | "esc" => Some("Escape"),
+        "up" => Some("Up"),
+        "down" => Some("Down"),
+        "left" => Some("Left"),
+        "right" => Some("Right"),
+        "home" => Some("Home"),
+        "end" => Some("End"),
+        _ => None,
+    }
+}
+
 /// Scan `text` for voice command phrases (case-insensitive, tolerant of
 /// punctuation between words) and split into text segments and command actions.
 fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
@@ -823,6 +929,20 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
         if let Some((start, end, x, y)) = find_click_coordinate(&lower, cursor) {
             if best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, VoiceAction::ClickCoordinate { x, y }));
+            }
+        }
+
+        // Try "[press] <modifier> <key>" dynamic command
+        if let Some((start, end, action)) = find_modified_key(&lower, cursor) {
+            if best.as_ref().is_none_or(|b| start < b.0) {
+                best = Some((start, end, action));
+            }
+        }
+
+        // Try "press <key>" (unmodified) dynamic command
+        if let Some((start, end, action)) = find_key_press(&lower, cursor) {
+            if best.as_ref().is_none_or(|b| start < b.0) {
+                best = Some((start, end, action));
             }
         }
 
@@ -1174,7 +1294,7 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                         print!("{t} ");
                                     }
                                 }
-                                TextAction::Command(VoiceAction::Key(key)) => {
+                                TextAction::Command(VoiceAction::Key(ref key)) => {
                                     if ctx.type_text {
                                         if just_typed {
                                             std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1185,12 +1305,13 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                     }
                                     just_typed = false;
                                 }
-                                TextAction::Command(VoiceAction::ModifiedKey { modifiers, key }) => {
+                                TextAction::Command(VoiceAction::ModifiedKey { ref modifiers, ref key }) => {
                                     if ctx.type_text {
                                         if just_typed {
                                             std::thread::sleep(std::time::Duration::from_millis(50));
                                         }
-                                        send_modified_key(modifiers, key, &ctx.display_server, ctx.verbose);
+                                        let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
+                                        send_modified_key(&mod_refs, key, &ctx.display_server, ctx.verbose);
                                     } else {
                                         println!();
                                     }
