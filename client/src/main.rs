@@ -456,6 +456,42 @@ fn click_quadrant(right: bool, bottom: bool) {
     }
 }
 
+fn click_coordinate(x_pct: u32, y_pct: u32) {
+    let output = match std::process::Command::new("xdotool")
+        .args(["getdisplaygeometry"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("Failed to get display geometry: {e}");
+            return;
+        }
+    };
+    let geometry = String::from_utf8_lossy(&output.stdout);
+    let parts: Vec<&str> = geometry.trim().split_whitespace().collect();
+    if parts.len() < 2 {
+        eprintln!("Unexpected geometry output: {geometry}");
+        return;
+    }
+    let (width, height) = match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+        (Ok(w), Ok(h)) => (w, h),
+        _ => {
+            eprintln!("Failed to parse geometry: {geometry}");
+            return;
+        }
+    };
+
+    let x = width * x_pct.min(100) / 100;
+    let y = height * y_pct.min(100) / 100;
+
+    let result = std::process::Command::new("xdotool")
+        .args(["mousemove", "--sync", &x.to_string(), &y.to_string(), "click", "1"])
+        .status();
+    if let Err(e) = result {
+        eprintln!("Mouse click failed: {e}");
+    }
+}
+
 fn scroll(up: bool, ticks: u32) {
     let button = if up { "4" } else { "5" };
     let repeat = ticks.to_string();
@@ -485,6 +521,13 @@ enum VoiceAction {
         right: bool,
         /// Vertical position: false = top, true = bottom.
         bottom: bool,
+    },
+    /// Move the mouse to a percentage-based coordinate and click.
+    ClickCoordinate {
+        /// X position as a percentage (0–100) of screen width.
+        x: u32,
+        /// Y position as a percentage (0–100) of screen height.
+        y: u32,
     },
     /// Scroll the mouse wheel.
     Scroll {
@@ -623,6 +666,139 @@ fn find_slash_command(lower: &str, from: usize) -> Option<(usize, usize, String)
     None
 }
 
+/// Parse a spoken number word into its value. Returns None if the word is not a number.
+fn parse_number_word(word: &str) -> Option<u32> {
+    match word {
+        "zero" | "oh" => Some(0),
+        "one" => Some(1),
+        "two" | "to" | "too" => Some(2),
+        "three" => Some(3),
+        "four" | "for" => Some(4),
+        "five" => Some(5),
+        "six" => Some(6),
+        "seven" => Some(7),
+        "eight" => Some(8),
+        "nine" => Some(9),
+        "ten" => Some(10),
+        "eleven" => Some(11),
+        "twelve" => Some(12),
+        "thirteen" => Some(13),
+        "fourteen" => Some(14),
+        "fifteen" => Some(15),
+        "sixteen" => Some(16),
+        "seventeen" => Some(17),
+        "eighteen" => Some(18),
+        "nineteen" => Some(19),
+        "twenty" => Some(20),
+        "thirty" => Some(30),
+        "forty" => Some(40),
+        "fifty" => Some(50),
+        "sixty" => Some(60),
+        "seventy" => Some(70),
+        "eighty" => Some(80),
+        "ninety" => Some(90),
+        "hundred" => Some(100),
+        _ => None,
+    }
+}
+
+/// Try to parse a spoken number (0–100) from words starting at `word_idx`.
+/// Returns (value, number_of_words_consumed) or None.
+fn parse_spoken_number(words: &[&str], word_idx: usize) -> Option<(u32, usize)> {
+    let first = words.get(word_idx)?;
+    let first_val = parse_number_word(first)?;
+
+    // "one hundred"
+    if first_val == 1 {
+        if let Some(&next) = words.get(word_idx + 1) {
+            if next == "hundred" {
+                return Some((100, 2));
+            }
+        }
+    }
+
+    // "hundred" alone
+    if *first == "hundred" {
+        return Some((100, 1));
+    }
+
+    // Tens word (20, 30, ..., 90) optionally followed by a ones word (1–9)
+    if first_val >= 20 && first_val <= 90 && first_val % 10 == 0 {
+        if let Some(&next) = words.get(word_idx + 1) {
+            if let Some(ones) = parse_number_word(next) {
+                if ones >= 1 && ones <= 9 {
+                    return Some((first_val + ones, 2));
+                }
+            }
+        }
+        return Some((first_val, 1));
+    }
+
+    // Single number word (0–19)
+    if first_val <= 19 {
+        return Some((first_val, 1));
+    }
+
+    None
+}
+
+/// Try to find "click <number> <number>" in `lower` starting from `from`.
+/// Returns (start_byte, end_byte, x, y) or None.
+fn find_click_coordinate(lower: &str, from: usize) -> Option<(usize, usize, u32, u32)> {
+    let haystack = &lower[from..];
+
+    let mut search_start = 0;
+    while let Some(p) = haystack[search_start..].find("click") {
+        let click_start = from + search_start + p;
+        let after_click = click_start + "click".len();
+
+        // Collect the words after "click", skipping punctuation/whitespace
+        let rest = &lower[after_click..];
+        let word_chars: Vec<&str> = rest
+            .split(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"'))
+            .filter(|s| !s.is_empty())
+            .take(4) // at most 4 words needed (2 per number)
+            .collect();
+
+        if let Some((y, y_consumed)) = parse_spoken_number(&word_chars, 0) {
+            if y <= 100 {
+                if let Some((x, x_consumed)) = parse_spoken_number(&word_chars, y_consumed) {
+                    if x <= 100 {
+                        // Find the byte offset of the end of the last consumed word
+                        let total_words = y_consumed + x_consumed;
+                        let mut end = after_click;
+                        let mut words_found = 0;
+                        let mut in_word = false;
+                        for (i, c) in lower[after_click..].char_indices() {
+                            let is_sep = c.is_whitespace()
+                                || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"');
+                            if in_word && is_sep {
+                                words_found += 1;
+                                if words_found == total_words {
+                                    end = after_click + i;
+                                    break;
+                                }
+                                in_word = false;
+                            } else if !is_sep {
+                                in_word = true;
+                            }
+                        }
+                        if words_found < total_words && in_word {
+                            // Last word runs to end of string
+                            end = lower.len();
+                        }
+                        return Some((click_start, end, x, y));
+                    }
+                }
+            }
+        }
+
+        search_start = search_start + p + "click".len();
+    }
+
+    None
+}
+
 /// Scan `text` for voice command phrases (case-insensitive, tolerant of
 /// punctuation between words) and split into text segments and command actions.
 fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
@@ -640,6 +816,13 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
                 if best.as_ref().is_none_or(|b| start < b.0) {
                     best = Some((start, end, cmd.action.clone()));
                 }
+            }
+        }
+
+        // Try "click <number> <number>" coordinate command
+        if let Some((start, end, x, y)) = find_click_coordinate(&lower, cursor) {
+            if best.as_ref().is_none_or(|b| start < b.0) {
+                best = Some((start, end, VoiceAction::ClickCoordinate { x, y }));
             }
         }
 
@@ -1020,6 +1203,14 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                         let h = if *bottom { "lower" } else { "upper" };
                                         let v = if *right { "right" } else { "left" };
                                         println!("[click {h} {v}]");
+                                    }
+                                    just_typed = false;
+                                }
+                                TextAction::Command(VoiceAction::ClickCoordinate { x, y }) => {
+                                    if ctx.type_text {
+                                        click_coordinate(*x, *y);
+                                    } else {
+                                        println!("[click {x} {y}]");
                                     }
                                     just_typed = false;
                                 }
