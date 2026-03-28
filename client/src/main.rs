@@ -128,6 +128,12 @@ struct Cli {
     #[arg(long)]
     paused: bool,
 
+    /// Lowercase the first letter of a segment when the previous segment did not
+    /// end with sentence-ending punctuation (. ! ?). Reduces spurious capitals
+    /// when VAD splits speech mid-sentence.
+    #[arg(long)]
+    continuation_lowercase: bool,
+
     /// Enable verbose logging (parsed actions, key injection details).
     #[arg(long, short, env = "TELEMUZE_VERBOSE")]
     verbose: bool,
@@ -284,6 +290,8 @@ struct AppContext {
     notify: bool,
     sound: bool,
     verbose: bool,
+    continuation_lowercase: bool,
+    last_ended_with_punctuation: Cell<bool>,
     display_server: String,
     notify_id: Cell<u32>,
     tray_handle: Option<tray::TrayHandle>,
@@ -311,6 +319,8 @@ impl AppContext {
             notify: cli.notify,
             sound: cli.sound,
             verbose: cli.verbose,
+            continuation_lowercase: cli.continuation_lowercase,
+            last_ended_with_punctuation: Cell::new(true),
             display_server,
             notify_id: Cell::new(0),
             tray_handle: None,
@@ -883,6 +893,20 @@ fn spawn_signal_handler(tx: mpsc::SyncSender<Event>) {
     });
 }
 
+// ── Continuation lowercasing ──────────────────────────────────────────────
+
+fn lowercase_first_letter(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_lowercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn ends_with_sentence_punctuation(s: &str) -> bool {
+    s.trim_end().ends_with(['.', '!', '?'])
+}
+
 // ── Segment flushing ───────────────────────────────────────────────────────
 
 fn flush_segment(samples: &[f32], ctx: &AppContext) {
@@ -902,7 +926,18 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                     let text = text.trim();
                     if !text.is_empty() {
                         eprintln!("OK");
-                        let actions = process_voice_commands(text);
+                        let text = if ctx.continuation_lowercase
+                            && !ctx.last_ended_with_punctuation.get()
+                        {
+                            lowercase_first_letter(text)
+                        } else {
+                            text.to_string()
+                        };
+                        if ctx.continuation_lowercase {
+                            ctx.last_ended_with_punctuation
+                                .set(ends_with_sentence_punctuation(&text));
+                        }
+                        let actions = process_voice_commands(&text);
                         if ctx.verbose {
                             eprintln!("  actions: {actions:?}");
                         }
