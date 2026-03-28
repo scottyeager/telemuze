@@ -912,41 +912,61 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
     let commands = voice_commands();
     let mut actions: Vec<TextAction<'_>> = Vec::new();
     let mut cursor = 0;
+    // Commands are only recognised at the front of the input — once real
+    // dictated text appears, the rest is treated as literal text.  This
+    // prevents words like "press", "click", or "scroll" in normal speech
+    // from being swallowed.  A slash command at the very start also enters
+    // command mode.
+    let mut seen_text = false;
 
     while cursor < text.len() {
-        // Try each command at every position
-        let mut best: Option<(usize, usize, VoiceAction)> = None; // (start, end, action)
+        if seen_text {
+            // Command mode is over — emit everything remaining as text.
+            let rest = text[cursor..].trim();
+            if has_word_chars(rest) {
+                actions.push(TextAction::Text(rest));
+            }
+            break;
+        }
 
+        let mut best: Option<(usize, usize, VoiceAction)> = None;
+
+        // Only look for commands if there is no word-character text between
+        // the cursor and the candidate — that would mean dictated text
+        // precedes the command, ending command mode.
+        let no_text_before = |start: usize| !has_word_chars(&text[cursor..start]);
+
+        // Static commands (click quadrant, scroll)
         for cmd in commands {
             if let Some((start, end)) = find_phrase(&lower, cursor, cmd.words) {
-                if best.as_ref().is_none_or(|b| start < b.0) {
+                if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                     best = Some((start, end, cmd.action.clone()));
                 }
             }
         }
 
-        // Try "click <number> <number>" coordinate command
+        // "click <number> <number>" coordinate command
         if let Some((start, end, x, y)) = find_click_coordinate(&lower, cursor) {
-            if best.as_ref().is_none_or(|b| start < b.0) {
+            if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, VoiceAction::ClickCoordinate { x, y }));
             }
         }
 
-        // Try "[press] <modifier> <key>" dynamic command
+        // "[press] <modifier> <key>" dynamic command
         if let Some((start, end, action)) = find_modified_key(&lower, cursor) {
-            if best.as_ref().is_none_or(|b| start < b.0) {
+            if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, action));
             }
         }
 
-        // Try "press <key>" (unmodified) dynamic command
+        // "press <key>" (unmodified) dynamic command
         if let Some((start, end, action)) = find_key_press(&lower, cursor) {
-            if best.as_ref().is_none_or(|b| start < b.0) {
+            if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, action));
             }
         }
 
-        // Try "slash command <word>" only at the very beginning of the text
+        // "slash command <word>" at the very beginning of the text
         let slash = if cursor == 0 {
             find_slash_command(&lower, 0)
                 .filter(|(start, ..)| !has_word_chars(&text[..*start]))
@@ -954,7 +974,7 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
             None
         };
 
-        // Determine whether a voice command or slash command comes first
+        // Pick whichever matched earliest
         let use_voice = match (&best, &slash) {
             (Some((vs, ..)), Some((ss, ..))) => vs <= ss,
             (Some(_), None) => true,
@@ -965,7 +985,10 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
             let (start, end, action) = best.unwrap();
             let before = text[cursor..start].trim();
             if has_word_chars(before) {
+                // Text before the first command — emit it and leave command mode
                 actions.push(TextAction::Text(before));
+                seen_text = true;
+                continue;
             }
             actions.push(TextAction::Command(action));
             cursor = end;
@@ -973,10 +996,13 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
             let before = text[cursor..start].trim();
             if has_word_chars(before) {
                 actions.push(TextAction::Text(before));
+                seen_text = true;
+                continue;
             }
             actions.push(TextAction::OwnedText(slash_text));
             cursor = end;
         } else {
+            // No command found — emit the rest as text
             let rest = text[cursor..].trim();
             if has_word_chars(rest) {
                 actions.push(TextAction::Text(rest));
