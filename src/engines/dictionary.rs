@@ -8,7 +8,7 @@
 //! Candidates are collected and passed to the LLM for final correction,
 //! transforming a hard "search" problem into a simple "choose" problem.
 
-use rphonetic::{DoubleMetaphone, Encoder};
+use rphonetic::DoubleMetaphone;
 use strsim::jaro_winkler;
 use tracing::{debug, info};
 
@@ -37,8 +37,6 @@ pub struct Dictionary {
 pub struct Candidate {
     /// The original text span from the STT output (1–3 words).
     pub original: String,
-    /// The position range in the word list (start_idx, end_idx exclusive).
-    pub word_range: (usize, usize),
     /// The matching dictionary term.
     pub suggested: String,
     /// How this match was found.
@@ -132,11 +130,6 @@ impl Dictionary {
         Self { entries, encoder }
     }
 
-    /// Returns true if the dictionary has no terms.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     /// Scan STT text and find correction candidates using phonetic and fuzzy matching.
     ///
     /// Uses a sliding window of 1–3 words to catch STT hallucinations that
@@ -191,7 +184,6 @@ impl Dictionary {
                 let candidates = self.match_against_dictionary(
                     &window_text,
                     &window_joined,
-                    (start, end),
                     config,
                 );
 
@@ -241,7 +233,6 @@ impl Dictionary {
         &self,
         original_text: &str,
         joined_lower: &str,
-        word_range: (usize, usize),
         config: &PipelineConfig,
     ) -> Vec<Candidate> {
         let mut candidates = Vec::new();
@@ -274,7 +265,6 @@ impl Dictionary {
                 if phonetic_match {
                     candidates.push(Candidate {
                         original: original_text.to_string(),
-                        word_range,
                         suggested: entry.term.clone(),
                         match_type: MatchType::Phonetic,
                         score: 1.0,
@@ -290,7 +280,6 @@ impl Dictionary {
                 if score >= config.fuzzy_threshold {
                     candidates.push(Candidate {
                         original: original_text.to_string(),
-                        word_range,
                         suggested: entry.term.clone(),
                         match_type: MatchType::Fuzzy,
                         score,
@@ -413,7 +402,6 @@ mod tests {
     fn test_format_candidates() {
         let candidates = vec![Candidate {
             original: "an sible".to_string(),
-            word_range: (0, 2),
             suggested: "Ansible".to_string(),
             match_type: MatchType::Phonetic,
             score: 1.0,
