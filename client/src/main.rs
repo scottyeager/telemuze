@@ -298,6 +298,8 @@ struct AppContext {
     continuation_lowercase: bool,
     scroll_ticks: u32,
     last_ended_with_punctuation: Cell<bool>,
+    /// Number of characters typed in the last segment (for undo via backspace).
+    last_typed_chars: Cell<usize>,
     display_server: String,
     notify_id: Cell<u32>,
     tray_handle: Option<tray::TrayHandle>,
@@ -328,6 +330,7 @@ impl AppContext {
             continuation_lowercase: cli.continuation_lowercase,
             scroll_ticks: cli.scroll_ticks,
             last_ended_with_punctuation: Cell::new(true),
+            last_typed_chars: Cell::new(0),
             display_server,
             notify_id: Cell::new(0),
             tray_handle: None,
@@ -905,6 +908,16 @@ fn key_name(word: &str) -> Option<&'static str> {
     }
 }
 
+/// Returns true when the entire segment is the word "undo" (possibly followed
+/// by punctuation), e.g. "Undo", "undo.", "Undo!".
+fn is_undo_command(text: &str) -> bool {
+    let stripped: String = text
+        .chars()
+        .filter(|c| !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"'))
+        .collect();
+    stripped.eq_ignore_ascii_case("undo")
+}
+
 /// Scan `text` for voice command phrases (case-insensitive, tolerant of
 /// punctuation between words) and split into text segments and command actions.
 fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
@@ -1297,16 +1310,36 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                             ctx.last_ended_with_punctuation
                                 .set(ends_with_sentence_punctuation(&text));
                         }
+                        // "undo" as a standalone segment — delete the last
+                        // typed text by sending backspaces.
+                        if is_undo_command(&text) {
+                            let n = ctx.last_typed_chars.get();
+                            if n > 0 && ctx.type_text {
+                                if ctx.verbose {
+                                    eprintln!("  undo: sending {n} backspaces");
+                                }
+                                for _ in 0..n {
+                                    send_key("BackSpace", &ctx.display_server, false);
+                                }
+                                ctx.last_typed_chars.set(0);
+                            } else if !ctx.type_text {
+                                println!("[undo]");
+                            }
+                        } else {
+
                         let actions = process_voice_commands(&text);
                         if ctx.verbose {
                             eprintln!("  actions: {actions:?}");
                         }
                         let mut just_typed = false;
+                        let mut chars_typed: usize = 0;
                         for action in &actions {
                             match action {
                                 TextAction::Text(t) => {
                                     if ctx.type_text {
                                         type_into_window(t, &ctx.display_server, ctx.verbose);
+                                        // +1 for trailing space appended by type_into_window
+                                        chars_typed += t.len() + 1;
                                         just_typed = true;
                                     } else {
                                         print!("{t} ");
@@ -1315,6 +1348,7 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                 TextAction::OwnedText(t) => {
                                     if ctx.type_text {
                                         type_into_window(t, &ctx.display_server, ctx.verbose);
+                                        chars_typed += t.len() + 1;
                                         just_typed = true;
                                     } else {
                                         print!("{t} ");
@@ -1372,9 +1406,12 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                 }
                             }
                         }
+                        ctx.last_typed_chars.set(chars_typed);
                         if !ctx.type_text {
                             let _ = io::stdout().flush();
                         }
+
+                        } // else (not undo)
                         if ctx.sound {
                             play_sound("message-new-instant");
                         }
