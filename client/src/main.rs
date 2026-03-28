@@ -536,6 +536,8 @@ enum VoiceAction {
     Scroll {
         /// true = scroll up, false = scroll down.
         up: bool,
+        /// Number of times to apply the scroll tick count.
+        repeats: u32,
     },
 }
 
@@ -563,14 +565,6 @@ fn voice_commands() -> &'static [VoiceCommand] {
         VoiceCommand {
             words: &["click", "lower", "right"],
             action: VoiceAction::ClickQuadrant { right: true, bottom: true },
-        },
-        VoiceCommand {
-            words: &["scroll", "up"],
-            action: VoiceAction::Scroll { up: true },
-        },
-        VoiceCommand {
-            words: &["scroll", "down"],
-            action: VoiceAction::Scroll { up: false },
         },
     ];
     COMMANDS
@@ -908,6 +902,103 @@ fn key_name(word: &str) -> Option<&'static str> {
     }
 }
 
+/// Try to find "scroll up/down/top/bottom [up/down...]" in `lower` starting
+/// from `from`.  Repeated direction words multiply the scroll count.
+/// "top" and "bottom" scroll 100 repeats in the respective direction.
+/// Returns (start_byte, end_byte, VoiceAction) or None.
+fn find_scroll(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> {
+    let haystack = &lower[from..];
+    let mut best: Option<(usize, usize, VoiceAction)> = None;
+
+    let mut search_start = 0;
+    while let Some(p) = haystack[search_start..].find("scroll") {
+        let scroll_start = from + search_start + p;
+        let after_scroll = scroll_start + "scroll".len();
+
+        // Collect words after "scroll", consuming direction words greedily
+        let mut pos = after_scroll;
+        let mut up: Option<bool> = None;
+        let mut repeats: u32 = 0;
+
+        loop {
+            // Skip separators
+            let rest = &lower[pos..];
+            let skip: usize = rest
+                .chars()
+                .take_while(|c| is_separator(*c))
+                .map(|c| c.len_utf8())
+                .sum();
+
+            if skip == 0 && pos != after_scroll {
+                break;
+            }
+            let word_start = pos + skip;
+            let word_end = lower[word_start..]
+                .find(|c: char| c.is_whitespace() || is_separator(c))
+                .map_or(lower.len(), |i| word_start + i);
+            if word_start == word_end {
+                break;
+            }
+            let word = &lower[word_start..word_end];
+
+            match word {
+                "up" => {
+                    if up == Some(false) {
+                        break; // direction changed — stop
+                    }
+                    up = Some(true);
+                    repeats += 1;
+                    pos = word_end;
+                }
+                "down" => {
+                    if up == Some(true) {
+                        break;
+                    }
+                    up = Some(false);
+                    repeats += 1;
+                    pos = word_end;
+                }
+                "top" => {
+                    if up.is_some() {
+                        break; // already have a direction
+                    }
+                    up = Some(true);
+                    repeats = 100;
+                    pos = word_end;
+                    break; // "top" is terminal
+                }
+                "bottom" => {
+                    if up.is_some() {
+                        break;
+                    }
+                    up = Some(false);
+                    repeats = 100;
+                    pos = word_end;
+                    break;
+                }
+                _ => break,
+            }
+        }
+
+        if let Some(up) = up {
+            if repeats > 0 {
+                let candidate = (
+                    scroll_start,
+                    pos,
+                    VoiceAction::Scroll { up, repeats },
+                );
+                if best.as_ref().is_none_or(|b| scroll_start < b.0) {
+                    best = Some(candidate);
+                }
+            }
+        }
+
+        search_start = search_start + p + "scroll".len();
+    }
+
+    best
+}
+
 /// Returns true when the entire segment is the word "undo" (possibly followed
 /// by punctuation), e.g. "Undo", "undo.", "Undo!".
 fn is_undo_command(text: &str) -> bool {
@@ -949,12 +1040,19 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
         // precedes the command, ending command mode.
         let no_text_before = |start: usize| !has_word_chars(&text[cursor..start]);
 
-        // Static commands (click quadrant, scroll)
+        // Static commands (click quadrant)
         for cmd in commands {
             if let Some((start, end)) = find_phrase(&lower, cursor, cmd.words) {
                 if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                     best = Some((start, end, cmd.action.clone()));
                 }
+            }
+        }
+
+        // "scroll up/down/top/bottom [up/down...]" dynamic command
+        if let Some((start, end, action)) = find_scroll(&lower, cursor) {
+            if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
+                best = Some((start, end, action));
             }
         }
 
@@ -1395,12 +1493,12 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                     }
                                     just_typed = false;
                                 }
-                                TextAction::Command(VoiceAction::Scroll { up }) => {
+                                TextAction::Command(VoiceAction::Scroll { up, repeats }) => {
                                     if ctx.type_text {
-                                        scroll(*up, ctx.scroll_ticks);
+                                        scroll(*up, ctx.scroll_ticks * repeats);
                                     } else {
                                         let dir = if *up { "up" } else { "down" };
-                                        println!("[scroll {dir}]");
+                                        println!("[scroll {dir} x{repeats}]");
                                     }
                                     just_typed = false;
                                 }
