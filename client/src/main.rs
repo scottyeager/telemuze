@@ -35,6 +35,7 @@ const DEFAULT_SILENCE_MS: u32 = 800;
 const DEFAULT_PREFILL_MS: u32 = 450;
 const DEFAULT_MAX_SPEECH_SECS: u32 = 300;
 
+const DEFAULT_SCROLL_TICKS: u32 = 5;
 const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
 
 // ── Event types ────────────────────────────────────────────────────────────
@@ -133,6 +134,10 @@ struct Cli {
     /// when VAD splits speech mid-sentence.
     #[arg(long)]
     continuation_lowercase: bool,
+
+    /// Number of scroll ticks per "scroll up" / "scroll down" voice command.
+    #[arg(long, default_value_t = DEFAULT_SCROLL_TICKS)]
+    scroll_ticks: u32,
 
     /// Enable verbose logging (parsed actions, key injection details).
     #[arg(long, short, env = "TELEMUZE_VERBOSE")]
@@ -291,6 +296,7 @@ struct AppContext {
     sound: bool,
     verbose: bool,
     continuation_lowercase: bool,
+    scroll_ticks: u32,
     last_ended_with_punctuation: Cell<bool>,
     display_server: String,
     notify_id: Cell<u32>,
@@ -320,6 +326,7 @@ impl AppContext {
             sound: cli.sound,
             verbose: cli.verbose,
             continuation_lowercase: cli.continuation_lowercase,
+            scroll_ticks: cli.scroll_ticks,
             last_ended_with_punctuation: Cell::new(true),
             display_server,
             notify_id: Cell::new(0),
@@ -449,6 +456,17 @@ fn click_quadrant(right: bool, bottom: bool) {
     }
 }
 
+fn scroll(up: bool, ticks: u32) {
+    let button = if up { "4" } else { "5" };
+    let repeat = ticks.to_string();
+    let result = std::process::Command::new("xdotool")
+        .args(["click", "--repeat", &repeat, "--delay", "10", button])
+        .status();
+    if let Err(e) = result {
+        eprintln!("Scroll failed: {e}");
+    }
+}
+
 // ── Voice commands ──────────────────────────────────────────────────────
 
 /// An action that a voice command can trigger.
@@ -467,6 +485,11 @@ enum VoiceAction {
         right: bool,
         /// Vertical position: false = top, true = bottom.
         bottom: bool,
+    },
+    /// Scroll the mouse wheel.
+    Scroll {
+        /// true = scroll up, false = scroll down.
+        up: bool,
     },
 }
 
@@ -539,6 +562,14 @@ fn voice_commands() -> &'static [VoiceCommand] {
         VoiceCommand {
             words: &["click", "lower", "right"],
             action: VoiceAction::ClickQuadrant { right: true, bottom: true },
+        },
+        VoiceCommand {
+            words: &["scroll", "up"],
+            action: VoiceAction::Scroll { up: true },
+        },
+        VoiceCommand {
+            words: &["scroll", "down"],
+            action: VoiceAction::Scroll { up: false },
         },
     ];
     COMMANDS
@@ -989,6 +1020,15 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                         let h = if *bottom { "lower" } else { "upper" };
                                         let v = if *right { "right" } else { "left" };
                                         println!("[click {h} {v}]");
+                                    }
+                                    just_typed = false;
+                                }
+                                TextAction::Command(VoiceAction::Scroll { up }) => {
+                                    if ctx.type_text {
+                                        scroll(*up, ctx.scroll_ticks);
+                                    } else {
+                                        let dir = if *up { "up" } else { "down" };
+                                        println!("[scroll {dir}]");
                                     }
                                     just_typed = false;
                                 }
