@@ -6,6 +6,8 @@ We borrow inspiration and code from the excellent [Handy](https://github.com/cjp
 
 There's also a Telegram bot feature, enabling access to the server over Telegram.
 
+Linux only is supported at the moment.
+
 ## Prerequisites
 
 - Rust toolchain (stable) — install via [rustup](https://rustup.rs/)
@@ -56,7 +58,7 @@ All options can be set via CLI flags or environment variables.
 - **`POST /v1/dictate/smart`** — Smart dictation: STT + optional LLM correction (currently requires an external API). Returns plain text.
 - **`POST /v1/transcribe/long`** — Long-form transcription with VAD-based chunking.
 
-## Desktop Client
+## Bash Client
 
 A toggle-style dictation script is included in `scripts/smart_dictation_client.sh`. Bind it to a global hotkey — first press starts recording, second press transcribes and types the result into the focused window.
 
@@ -67,7 +69,18 @@ Requires: `arecord`, `curl`, and `wtype` (Wayland) or `xdotool` (X11).
 export TELEMUZE_URL=http://127.0.0.1:7313
 ```
 
-## Planned
+## Full Client
 
-- **In-process LLM inference** — LLM post-processing currently requires an external OpenAI-compatible server (e.g., llama.cpp, mistral.rs, Ollama). The plan is to bring LLM inference in-process so Telemuze is fully self-contained.
+An additional client is available as a compiled binary. This client includes a number of features not available in the bash based client. However, it only supports XOrg. `xdotool` is required.
+
+Features:
+* System tray icon indicating status
+* VAD based always-on listening, with transcription only during active speech
+* Keyboard and mouse control features (press "enter", click in different parts of the screen, scrolling, etc)
+* Undo the last text input by saying "undo"
+
+## WIP
+
+- **In-process LLM inference** — While this is implemented in a basic way, making a small LLM really useful in this setting is more challenging
+- **Phonetic and fuzzy word replacement** — The idea here is to provide a dictionary of special words and then try to fix mistakes where the speech model doesn't correctly write them. Promising results, but needs more work
 
