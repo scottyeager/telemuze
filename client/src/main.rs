@@ -127,6 +127,10 @@ struct Cli {
     /// Start in paused state (model loaded but not listening). Use `toggle` to begin.
     #[arg(long)]
     paused: bool,
+
+    /// Enable verbose logging (parsed actions, key injection details).
+    #[arg(long, short, env = "TELEMUZE_VERBOSE")]
+    verbose: bool,
 }
 
 #[derive(Subcommand)]
@@ -279,6 +283,7 @@ struct AppContext {
     type_text: bool,
     notify: bool,
     sound: bool,
+    verbose: bool,
     display_server: String,
     notify_id: Cell<u32>,
     tray_handle: Option<tray::TrayHandle>,
@@ -305,6 +310,7 @@ impl AppContext {
             type_text: cli.type_text,
             notify: cli.notify,
             sound: cli.sound,
+            verbose: cli.verbose,
             display_server,
             notify_id: Cell::new(0),
             tray_handle: None,
@@ -328,7 +334,10 @@ fn detect_display_server() -> String {
     }
 }
 
-fn type_into_window(text: &str, display_server: &str) {
+fn type_into_window(text: &str, display_server: &str, verbose: bool) {
+    if verbose {
+        eprintln!("  -> type_into_window({text:?}, {display_server})");
+    }
     let result = if display_server == "wayland" {
         std::process::Command::new("wtype")
             .arg(format!("{text} "))
@@ -343,7 +352,10 @@ fn type_into_window(text: &str, display_server: &str) {
     }
 }
 
-fn send_key(key: &str, display_server: &str) {
+fn send_key(key: &str, display_server: &str, verbose: bool) {
+    if verbose {
+        eprintln!("  -> send_key({key:?}, {display_server})");
+    }
     let result = if display_server == "wayland" {
         std::process::Command::new("wtype")
             .args(["-k", key])
@@ -358,7 +370,10 @@ fn send_key(key: &str, display_server: &str) {
     }
 }
 
-fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str) {
+fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str, verbose: bool) {
+    if verbose {
+        eprintln!("  -> send_modified_key({modifiers:?}+{key:?}, {display_server})");
+    }
     let result = if display_server == "wayland" {
         // wtype: -M mod -k key -m mod (press modifier, tap key, release modifier)
         let mut args: Vec<String> = Vec::new();
@@ -427,7 +442,7 @@ fn click_quadrant(right: bool, bottom: bool) {
 // ── Voice commands ──────────────────────────────────────────────────────
 
 /// An action that a voice command can trigger.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum VoiceAction {
     /// Simulate a keypress (e.g. "Return", "Tab").
     Key(&'static str),
@@ -520,6 +535,7 @@ fn voice_commands() -> &'static [VoiceCommand] {
 }
 
 /// A segment of processed transcription output.
+#[derive(Debug)]
 enum TextAction<'a> {
     /// Literal text to type or print.
     Text(&'a str),
@@ -887,35 +903,49 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                     if !text.is_empty() {
                         eprintln!("OK");
                         let actions = process_voice_commands(text);
+                        if ctx.verbose {
+                            eprintln!("  actions: {actions:?}");
+                        }
+                        let mut just_typed = false;
                         for action in &actions {
                             match action {
                                 TextAction::Text(t) => {
                                     if ctx.type_text {
-                                        type_into_window(t, &ctx.display_server);
+                                        type_into_window(t, &ctx.display_server, ctx.verbose);
+                                        just_typed = true;
                                     } else {
                                         print!("{t} ");
                                     }
                                 }
                                 TextAction::OwnedText(t) => {
                                     if ctx.type_text {
-                                        type_into_window(t, &ctx.display_server);
+                                        type_into_window(t, &ctx.display_server, ctx.verbose);
+                                        just_typed = true;
                                     } else {
                                         print!("{t} ");
                                     }
                                 }
                                 TextAction::Command(VoiceAction::Key(key)) => {
                                     if ctx.type_text {
-                                        send_key(key, &ctx.display_server);
+                                        if just_typed {
+                                            std::thread::sleep(std::time::Duration::from_millis(50));
+                                        }
+                                        send_key(key, &ctx.display_server, ctx.verbose);
                                     } else {
                                         println!();
                                     }
+                                    just_typed = false;
                                 }
                                 TextAction::Command(VoiceAction::ModifiedKey { modifiers, key }) => {
                                     if ctx.type_text {
-                                        send_modified_key(modifiers, key, &ctx.display_server);
+                                        if just_typed {
+                                            std::thread::sleep(std::time::Duration::from_millis(50));
+                                        }
+                                        send_modified_key(modifiers, key, &ctx.display_server, ctx.verbose);
                                     } else {
                                         println!();
                                     }
+                                    just_typed = false;
                                 }
                                 TextAction::Command(VoiceAction::ClickQuadrant { right, bottom }) => {
                                     if ctx.type_text {
@@ -925,6 +955,7 @@ fn flush_segment(samples: &[f32], ctx: &AppContext) {
                                         let v = if *right { "right" } else { "left" };
                                         println!("[click {h} {v}]");
                                     }
+                                    just_typed = false;
                                 }
                             }
                         }
