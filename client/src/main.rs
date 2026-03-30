@@ -1112,8 +1112,36 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
                 seen_text = true;
                 continue;
             }
-            actions.push(TextAction::Command(action));
+            actions.push(TextAction::Command(action.clone()));
             cursor = end;
+
+            // After a key-press command, greedily consume continuation keys
+            // so that "press enter tab escape" produces three key actions
+            // and "press enter control c" produces Enter then Ctrl+C.
+            if matches!(action, VoiceAction::Key(_) | VoiceAction::ModifiedKey { .. }) {
+                loop {
+                    // Try modifier+key first (e.g. "control c")
+                    if let Some((mod_word, mod_end)) = next_word(&lower, cursor) {
+                        if let Some(canonical) = modifier_canonical(mod_word) {
+                            if let Some((kn, key_end)) = next_key_word(&lower, mod_end) {
+                                actions.push(TextAction::Command(VoiceAction::ModifiedKey {
+                                    modifiers: vec![canonical.into()],
+                                    key: kn.into(),
+                                }));
+                                cursor = key_end;
+                                continue;
+                            }
+                        }
+                    }
+                    // Try plain key name (e.g. "tab")
+                    if let Some((kn, key_end)) = next_key_word(&lower, cursor) {
+                        actions.push(TextAction::Command(VoiceAction::Key(kn.into())));
+                        cursor = key_end;
+                        continue;
+                    }
+                    break;
+                }
+            }
         } else if let Some((start, end, slash_text)) = slash {
             let before = text[cursor..start].trim();
             if has_word_chars(before) {
