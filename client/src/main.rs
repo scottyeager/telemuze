@@ -1762,6 +1762,7 @@ fn main() -> Result<()> {
                             flush_segment(&audio_buf[start..end], &ctx);
                             audio_buf.drain(..end);
                             vad_pos = 0;
+                            vad.reset();
                             continue;
                         }
                         VadEvent::None => {}
