@@ -127,6 +127,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_PREFILL_MS)]
     prefill_ms: u32,
 
+    /// Maximum dictation utterance length (seconds) before force-flushing.
+    #[arg(long, default_value_t = DEFAULT_DICTATION_MAX_SPEECH)]
+    dictation_max_speech: f32,
+
     /// Seconds of silence in dictation mode before returning to idle.
     #[arg(long, default_value_t = DEFAULT_DICTATION_TIMEOUT)]
     dictation_timeout: f32,
@@ -246,7 +250,9 @@ struct AppContext {
     continuation_lowercase: bool,
     scroll_ticks: u32,
     prefill_samples: usize,
+    dictation_silence_secs: f32,
     dictation_timeout_secs: f32,
+    dictation_max_speech_samples: usize,
     last_ended_with_punctuation: Cell<bool>,
     last_output_time: Cell<Option<Instant>>,
     /// Number of characters typed in the last segment (for undo via backspace).
@@ -281,7 +287,9 @@ impl AppContext {
             continuation_lowercase: cli.continuation_lowercase,
             scroll_ticks: cli.scroll_ticks,
             prefill_samples: (cli.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
+            dictation_silence_secs: cli.dictation_silence,
             dictation_timeout_secs: cli.dictation_timeout,
+            dictation_max_speech_samples: (cli.dictation_max_speech * SAMPLE_RATE as f32) as usize,
             last_ended_with_punctuation: Cell::new(true),
             last_output_time: Cell::new(None),
             last_typed_chars: Cell::new(0),
@@ -1383,25 +1391,27 @@ fn ends_with_sentence_punctuation(s: &str) -> bool {
 
 // ── Segment flushing ───────────────────────────────────────────────────────
 
-/// Result of processing a speech segment.
-enum SegmentResult {
-    /// Text was output (not a command). Contains whether it was a command-only segment.
+/// Result of classifying a speech segment (without outputting).
+enum ClassifyResult {
+    /// Transcription contains voice commands only (no text to dictate).
+    Command(String),
+    /// Transcription is regular text (not a command). Not output in idle mode.
     Text,
-    /// One or more voice commands were executed (no text output).
-    CommandOnly,
     /// Empty transcription.
     Empty,
     /// Server or encoding error.
     Error,
 }
 
-fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> SegmentResult {
+/// Send audio to the server for STT and classify the result as command or text.
+/// Does NOT output anything — use `output_transcription` for that.
+fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
     let duration_secs = samples.len() as f64 / SAMPLE_RATE as f64;
-    eprint!("[{duration_secs:.1}s {mode:?}] ");
+    eprint!("[classify {duration_secs:.1}s] ");
 
     ctx.set_tray_status(TrayStatus::Processing);
     if ctx.notify {
-        let id = show_notification("Processing...", "Transcribing audio", ctx.notify_id.get());
+        let id = show_notification("Processing...", "Classifying speech", ctx.notify_id.get());
         ctx.notify_id.set(id);
     }
 
@@ -1409,53 +1419,47 @@ fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Segment
         Ok(w) => w,
         Err(e) => {
             eprintln!("encode error: {e}");
-            return SegmentResult::Error;
+            finish_segment_ui(ctx);
+            return ClassifyResult::Error;
         }
     };
 
     let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("send error: {e}");
-            ctx.set_tray_status(TrayStatus::Listening);
-            if ctx.notify {
-                let id = show_notification(
-                    "Dictation failed",
-                    &e.to_string(),
-                    ctx.notify_id.get(),
-                );
-                ctx.notify_id.set(id);
-            }
+            eprintln!("classify error: {e}");
+            finish_segment_ui(ctx);
             if ctx.sound {
                 play_sound("dialog-error");
             }
-            return SegmentResult::Error;
+            return ClassifyResult::Error;
         }
     };
 
-    let text = text.trim();
+    let text = text.trim().to_string();
     if text.is_empty() {
         eprintln!("(empty)");
-        ctx.set_tray_status(TrayStatus::Listening);
-        return SegmentResult::Empty;
+        finish_segment_ui(ctx);
+        return ClassifyResult::Empty;
     }
 
-    eprintln!("OK");
+    eprintln!("=> {text:?}");
+    finish_segment_ui(ctx);
 
-    // Apply continuation lowercasing based on mode.
-    let text = if ctx.should_lowercase_continuation(mode) {
-        lowercase_first_letter(text)
+    // Check if the text starts with a command keyword.
+    let actions = process_voice_commands(&text);
+    let has_text = actions.iter().any(|a| matches!(a, TextAction::Text(_) | TextAction::OwnedText(_)));
+
+    if has_text {
+        ClassifyResult::Text
     } else {
-        text.to_string()
-    };
+        ClassifyResult::Command(text)
+    }
+}
 
-    // Track punctuation state for future segments.
-    ctx.last_ended_with_punctuation
-        .set(ends_with_sentence_punctuation(&text));
-    ctx.last_output_time.set(Some(Instant::now()));
-
-    // "undo" as a standalone segment — delete the last typed text.
-    if is_undo_command(&text) {
+/// Execute voice commands from a transcription (used in idle mode).
+fn execute_commands(text: &str, ctx: &AppContext) {
+    if is_undo_command(text) {
         let n = ctx.last_typed_chars.get();
         if n > 0 && ctx.type_text {
             if ctx.verbose {
@@ -1468,44 +1472,18 @@ fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Segment
         } else if !ctx.type_text {
             println!("[undo]");
         }
-        finish_segment_ui(ctx);
-        return SegmentResult::CommandOnly;
+        return;
     }
 
-    let actions = process_voice_commands(&text);
+    let actions = process_voice_commands(text);
     if ctx.verbose {
         eprintln!("  actions: {actions:?}");
     }
 
     let mut just_typed = false;
-    let mut chars_typed: usize = 0;
-    let mut has_text = false;
-    let mut has_command = false;
-
     for action in &actions {
         match action {
-            TextAction::Text(t) => {
-                has_text = true;
-                if ctx.type_text {
-                    type_into_window(t, &ctx.display_server, ctx.verbose);
-                    chars_typed += t.len() + 1;
-                    just_typed = true;
-                } else {
-                    print!("{t} ");
-                }
-            }
-            TextAction::OwnedText(t) => {
-                has_text = true;
-                if ctx.type_text {
-                    type_into_window(t, &ctx.display_server, ctx.verbose);
-                    chars_typed += t.len() + 1;
-                    just_typed = true;
-                } else {
-                    print!("{t} ");
-                }
-            }
             TextAction::Command(VoiceAction::Key(ref key)) => {
-                has_command = true;
                 if ctx.type_text {
                     if just_typed {
                         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1517,7 +1495,6 @@ fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Segment
                 just_typed = false;
             }
             TextAction::Command(VoiceAction::ModifiedKey { ref modifiers, ref key }) => {
-                has_command = true;
                 if ctx.type_text {
                     if just_typed {
                         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1530,7 +1507,6 @@ fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Segment
                 just_typed = false;
             }
             TextAction::Command(VoiceAction::ClickQuadrant { right, bottom }) => {
-                has_command = true;
                 if ctx.type_text {
                     click_quadrant(*right, *bottom);
                 } else {
@@ -1541,7 +1517,6 @@ fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Segment
                 just_typed = false;
             }
             TextAction::Command(VoiceAction::ClickCoordinate { x, y }) => {
-                has_command = true;
                 if ctx.type_text {
                     click_coordinate(*x, *y);
                 } else {
@@ -1550,7 +1525,162 @@ fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Segment
                 just_typed = false;
             }
             TextAction::Command(VoiceAction::Scroll { up, repeats }) => {
-                has_command = true;
+                if ctx.type_text {
+                    scroll(*up, ctx.scroll_ticks * repeats);
+                } else {
+                    let dir = if *up { "up" } else { "down" };
+                    println!("[scroll {dir} x{repeats}]");
+                }
+                just_typed = false;
+            }
+            // Commands shouldn't have text actions, but handle gracefully
+            TextAction::Text(_) | TextAction::OwnedText(_) => {}
+        }
+    }
+
+    if ctx.sound {
+        play_sound("message-new-instant");
+    }
+}
+
+/// Send accumulated dictation audio to the server, output the transcription.
+fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
+    if utterance_audio.is_empty() {
+        return;
+    }
+
+    let duration_secs = utterance_audio.len() as f64 / SAMPLE_RATE as f64;
+    eprint!("[dictation {duration_secs:.1}s] ");
+
+    ctx.set_tray_status(TrayStatus::Processing);
+    if ctx.notify {
+        let id = show_notification("Processing...", "Transcribing dictation", ctx.notify_id.get());
+        ctx.notify_id.set(id);
+    }
+
+    let wav = match encode_wav(utterance_audio) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("encode error: {e}");
+            utterance_audio.clear();
+            finish_segment_ui(ctx);
+            return;
+        }
+    };
+
+    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("send error: {e}");
+            utterance_audio.clear();
+            finish_segment_ui(ctx);
+            if ctx.notify {
+                let id = show_notification(
+                    "Dictation failed",
+                    &e.to_string(),
+                    ctx.notify_id.get(),
+                );
+                ctx.notify_id.set(id);
+            }
+            if ctx.sound {
+                play_sound("dialog-error");
+            }
+            return;
+        }
+    };
+
+    utterance_audio.clear();
+
+    let text = text.trim();
+    if text.is_empty() {
+        eprintln!("(empty)");
+        finish_segment_ui(ctx);
+        return;
+    }
+
+    eprintln!("OK");
+
+    // Apply continuation lowercasing for dictation.
+    let text = if ctx.should_lowercase_continuation(ListenMode::Dictation) {
+        lowercase_first_letter(text)
+    } else {
+        text.to_string()
+    };
+
+    ctx.last_ended_with_punctuation
+        .set(ends_with_sentence_punctuation(&text));
+    ctx.last_output_time.set(Some(Instant::now()));
+
+    // In dictation mode, output all text (commands at start are still processed).
+    let actions = process_voice_commands(&text);
+    if ctx.verbose {
+        eprintln!("  actions: {actions:?}");
+    }
+
+    let mut just_typed = false;
+    let mut chars_typed: usize = 0;
+    for action in &actions {
+        match action {
+            TextAction::Text(t) => {
+                if ctx.type_text {
+                    type_into_window(t, &ctx.display_server, ctx.verbose);
+                    chars_typed += t.len() + 1;
+                    just_typed = true;
+                } else {
+                    print!("{t} ");
+                }
+            }
+            TextAction::OwnedText(t) => {
+                if ctx.type_text {
+                    type_into_window(t, &ctx.display_server, ctx.verbose);
+                    chars_typed += t.len() + 1;
+                    just_typed = true;
+                } else {
+                    print!("{t} ");
+                }
+            }
+            TextAction::Command(VoiceAction::Key(ref key)) => {
+                if ctx.type_text {
+                    if just_typed {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    send_key(key, &ctx.display_server, ctx.verbose);
+                } else {
+                    println!();
+                }
+                just_typed = false;
+            }
+            TextAction::Command(VoiceAction::ModifiedKey { ref modifiers, ref key }) => {
+                if ctx.type_text {
+                    if just_typed {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
+                    send_modified_key(&mod_refs, key, &ctx.display_server, ctx.verbose);
+                } else {
+                    println!();
+                }
+                just_typed = false;
+            }
+            TextAction::Command(VoiceAction::ClickQuadrant { right, bottom }) => {
+                if ctx.type_text {
+                    click_quadrant(*right, *bottom);
+                } else {
+                    let h = if *bottom { "lower" } else { "upper" };
+                    let v = if *right { "right" } else { "left" };
+                    println!("[click {h} {v}]");
+                }
+                just_typed = false;
+            }
+            TextAction::Command(VoiceAction::ClickCoordinate { x, y }) => {
+                if ctx.type_text {
+                    click_coordinate(*x, *y);
+                } else {
+                    println!("[click {x} {y}]");
+                }
+                just_typed = false;
+            }
+            TextAction::Command(VoiceAction::Scroll { up, repeats }) => {
                 if ctx.type_text {
                     scroll(*up, ctx.scroll_ticks * repeats);
                 } else {
@@ -1572,14 +1702,6 @@ fn flush_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Segment
     }
 
     finish_segment_ui(ctx);
-
-    if has_text {
-        SegmentResult::Text
-    } else if has_command {
-        SegmentResult::CommandOnly
-    } else {
-        SegmentResult::Empty
-    }
 }
 
 fn finish_segment_ui(ctx: &AppContext) {
@@ -1591,6 +1713,31 @@ fn finish_segment_ui(ctx: &AppContext) {
             ctx.notify_id.get(),
         );
         ctx.notify_id.set(id);
+    }
+}
+
+/// Flush any in-progress speech. In dictation mode, sends accumulated
+/// utterance audio. In idle mode, processes remaining VAD segments as commands.
+fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mode: ListenMode) {
+    // In dictation mode, send accumulated audio if any.
+    if mode == ListenMode::Dictation {
+        flush_utterance(utterance_audio, ctx);
+    }
+
+    // Drain any remaining VAD segments (idle mode commands).
+    vad.detector.flush();
+    while !vad.detector.is_empty() {
+        if let Some(seg) = vad.detector.front() {
+            if mode == ListenMode::Idle {
+                let samples = seg.samples().to_vec();
+                if samples.len() >= (SAMPLE_RATE as usize / 10) {
+                    if let ClassifyResult::Command(text) = classify_segment(&samples, ctx) {
+                        execute_commands(&text, ctx);
+                    }
+                }
+            }
+        }
+        vad.detector.pop();
     }
 }
 
@@ -1756,7 +1903,8 @@ fn main() -> Result<()> {
     let mut vad_pos: usize = 0;
     let mut was_detected = false;
     let mut mode = ListenMode::Idle;
-    let mut last_segment_time: Option<Instant> = None;
+    let mut last_speech_time: Option<Instant> = None;
+    let mut utterance_audio: Vec<f32> = Vec::new();
     let prefill_samples = ctx.prefill_samples;
 
     loop {
@@ -1766,114 +1914,168 @@ fn main() -> Result<()> {
                     continue;
                 }
 
-                // In dictation mode, check for timeout → return to idle.
+                // ── Dictation mode: check silence thresholds ─────────
                 if mode == ListenMode::Dictation {
-                    if let Some(t) = last_segment_time {
-                        if t.elapsed().as_secs_f32() > ctx.dictation_timeout_secs
-                            && !vad.detector.detected()
-                        {
-                            if ctx.verbose {
-                                eprintln!("Dictation timeout, returning to idle");
-                            }
-                            mode = ListenMode::Idle;
-                            vad.replace(&idle_vad_config)?;
-                            audio_buf.clear();
-                            vad_pos = 0;
-                            was_detected = false;
-                            last_segment_time = None;
+                    let silence = last_speech_time
+                        .map(|t| t.elapsed().as_secs_f32())
+                        .unwrap_or(f32::MAX);
+
+                    if silence > ctx.dictation_timeout_secs {
+                        // Sustained silence → flush and return to idle.
+                        if ctx.verbose {
+                            eprintln!("Dictation timeout ({silence:.1}s silence), returning to idle");
                         }
+                        flush_utterance(&mut utterance_audio, &ctx);
+                        mode = ListenMode::Idle;
+                        vad.replace(&idle_vad_config)?;
+                        audio_buf.clear();
+                        vad_pos = 0;
+                        was_detected = false;
+                        last_speech_time = None;
+                        ctx.set_tray_status(TrayStatus::Listening);
+                    } else if silence > ctx.dictation_silence_secs
+                        && !utterance_audio.is_empty()
+                    {
+                        // Speech ended → send accumulated audio.
+                        if ctx.verbose {
+                            eprintln!("Dictation silence ({silence:.1}s), flushing utterance");
+                        }
+                        flush_utterance(&mut utterance_audio, &ctx);
+                        // Stay in dictation mode for the next utterance.
                     }
+
+                    // Force-flush if utterance is too long.
+                    if utterance_audio.len() > ctx.dictation_max_speech_samples {
+                        if ctx.verbose {
+                            let secs = utterance_audio.len() as f32 / SAMPLE_RATE as f32;
+                            eprintln!("Dictation max speech ({secs:.1}s), force-flushing");
+                        }
+                        flush_utterance(&mut utterance_audio, &ctx);
+                    }
+                }
+
+                // ── Accumulate audio in dictation mode ────────────────
+                // Only append when we have an utterance in progress or
+                // speech is currently detected (to start a new one).
+                if mode == ListenMode::Dictation
+                    && (!utterance_audio.is_empty() || vad.detector.detected())
+                {
+                    utterance_audio.extend_from_slice(&chunk);
                 }
 
                 audio_buf.extend_from_slice(&chunk);
 
-                // Process all complete frames (512 samples for sherpa-onnx).
+                // ── Process frames through VAD ────────────────────────
                 while vad_pos + WINDOW_SIZE <= audio_buf.len() {
                     let frame = &audio_buf[vad_pos..vad_pos + WINDOW_SIZE];
                     vad.detector.accept_waveform(frame);
                     vad_pos += WINDOW_SIZE;
 
-                    // Detect speech start transition for UI.
+                    // Track speech transitions for UI and silence timing.
                     let now_detected = vad.detector.detected();
-                    if now_detected && !was_detected {
-                        ctx.set_tray_status(TrayStatus::Recording);
-                        if ctx.notify {
-                            let id = show_notification(
-                                "Recording...",
-                                "Speech detected",
-                                ctx.notify_id.get(),
-                            );
-                            ctx.notify_id.set(id);
+                    if now_detected {
+                        last_speech_time = Some(Instant::now());
+                        if !was_detected {
+                            ctx.set_tray_status(TrayStatus::Recording);
+                            if ctx.notify {
+                                let id = show_notification(
+                                    "Recording...",
+                                    "Speech detected",
+                                    ctx.notify_id.get(),
+                                );
+                                ctx.notify_id.set(id);
+                            }
                         }
+                    } else if was_detected {
+                        ctx.set_tray_status(TrayStatus::Listening);
                     }
                     was_detected = now_detected;
 
-                    // Process any completed segments.
+                    // ── Handle VAD segments ───────────────────────────
                     while !vad.detector.is_empty() {
-                        if let Some(seg) = vad.detector.front() {
-                            let seg_start = seg.start() as usize;
-                            let seg_samples = seg.samples().to_vec();
+                        match mode {
+                            ListenMode::Idle => {
+                                if let Some(seg) = vad.detector.front() {
+                                    let seg_start = seg.start() as usize;
+                                    let seg_samples = seg.samples().to_vec();
 
-                            // Prepend prefill audio from our buffer.
-                            let prefill_start = seg_start.saturating_sub(prefill_samples);
-                            let samples = if prefill_start < seg_start && prefill_start < audio_buf.len() {
-                                let prefill_end = seg_start.min(audio_buf.len());
-                                let mut pre = audio_buf[prefill_start..prefill_end].to_vec();
-                                pre.extend_from_slice(&seg_samples);
-                                pre
-                            } else {
-                                seg_samples
-                            };
+                                    // Prepend prefill audio.
+                                    let prefill_start = seg_start.saturating_sub(prefill_samples);
+                                    let samples = if prefill_start < seg_start && prefill_start < audio_buf.len() {
+                                        let prefill_end = seg_start.min(audio_buf.len());
+                                        let mut pre = audio_buf[prefill_start..prefill_end].to_vec();
+                                        pre.extend_from_slice(&seg_samples);
+                                        pre
+                                    } else {
+                                        seg_samples
+                                    };
 
-                            // Avoid sending tiny segments.
-                            if samples.len() < (SAMPLE_RATE as usize / 10) {
-                                vad.detector.pop();
-                                continue;
-                            }
+                                    // Skip tiny segments.
+                                    if samples.len() < (SAMPLE_RATE as usize / 10) {
+                                        vad.detector.pop();
+                                        continue;
+                                    }
 
-                            let result = flush_segment(&samples, &ctx, mode);
-
-                            match mode {
-                                ListenMode::Idle => {
-                                    match result {
-                                        SegmentResult::Text => {
-                                            // Non-command text in idle → switch to dictation.
+                                    match classify_segment(&samples, &ctx) {
+                                        ClassifyResult::Command(text) => {
+                                            execute_commands(&text, &ctx);
+                                            last_speech_time = Some(Instant::now());
+                                        }
+                                        ClassifyResult::Text => {
+                                            // Text detected → enter dictation mode.
+                                            // Save this segment's audio as start of utterance.
                                             if ctx.verbose {
                                                 eprintln!("Switching to dictation mode");
                                             }
+                                            utterance_audio = samples;
                                             mode = ListenMode::Dictation;
-                                            last_segment_time = Some(Instant::now());
+                                            last_speech_time = Some(Instant::now());
 
-                                            // Drain processed audio, switch VAD.
+                                            // Switch VAD, keep audio flowing.
                                             vad.detector.pop();
                                             vad.replace(&dictation_vad_config)?;
-                                            let keep = prefill_samples.min(audio_buf.len());
-                                            audio_buf.drain(..audio_buf.len().saturating_sub(keep));
-                                            vad_pos = audio_buf.len();
+                                            audio_buf.clear();
+                                            vad_pos = 0;
                                             was_detected = false;
-                                            continue;
+                                            // Break out of both while loops.
+                                            break;
                                         }
-                                        SegmentResult::CommandOnly => {
-                                            // Command executed, stay in idle.
-                                            last_segment_time = Some(Instant::now());
-                                        }
-                                        _ => {}
+                                        ClassifyResult::Empty | ClassifyResult::Error => {}
                                     }
                                 }
-                                ListenMode::Dictation => {
-                                    last_segment_time = Some(Instant::now());
-                                }
+                                vad.detector.pop();
+                            }
+                            ListenMode::Dictation => {
+                                // Discard VAD segments in dictation mode —
+                                // we use our own silence tracking.
+                                vad.detector.pop();
                             }
                         }
-                        vad.detector.pop();
+                    }
+
+                    // If we just switched to dictation, break the frame loop
+                    // so the next chunk starts accumulating in utterance_audio.
+                    if mode == ListenMode::Dictation && audio_buf.is_empty() {
+                        break;
                     }
                 }
 
-                // Prevent unbounded memory growth during silence.
-                if !vad.detector.detected() && vad_pos > SAMPLE_RATE as usize * 5 {
+                // Prevent unbounded memory growth during silence (idle mode).
+                if mode == ListenMode::Idle
+                    && !vad.detector.detected()
+                    && vad_pos > SAMPLE_RATE as usize * 5
+                {
                     let keep = prefill_samples.min(vad_pos);
                     audio_buf.drain(..vad_pos - keep);
                     vad_pos = keep;
+                    vad.detector.reset();
+                }
+
+                // In dictation mode, drain audio_buf periodically (VAD only
+                // needs recent frames, utterance_audio has the full audio).
+                if mode == ListenMode::Dictation && vad_pos > SAMPLE_RATE as usize * 5 {
+                    audio_buf.clear();
+                    vad_pos = 0;
                     vad.detector.reset();
                 }
             }
@@ -1881,20 +2083,13 @@ fn main() -> Result<()> {
             Ok(Event::Ipc(IpcCommand::Toggle)) => {
                 if listening {
                     // Pause: flush any in-progress speech, stop audio.
-                    vad.detector.flush();
-                    while !vad.detector.is_empty() {
-                        if let Some(seg) = vad.detector.front() {
-                            let samples = seg.samples().to_vec();
-                            flush_segment(&samples, &ctx, mode);
-                        }
-                        vad.detector.pop();
-                    }
+                    drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
                     stream.pause().ok();
                     audio_buf.clear();
                     vad_pos = 0;
                     was_detected = false;
                     mode = ListenMode::Idle;
-                    last_segment_time = None;
+                    last_speech_time = None;
                     vad.replace(&idle_vad_config)?;
                     listening = false;
                     eprintln!("Paused");
@@ -1921,32 +2116,15 @@ fn main() -> Result<()> {
             }
 
             Ok(Event::Ipc(IpcCommand::Flush)) => {
-                if vad.detector.detected() {
-                    vad.detector.flush();
-                    while !vad.detector.is_empty() {
-                        if let Some(seg) = vad.detector.front() {
-                            let samples = seg.samples().to_vec();
-                            flush_segment(&samples, &ctx, mode);
-                        }
-                        vad.detector.pop();
-                    }
-                    audio_buf.clear();
-                    vad_pos = 0;
-                    was_detected = false;
-                    vad.detector.reset();
-                }
+                drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
+                audio_buf.clear();
+                vad_pos = 0;
+                was_detected = false;
+                vad.detector.reset();
             }
 
             Ok(Event::Ipc(IpcCommand::Stop)) => {
-                // Flush any in-progress speech.
-                vad.detector.flush();
-                while !vad.detector.is_empty() {
-                    if let Some(seg) = vad.detector.front() {
-                        let samples = seg.samples().to_vec();
-                        flush_segment(&samples, &ctx, mode);
-                    }
-                    vad.detector.pop();
-                }
+                drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
                 eprintln!("Stopping...");
                 break;
             }
