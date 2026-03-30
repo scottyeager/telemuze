@@ -1,84 +1,59 @@
-//! Speech-to-Text engine wrapper around transcribe-rs.
+//! Speech-to-Text engine using sherpa-onnx.
 //!
-//! Uses the Parakeet ONNX model via transcribe-rs for fast,
-//! accurate speech recognition. Supports both plain transcription
-//! and timestamped segment output.
+//! Uses the Parakeet TDT ONNX model via sherpa-onnx's OfflineRecognizer
+//! for fast, accurate speech recognition.
 
 use anyhow::{Context, Result};
+use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 use std::path::Path;
-use transcribe_rs::onnx::parakeet::ParakeetModel;
-use transcribe_rs::onnx::Quantization;
-use transcribe_rs::{SpeechModel, TranscribeOptions};
+use tracing::info;
 
-/// Wraps the Parakeet STT model for thread-safe inference.
+/// Wraps the sherpa-onnx OfflineRecognizer for Parakeet TDT inference.
 pub struct SttEngine {
-    engine: ParakeetModel,
-    options: TranscribeOptions,
+    recognizer: OfflineRecognizer,
 }
 
 // Safety: The underlying ONNX runtime session is thread-safe for inference.
+// We guard access with a Mutex in AppState.
 unsafe impl Send for SttEngine {}
 unsafe impl Sync for SttEngine {}
 
 impl SttEngine {
-    /// Load a Parakeet model from the given directory.
+    /// Load a Parakeet TDT model from the given directory.
     ///
     /// The directory should contain:
-    /// - encoder model (ONNX)
-    /// - decoder_joint model (ONNX)
-    /// - nemo128.onnx (audio preprocessor)
-    /// - vocab.txt (vocabulary)
-    pub fn new(model_path: &Path) -> Result<Self> {
-        let engine = ParakeetModel::load(model_path, &Quantization::Int8)
-            .context("Failed to load Parakeet STT model")?;
+    /// - encoder.int8.onnx
+    /// - decoder.int8.onnx
+    /// - joiner.int8.onnx
+    /// - tokens.txt
+    pub fn new(model_dir: &Path) -> Result<Self> {
+        let mut config = OfflineRecognizerConfig::default();
+        config.model_config.transducer.encoder =
+            Some(model_dir.join("encoder.int8.onnx").to_string_lossy().into_owned());
+        config.model_config.transducer.decoder =
+            Some(model_dir.join("decoder.int8.onnx").to_string_lossy().into_owned());
+        config.model_config.transducer.joiner =
+            Some(model_dir.join("joiner.int8.onnx").to_string_lossy().into_owned());
+        config.model_config.tokens =
+            Some(model_dir.join("tokens.txt").to_string_lossy().into_owned());
+        config.model_config.model_type = Some("nemo_transducer".into());
+        config.model_config.num_threads = 4;
 
-        Ok(Self { engine, options: TranscribeOptions::default() })
+        info!("Creating sherpa-onnx recognizer from {:?}", model_dir);
+        let recognizer = OfflineRecognizer::create(&config)
+            .context("Failed to create sherpa-onnx OfflineRecognizer")?;
+
+        Ok(Self { recognizer })
     }
 
     /// Transcribe mono 16kHz f32 PCM audio to text.
-    pub fn transcribe(&mut self, pcm_16khz: &[f32]) -> Result<String> {
-        let result = self
-            .engine
-            .transcribe(pcm_16khz, &self.options)
-            .context("STT transcription failed")?;
-
+    pub fn transcribe(&self, pcm_16khz: &[f32]) -> Result<String> {
+        let stream = self.recognizer.create_stream();
+        stream.accept_waveform(16000, pcm_16khz);
+        self.recognizer.decode(&stream);
+        let result = stream
+            .get_result()
+            .context("sherpa-onnx returned no recognition result")?;
         Ok(result.text)
     }
-
-    /// Transcribe with timestamps, returning segments.
-    #[allow(dead_code)]
-    pub fn transcribe_with_timestamps(&mut self, pcm_16khz: &[f32]) -> Result<Vec<TranscriptSegment>> {
-        let result = self
-            .engine
-            .transcribe(pcm_16khz, &self.options)
-            .context("STT transcription with timestamps failed")?;
-
-        let segments = if let Some(segs) = result.segments {
-            segs.iter()
-                .map(|s| TranscriptSegment {
-                    start: s.start as f64,
-                    end: s.end as f64,
-                    text: s.text.clone(),
-                })
-                .collect()
-        } else {
-            // Fallback: return entire text as a single segment
-            vec![TranscriptSegment {
-                start: 0.0,
-                end: pcm_16khz.len() as f64 / 16_000.0,
-                text: result.text,
-            }]
-        };
-
-        Ok(segments)
-    }
-}
-
-/// A timestamped segment of transcribed text.
-#[allow(dead_code)]
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct TranscriptSegment {
-    pub start: f64,
-    pub end: f64,
-    pub text: String,
 }

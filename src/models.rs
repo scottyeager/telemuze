@@ -59,37 +59,38 @@ pub struct ModelInfo {
 
 // ── Model registry ──────────────────────────────────────────────────────────
 
-// Parakeet TDT 0.6B v3 ONNX (int8) — converted by istupakov
-// Original model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
-// ONNX export: https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx
+// Parakeet TDT 0.6B v2 ONNX (int8) — packaged by sherpa-onnx (k2-fsa)
+// Original model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
+// sherpa-onnx export: https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8
 const PARAKEET_FILES: &[ModelFile] = &[
     ModelFile {
-        url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/encoder-model.int8.onnx",
-        filename: "encoder-model.int8.onnx",
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/resolve/main/encoder.int8.onnx",
+        filename: "encoder.int8.onnx",
     },
     ModelFile {
-        url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/decoder_joint-model.int8.onnx",
-        filename: "decoder_joint-model.int8.onnx",
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/resolve/main/decoder.int8.onnx",
+        filename: "decoder.int8.onnx",
     },
     ModelFile {
-        url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/nemo128.onnx",
-        filename: "nemo128.onnx",
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/resolve/main/joiner.int8.onnx",
+        filename: "joiner.int8.onnx",
     },
     ModelFile {
-        url: "https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx/resolve/main/vocab.txt",
-        filename: "vocab.txt",
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/resolve/main/tokens.txt",
+        filename: "tokens.txt",
     },
 ];
 
+// Silero VAD — hosted by sherpa-onnx
 const SILERO_VAD_FILES: &[ModelFile] = &[ModelFile {
-    url: "https://github.com/thewh1teagle/vad-rs/releases/download/v0.1.0/silero_vad.onnx",
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
     filename: "silero_vad.onnx",
 }];
 
 const PARAKEET: ModelInfo = ModelInfo {
-    id: "parakeet-tdt-0.6b-v3",
-    name: "Parakeet TDT 0.6B v3 (int8)",
-    dirname: "parakeet-tdt-0.6b-v3-int8",
+    id: "parakeet-tdt-0.6b-v2",
+    name: "Parakeet TDT 0.6B v2 (int8, sherpa-onnx)",
+    dirname: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
     is_directory: true,
     kind: ModelKind::Stt,
     is_downloaded: false,
@@ -98,7 +99,7 @@ const PARAKEET: ModelInfo = ModelInfo {
 
 const SILERO_VAD: ModelInfo = ModelInfo {
     id: "silero-vad",
-    name: "Silero VAD v4",
+    name: "Silero VAD (sherpa-onnx)",
     dirname: "silero_vad.onnx",
     is_directory: false,
     kind: ModelKind::Vad,

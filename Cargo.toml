@@ -17,11 +17,8 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Audio pipeline — uses ffmpeg subprocess (must be installed on host)
 
-# STT engine
-transcribe-rs = { version = "0.3", features = ["onnx"] }
-
-# VAD engine
-vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
+# STT + VAD engine (sherpa-onnx: Parakeet TDT + Silero VAD)
+sherpa-onnx = { version = "1.12", default-features = false, features = ["shared"] }
 
 # Phonetic dictionary pipeline
 rphonetic = "3"
