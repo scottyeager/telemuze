@@ -77,6 +77,12 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_HOTWORDS_SCORE", default_value_t = 1.5)]
     pub hotwords_score: f32,
 
+    /// Maximum seconds to wait for a single STT decode call before aborting.
+    /// Catches infinite beam search loops (e.g. from extreme hotword scores).
+    /// Set to 0 to disable the timeout.
+    #[arg(long, env = "TELEMUZE_DECODE_TIMEOUT", default_value_t = 120)]
+    pub decode_timeout: u64,
+
     /// Telegram API ID (from https://my.telegram.org)
     #[arg(long, env = "TELEGRAM_API_ID", default_value_t = 0)]
     pub telegram_api_id: i32,

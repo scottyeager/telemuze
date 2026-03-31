@@ -6,11 +6,13 @@
 use anyhow::{Context, Result};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 use std::path::Path;
-use tracing::{debug, info};
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 /// Wraps the sherpa-onnx OfflineRecognizer for Parakeet TDT inference.
 pub struct SttEngine {
     recognizer: OfflineRecognizer,
+    decode_timeout: Option<Duration>,
 }
 
 // Safety: The underlying ONNX runtime session is thread-safe for inference.
@@ -27,7 +29,12 @@ impl SttEngine {
     /// - joiner.int8.onnx
     /// - tokens.txt
     /// - bpe.vocab (for hotword support)
-    pub fn new(model_dir: &Path, hotwords_score: f32) -> Result<Self> {
+    pub fn new(model_dir: &Path, hotwords_score: f32, decode_timeout_secs: u64) -> Result<Self> {
+        let decode_timeout = if decode_timeout_secs > 0 {
+            Some(Duration::from_secs(decode_timeout_secs))
+        } else {
+            None
+        };
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.transducer.encoder =
             Some(model_dir.join("encoder.int8.onnx").to_string_lossy().into_owned());
@@ -60,7 +67,11 @@ impl SttEngine {
         let recognizer = OfflineRecognizer::create(&config)
             .context("Failed to create sherpa-onnx OfflineRecognizer")?;
 
-        Ok(Self { recognizer })
+        if let Some(t) = decode_timeout {
+            info!("STT decode timeout: {t:?}");
+        }
+
+        Ok(Self { recognizer, decode_timeout })
     }
 
     /// Transcribe mono 16kHz f32 PCM audio to text.
@@ -86,7 +97,52 @@ impl SttEngine {
             _ => self.recognizer.create_stream(),
         };
         stream.accept_waveform(16000, pcm_16khz);
-        self.recognizer.decode(&stream);
+
+        match self.decode_timeout {
+            Some(timeout) => {
+                // Run decode on a background thread with a timeout to
+                // catch infinite beam search loops (e.g. from extreme
+                // hotword scores).
+                //
+                // Cast pointers to usize so they are Send. The
+                // recognizer lives as long as the server. The stream
+                // is either dropped normally (success) or deliberately
+                // leaked (timeout) so both pointers stay valid.
+                let rec_ptr = &self.recognizer as *const OfflineRecognizer as usize;
+                let stream_ptr = &stream as *const sherpa_onnx::OfflineStream as usize;
+
+                let (tx, rx) = std::sync::mpsc::channel();
+
+                std::thread::spawn(move || {
+                    unsafe {
+                        let rec = &*(rec_ptr as *const OfflineRecognizer);
+                        let s = &*(stream_ptr as *const sherpa_onnx::OfflineStream);
+                        rec.decode(s);
+                    }
+                    let _ = tx.send(());
+                });
+
+                if rx.recv_timeout(timeout).is_err() {
+                    // Leak the stream so the background thread (which
+                    // is still running decode) doesn't hit freed memory.
+                    std::mem::forget(stream);
+                    warn!(
+                        "STT decode timed out after {timeout:?} — aborting request. \
+                         This usually means hotword scores are too high, causing \
+                         an infinite beam search loop. The server may need to be \
+                         restarted if the stuck thread does not finish."
+                    );
+                    anyhow::bail!(
+                        "STT decode timed out after {timeout:?} — \
+                         possible infinite beam search loop"
+                    );
+                }
+            }
+            None => {
+                self.recognizer.decode(&stream);
+            }
+        }
+
         let result = stream
             .get_result()
             .context("sherpa-onnx returned no recognition result")?;
