@@ -19,6 +19,7 @@ use std::io::{self, BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc;
 use std::time::Instant;
+use tracing::{debug, error, info, warn};
 use tray::TrayStatus;
 
 // ── Audio constants ────────────────────────────────────────────────────────
@@ -246,7 +247,6 @@ struct AppContext {
     type_text: bool,
     notify: bool,
     sound: bool,
-    verbose: bool,
     continuation_lowercase: bool,
     scroll_ticks: u32,
     prefill_samples: usize,
@@ -283,7 +283,6 @@ impl AppContext {
             type_text: cli.type_text,
             notify: cli.notify,
             sound: cli.sound,
-            verbose: cli.verbose,
             continuation_lowercase: cli.continuation_lowercase,
             scroll_ticks: cli.scroll_ticks,
             prefill_samples: (cli.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
@@ -339,10 +338,8 @@ fn detect_display_server() -> String {
     }
 }
 
-fn type_into_window(text: &str, display_server: &str, verbose: bool) {
-    if verbose {
-        eprintln!("  -> type_into_window({text:?}, {display_server})");
-    }
+fn type_into_window(text: &str, display_server: &str) {
+    debug!(text, display_server, "type_into_window");
     let result = if display_server == "wayland" {
         std::process::Command::new("wtype")
             .arg(format!("{text} "))
@@ -353,14 +350,12 @@ fn type_into_window(text: &str, display_server: &str, verbose: bool) {
             .status()
     };
     if let Err(e) = result {
-        eprintln!("Text injection failed: {e}");
+        warn!("Text injection failed: {e}");
     }
 }
 
-fn send_key(key: &str, display_server: &str, verbose: bool) {
-    if verbose {
-        eprintln!("  -> send_key({key:?}, {display_server})");
-    }
+fn send_key(key: &str, display_server: &str) {
+    debug!(key, display_server, "send_key");
     let result = if display_server == "wayland" {
         std::process::Command::new("wtype")
             .args(["-k", key])
@@ -371,14 +366,12 @@ fn send_key(key: &str, display_server: &str, verbose: bool) {
             .status()
     };
     if let Err(e) = result {
-        eprintln!("Key injection failed: {e}");
+        warn!("Key injection failed: {e}");
     }
 }
 
-fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str, verbose: bool) {
-    if verbose {
-        eprintln!("  -> send_modified_key({modifiers:?}+{key:?}, {display_server})");
-    }
+fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str) {
+    debug!(?modifiers, key, display_server, "send_modified_key");
     let result = if display_server == "wayland" {
         // wtype: -M mod -k key -m mod (press modifier, tap key, release modifier)
         let mut args: Vec<String> = Vec::new();
@@ -403,7 +396,7 @@ fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str, verbos
             .status()
     };
     if let Err(e) = result {
-        eprintln!("Key injection failed: {e}");
+        warn!("Modified key injection failed: {e}");
     }
 }
 
@@ -415,20 +408,20 @@ fn click_quadrant(right: bool, bottom: bool) {
     {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("Failed to get display geometry: {e}");
+            warn!("Failed to get display geometry: {e}");
             return;
         }
     };
     let geometry = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = geometry.trim().split_whitespace().collect();
     if parts.len() < 2 {
-        eprintln!("Unexpected geometry output: {geometry}");
+        warn!("Unexpected geometry output: {geometry}");
         return;
     }
     let (width, height) = match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
         (Ok(w), Ok(h)) => (w, h),
         _ => {
-            eprintln!("Failed to parse geometry: {geometry}");
+            warn!("Failed to parse geometry: {geometry}");
             return;
         }
     };
@@ -440,7 +433,7 @@ fn click_quadrant(right: bool, bottom: bool) {
         .args(["mousemove", "--sync", &x.to_string(), &y.to_string(), "click", "1"])
         .status();
     if let Err(e) = result {
-        eprintln!("Mouse click failed: {e}");
+        warn!("Mouse click failed: {e}");
     }
 }
 
@@ -451,20 +444,20 @@ fn click_coordinate(x_pct: u32, y_pct: u32) {
     {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("Failed to get display geometry: {e}");
+            warn!("Failed to get display geometry: {e}");
             return;
         }
     };
     let geometry = String::from_utf8_lossy(&output.stdout);
     let parts: Vec<&str> = geometry.trim().split_whitespace().collect();
     if parts.len() < 2 {
-        eprintln!("Unexpected geometry output: {geometry}");
+        warn!("Unexpected geometry output: {geometry}");
         return;
     }
     let (width, height) = match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
         (Ok(w), Ok(h)) => (w, h),
         _ => {
-            eprintln!("Failed to parse geometry: {geometry}");
+            warn!("Failed to parse geometry: {geometry}");
             return;
         }
     };
@@ -476,7 +469,7 @@ fn click_coordinate(x_pct: u32, y_pct: u32) {
         .args(["mousemove", "--sync", &x.to_string(), &y.to_string(), "click", "1"])
         .status();
     if let Err(e) = result {
-        eprintln!("Mouse click failed: {e}");
+        warn!("Mouse click failed: {e}");
     }
 }
 
@@ -487,7 +480,7 @@ fn scroll(up: bool, ticks: u32) {
         .args(["click", "--repeat", &repeat, "--delay", "10", button])
         .status();
     if let Err(e) = result {
-        eprintln!("Scroll failed: {e}");
+        warn!("Scroll failed: {e}");
     }
 }
 
@@ -1337,7 +1330,7 @@ fn download_vad_model(dest: &std::path::Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    eprintln!("Downloading Silero VAD model...");
+    info!("Downloading Silero VAD model");
     let client = reqwest::blocking::Client::new();
     let response = client.get(URL).send().context("Failed to download VAD model")?;
 
@@ -1349,7 +1342,7 @@ fn download_vad_model(dest: &std::path::Path) -> Result<()> {
     let mut file = std::fs::File::create(dest)?;
     file.write_all(&bytes)?;
 
-    eprintln!("VAD model saved to {}", dest.display());
+    info!(path = %dest.display(), "VAD model downloaded");
     Ok(())
 }
 
@@ -1435,7 +1428,7 @@ enum ClassifyResult {
 /// Does NOT output anything — use `output_transcription` for that.
 fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
     let duration_secs = samples.len() as f64 / SAMPLE_RATE as f64;
-    eprint!("[classify {duration_secs:.1}s] ");
+    info!(duration_secs, "Classifying speech segment");
 
     ctx.set_tray_status(TrayStatus::Processing);
     if ctx.notify {
@@ -1446,7 +1439,7 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
     let wav = match encode_wav(samples) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("encode error: {e}");
+            error!("WAV encode failed: {e}");
             finish_segment_ui(ctx);
             return ClassifyResult::Error;
         }
@@ -1455,7 +1448,7 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
     let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("classify error: {e}");
+            error!("Classification request failed: {e}");
             finish_segment_ui(ctx);
             if ctx.sound {
                 play_sound("dialog-error");
@@ -1466,12 +1459,12 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
 
     let text = text.trim().to_string();
     if text.is_empty() {
-        eprintln!("(empty)");
+        info!("Classification returned empty");
         finish_segment_ui(ctx);
         return ClassifyResult::Empty;
     }
 
-    eprintln!("=> {text:?}");
+    info!(text = %text, "Classification result");
     finish_segment_ui(ctx);
 
     // Check if the text starts with a command keyword.
@@ -1490,11 +1483,9 @@ fn execute_commands(text: &str, ctx: &AppContext) {
     if is_undo_command(text) {
         let n = ctx.last_typed_chars.get();
         if n > 0 && ctx.type_text {
-            if ctx.verbose {
-                eprintln!("  undo: sending {n} backspaces");
-            }
+            debug!(count = n, "Sending undo backspaces");
             for _ in 0..n {
-                send_key("BackSpace", &ctx.display_server, false);
+                send_key("BackSpace", &ctx.display_server);
             }
             ctx.last_typed_chars.set(0);
         } else if !ctx.type_text {
@@ -1504,9 +1495,7 @@ fn execute_commands(text: &str, ctx: &AppContext) {
     }
 
     let actions = process_voice_commands(text);
-    if ctx.verbose {
-        eprintln!("  actions: {actions:?}");
-    }
+    debug!(?actions, "Parsed voice actions");
 
     let mut just_typed = false;
     for action in &actions {
@@ -1516,7 +1505,7 @@ fn execute_commands(text: &str, ctx: &AppContext) {
                     if just_typed {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                    send_key(key, &ctx.display_server, ctx.verbose);
+                    send_key(key, &ctx.display_server);
                 } else {
                     println!();
                 }
@@ -1528,7 +1517,7 @@ fn execute_commands(text: &str, ctx: &AppContext) {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
-                    send_modified_key(&mod_refs, key, &ctx.display_server, ctx.verbose);
+                    send_modified_key(&mod_refs, key, &ctx.display_server);
                 } else {
                     println!();
                 }
@@ -1578,7 +1567,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
     }
 
     let duration_secs = utterance_audio.len() as f64 / SAMPLE_RATE as f64;
-    eprint!("[dictation {duration_secs:.1}s] ");
+    info!(duration_secs, "Transcribing dictation segment");
 
     ctx.set_tray_status(TrayStatus::Processing);
     if ctx.notify {
@@ -1589,7 +1578,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
     let wav = match encode_wav(utterance_audio) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("encode error: {e}");
+            error!("WAV encode failed: {e}");
             utterance_audio.clear();
             finish_segment_ui(ctx);
             return;
@@ -1599,7 +1588,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
     let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("send error: {e}");
+            error!("Dictation request failed: {e}");
             utterance_audio.clear();
             finish_segment_ui(ctx);
             if ctx.notify {
@@ -1621,12 +1610,12 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
 
     let text = text.trim();
     if text.is_empty() {
-        eprintln!("(empty)");
+        info!("Dictation returned empty");
         finish_segment_ui(ctx);
         return;
     }
 
-    eprintln!("OK");
+    info!("Dictation transcribed successfully");
 
     // Apply continuation lowercasing for dictation.
     let text = if ctx.should_lowercase_continuation(ListenMode::Dictation) {
@@ -1641,9 +1630,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
 
     // In dictation mode, output all text (commands at start are still processed).
     let actions = process_voice_commands(&text);
-    if ctx.verbose {
-        eprintln!("  actions: {actions:?}");
-    }
+    debug!(?actions, "Parsed dictation actions");
 
     let mut just_typed = false;
     let mut chars_typed: usize = 0;
@@ -1651,7 +1638,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
         match action {
             TextAction::Text(t) => {
                 if ctx.type_text {
-                    type_into_window(t, &ctx.display_server, ctx.verbose);
+                    type_into_window(t, &ctx.display_server);
                     chars_typed += t.len() + 1;
                     just_typed = true;
                 } else {
@@ -1660,7 +1647,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
             }
             TextAction::OwnedText(t) => {
                 if ctx.type_text {
-                    type_into_window(t, &ctx.display_server, ctx.verbose);
+                    type_into_window(t, &ctx.display_server);
                     chars_typed += t.len() + 1;
                     just_typed = true;
                 } else {
@@ -1672,7 +1659,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
                     if just_typed {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
-                    send_key(key, &ctx.display_server, ctx.verbose);
+                    send_key(key, &ctx.display_server);
                 } else {
                     println!();
                 }
@@ -1684,7 +1671,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
-                    send_modified_key(&mod_refs, key, &ctx.display_server, ctx.verbose);
+                    send_modified_key(&mod_refs, key, &ctx.display_server);
                 } else {
                     println!();
                 }
@@ -1803,6 +1790,20 @@ fn main() -> Result<()> {
         None => {} // Start the daemon
     }
 
+    // ── Logging ───────────────────────────────────────────────────────
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    if cli.verbose {
+                        "telemuze_listen=debug".into()
+                    } else {
+                        "telemuze_listen=info".into()
+                    }
+                }),
+        )
+        .init();
+
     // ── Start the daemon ───────────────────────────────────────────────
 
     // Clean up stale socket
@@ -1825,7 +1826,7 @@ fn main() -> Result<()> {
         };
         match tray::spawn_tray(tx.clone(), initial) {
             Ok(handle) => ctx.tray_handle = Some(handle),
-            Err(e) => eprintln!("Tray unavailable: {e}"),
+            Err(e) => warn!("System tray unavailable: {e}"),
         }
     }
 
@@ -1875,7 +1876,7 @@ fn main() -> Result<()> {
         DEFAULT_DICTATION_MAX_SPEECH,
     );
 
-    eprintln!("Loading VAD model from {}", vad_path.display());
+    info!(path = %vad_path.display(), "Loading VAD model");
     let mut vad = Vad::new(&idle_vad_config)?;
 
     // Set up audio capture
@@ -1884,9 +1885,9 @@ fn main() -> Result<()> {
         .default_input_device()
         .context("No input audio device available")?;
 
-    eprintln!(
-        "Using input device: {}",
-        device.name().unwrap_or_else(|_| "unknown".into())
+    info!(
+        device = %device.name().unwrap_or_else(|_| "unknown".into()),
+        "Using input device"
     );
 
     let config = cpal::StreamConfig {
@@ -1902,7 +1903,7 @@ fn main() -> Result<()> {
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let _ = audio_tx.send(Event::Audio(data.to_vec()));
             },
-            |err| eprintln!("Audio stream error: {err}"),
+            |err| error!("Audio stream error: {err}"),
             None,
         )
         .context("Failed to build audio input stream")?;
@@ -1918,12 +1919,11 @@ fn main() -> Result<()> {
     }
 
     if listening {
-        eprintln!("Listening... (use `telemuze-listen stop` to shut down)");
+        info!("Listening (use `telemuze-listen stop` to shut down)");
     } else {
-        eprintln!("Ready (paused). Use `telemuze-listen toggle` to start listening.");
+        info!("Ready (paused), use `telemuze-listen toggle` to start listening");
     }
-    eprintln!("Endpoint: {}", ctx.endpoint_url);
-    eprintln!();
+    info!(endpoint = %ctx.endpoint_url, "Server endpoint");
 
     // ── Main processing loop ──────────────────────────────────────────
 
@@ -1950,9 +1950,7 @@ fn main() -> Result<()> {
 
                     if silence > ctx.dictation_timeout_secs {
                         // Sustained silence → flush and return to idle.
-                        if ctx.verbose {
-                            eprintln!("Dictation timeout ({silence:.1}s silence), returning to idle");
-                        }
+                        debug!(silence, "Dictation timeout, returning to idle");
                         flush_utterance(&mut utterance_audio, &ctx);
                         mode = ListenMode::Idle;
                         vad.replace(&idle_vad_config)?;
@@ -1965,19 +1963,15 @@ fn main() -> Result<()> {
                         && !utterance_audio.is_empty()
                     {
                         // Speech ended → send accumulated audio.
-                        if ctx.verbose {
-                            eprintln!("Dictation silence ({silence:.1}s), flushing utterance");
-                        }
+                        debug!(silence, "Dictation silence, flushing utterance");
                         flush_utterance(&mut utterance_audio, &ctx);
                         // Stay in dictation mode for the next utterance.
                     }
 
                     // Force-flush if utterance is too long.
                     if utterance_audio.len() > ctx.dictation_max_speech_samples {
-                        if ctx.verbose {
-                            let secs = utterance_audio.len() as f32 / SAMPLE_RATE as f32;
-                            eprintln!("Dictation max speech ({secs:.1}s), force-flushing");
-                        }
+                        let secs = utterance_audio.len() as f32 / SAMPLE_RATE as f32;
+                        debug!(duration = secs, "Dictation max speech, force-flushing");
                         flush_utterance(&mut utterance_audio, &ctx);
                     }
                 }
@@ -2052,9 +2046,7 @@ fn main() -> Result<()> {
                                         ClassifyResult::Text => {
                                             // Text detected → enter dictation mode.
                                             // Save this segment's audio as start of utterance.
-                                            if ctx.verbose {
-                                                eprintln!("Switching to dictation mode");
-                                            }
+                                            debug!("Switching to dictation mode");
                                             utterance_audio = samples;
                                             mode = ListenMode::Dictation;
                                             last_speech_time = Some(Instant::now());
@@ -2120,7 +2112,7 @@ fn main() -> Result<()> {
                     last_speech_time = None;
                     vad.replace(&idle_vad_config)?;
                     listening = false;
-                    eprintln!("Paused");
+                    info!("Paused");
                     ctx.set_tray_status(TrayStatus::Idle);
                     if ctx.notify {
                         dismiss_notification(ctx.notify_id.get());
@@ -2130,7 +2122,7 @@ fn main() -> Result<()> {
                     // Resume
                     stream.play().ok();
                     listening = true;
-                    eprintln!("Listening...");
+                    info!("Listening");
                     ctx.set_tray_status(TrayStatus::Listening);
                     if ctx.notify {
                         let id = show_notification(
@@ -2153,7 +2145,7 @@ fn main() -> Result<()> {
 
             Ok(Event::Ipc(IpcCommand::Stop)) => {
                 drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
-                eprintln!("Stopping...");
+                info!("Stopping");
                 break;
             }
 
