@@ -1,2 +1,19 @@
-/target
+# Rust build artifacts
+/target/
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.code-workspace
+
+# macOS
+.DS_Store
+
+# Environment
 .env
+.env.local
