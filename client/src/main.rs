@@ -244,21 +244,38 @@ fn create_vad(config: &VadModelConfig) -> Result<VoiceActivityDetector> {
 /// Safety: VadModelConfig is just data. VoiceActivityDetector wraps C++ but
 /// is only used from the main thread.
 struct Vad {
-    detector: VoiceActivityDetector,
+    idle: VoiceActivityDetector,
+    dictation: VoiceActivityDetector,
+    use_dictation: bool,
 }
 
 unsafe impl Send for Vad {}
 
 impl Vad {
-    fn new(config: &VadModelConfig) -> Result<Self> {
+    fn new(idle_config: &VadModelConfig, dictation_config: &VadModelConfig) -> Result<Self> {
         Ok(Self {
-            detector: create_vad(config)?,
+            idle: create_vad(idle_config)?,
+            dictation: create_vad(dictation_config)?,
+            use_dictation: false,
         })
     }
 
-    fn replace(&mut self, config: &VadModelConfig) -> Result<()> {
-        self.detector = create_vad(config)?;
-        Ok(())
+    fn detector(&self) -> &VoiceActivityDetector {
+        if self.use_dictation {
+            &self.dictation
+        } else {
+            &self.idle
+        }
+    }
+
+    fn switch_to_idle(&mut self) {
+        self.use_dictation = false;
+        self.idle.reset();
+    }
+
+    fn switch_to_dictation(&mut self) {
+        self.use_dictation = true;
+        self.dictation.reset();
     }
 }
 
@@ -1873,9 +1890,9 @@ fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mo
     }
 
     // Drain any remaining VAD segments (idle mode commands).
-    vad.detector.flush();
-    while !vad.detector.is_empty() {
-        if let Some(seg) = vad.detector.front() {
+    vad.detector().flush();
+    while !vad.detector().is_empty() {
+        if let Some(seg) = vad.detector().front() {
             if mode == ListenMode::Idle {
                 let samples = seg.samples().to_vec();
                 if samples.len() >= (SAMPLE_RATE as usize / 10) {
@@ -1885,7 +1902,7 @@ fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mo
                 }
             }
         }
-        vad.detector.pop();
+        vad.detector().pop();
     }
 }
 
@@ -2016,7 +2033,7 @@ fn main() -> Result<()> {
     );
 
     info!(path = %vad_path.display(), "Loading VAD model");
-    let mut vad = Vad::new(&idle_vad_config)?;
+    let mut vad = Vad::new(&idle_vad_config, &dictation_vad_config)?;
 
     // Set up audio capture
     let host = cpal::default_host();
@@ -2095,7 +2112,7 @@ fn main() -> Result<()> {
                         debug!(silence, "Dictation silence, flushing and returning to idle");
                         flush_utterance(&mut utterance_audio, &ctx);
                         mode = ListenMode::Idle;
-                        vad.replace(&idle_vad_config)?;
+                        vad.switch_to_idle();
                         audio_buf.clear();
                         vad_pos = 0;
                         was_detected = false;
@@ -2115,7 +2132,7 @@ fn main() -> Result<()> {
                 // Only append when we have an utterance in progress or
                 // speech is currently detected (to start a new one).
                 if mode == ListenMode::Dictation
-                    && (!utterance_audio.is_empty() || vad.detector.detected())
+                    && (!utterance_audio.is_empty() || vad.detector().detected())
                 {
                     utterance_audio.extend_from_slice(&chunk);
                 }
@@ -2125,11 +2142,11 @@ fn main() -> Result<()> {
                 // ── Process frames through VAD ────────────────────────
                 while vad_pos + WINDOW_SIZE <= audio_buf.len() {
                     let frame = &audio_buf[vad_pos..vad_pos + WINDOW_SIZE];
-                    vad.detector.accept_waveform(frame);
+                    vad.detector().accept_waveform(frame);
                     vad_pos += WINDOW_SIZE;
 
                     // Track speech transitions for UI and silence timing.
-                    let now_detected = vad.detector.detected();
+                    let now_detected = vad.detector().detected();
                     if now_detected {
                         last_speech_time = Some(Instant::now());
                         if !was_detected {
@@ -2149,10 +2166,10 @@ fn main() -> Result<()> {
                     was_detected = now_detected;
 
                     // ── Handle VAD segments ───────────────────────────
-                    while !vad.detector.is_empty() {
+                    while !vad.detector().is_empty() {
                         match mode {
                             ListenMode::Idle => {
-                                if let Some(seg) = vad.detector.front() {
+                                if let Some(seg) = vad.detector().front() {
                                     let seg_start = seg.start() as usize;
                                     let seg_samples = seg.samples().to_vec();
 
@@ -2169,7 +2186,7 @@ fn main() -> Result<()> {
 
                                     // Skip tiny segments.
                                     if samples.len() < (SAMPLE_RATE as usize / 10) {
-                                        vad.detector.pop();
+                                        vad.detector().pop();
                                         continue;
                                     }
 
@@ -2191,8 +2208,8 @@ fn main() -> Result<()> {
                                             last_speech_time = Some(Instant::now());
 
                                             // Switch VAD, keep audio flowing.
-                                            vad.detector.pop();
-                                            vad.replace(&dictation_vad_config)?;
+                                            vad.detector().pop();
+                                            vad.switch_to_dictation();
                                             audio_buf.clear();
                                             vad_pos = 0;
                                             was_detected = false;
@@ -2202,12 +2219,12 @@ fn main() -> Result<()> {
                                         ClassifyResult::Empty | ClassifyResult::Error => {}
                                     }
                                 }
-                                vad.detector.pop();
+                                vad.detector().pop();
                             }
                             ListenMode::Dictation => {
                                 // Discard VAD segments in dictation mode —
                                 // we use our own silence tracking.
-                                vad.detector.pop();
+                                vad.detector().pop();
                             }
                         }
                     }
@@ -2221,13 +2238,13 @@ fn main() -> Result<()> {
 
                 // Prevent unbounded memory growth during silence (idle mode).
                 if mode == ListenMode::Idle
-                    && !vad.detector.detected()
+                    && !vad.detector().detected()
                     && vad_pos > SAMPLE_RATE as usize * 5
                 {
                     let keep = prefill_samples.min(vad_pos);
                     audio_buf.drain(..vad_pos - keep);
                     vad_pos = keep;
-                    vad.detector.reset();
+                    vad.detector().reset();
                 }
 
                 // In dictation mode, drain audio_buf periodically (VAD only
@@ -2235,7 +2252,7 @@ fn main() -> Result<()> {
                 if mode == ListenMode::Dictation && vad_pos > SAMPLE_RATE as usize * 5 {
                     audio_buf.clear();
                     vad_pos = 0;
-                    vad.detector.reset();
+                    vad.detector().reset();
                 }
             }
 
@@ -2249,7 +2266,7 @@ fn main() -> Result<()> {
                     was_detected = false;
                     mode = ListenMode::Idle;
                     last_speech_time = None;
-                    vad.replace(&idle_vad_config)?;
+                    vad.switch_to_idle();
                     listening = false;
                     info!("Paused");
                     ctx.set_tray_status(TrayStatus::Idle);
@@ -2279,7 +2296,7 @@ fn main() -> Result<()> {
                 audio_buf.clear();
                 vad_pos = 0;
                 was_detected = false;
-                vad.detector.reset();
+                vad.detector().reset();
             }
 
             Ok(Event::Ipc(IpcCommand::Stop)) => {
