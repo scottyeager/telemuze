@@ -36,7 +36,7 @@ const DEFAULT_MIN_SPEECH: f32 = 0.1;
 const DEFAULT_MAX_SPEECH: f32 = 15.0;
 const DEFAULT_DICTATION_MAX_SPEECH: f32 = 30.0;
 const DEFAULT_PREFILL_MS: u32 = 450;
-const DEFAULT_DICTATION_TIMEOUT: f32 = 5.0;
+const DEFAULT_LOWERCASE_TIMEOUT: f32 = 5.0;
 
 const DEFAULT_SCROLL_TICKS: u32 = 5;
 const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
@@ -132,9 +132,10 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_DICTATION_MAX_SPEECH)]
     dictation_max_speech: f32,
 
-    /// Seconds of silence in dictation mode before returning to idle.
-    #[arg(long, default_value_t = DEFAULT_DICTATION_TIMEOUT)]
-    dictation_timeout: f32,
+    /// Seconds after last output before continuation lowercasing resets
+    /// (treats next segment as a fresh utterance).
+    #[arg(long, default_value_t = DEFAULT_LOWERCASE_TIMEOUT)]
+    lowercase_timeout: f32,
 
     /// Start in paused state (model loaded but not listening). Use `toggle` to begin.
     #[arg(long)]
@@ -251,7 +252,7 @@ struct AppContext {
     scroll_ticks: u32,
     prefill_samples: usize,
     dictation_silence_secs: f32,
-    dictation_timeout_secs: f32,
+    lowercase_timeout_secs: f32,
     dictation_max_speech_samples: usize,
     last_ended_with_punctuation: Cell<bool>,
     last_output_time: Cell<Option<Instant>>,
@@ -287,7 +288,7 @@ impl AppContext {
             scroll_ticks: cli.scroll_ticks,
             prefill_samples: (cli.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
             dictation_silence_secs: cli.dictation_silence,
-            dictation_timeout_secs: cli.dictation_timeout,
+            lowercase_timeout_secs: cli.lowercase_timeout,
             dictation_max_speech_samples: (cli.dictation_max_speech * SAMPLE_RATE as f32) as usize,
             last_ended_with_punctuation: Cell::new(true),
             last_output_time: Cell::new(None),
@@ -314,7 +315,7 @@ impl AppContext {
                 return false;
             }
             if let Some(t) = self.last_output_time.get() {
-                if t.elapsed().as_secs_f32() > self.dictation_timeout_secs {
+                if t.elapsed().as_secs_f32() > self.lowercase_timeout_secs {
                     return false;
                 }
             } else {
@@ -1948,9 +1949,12 @@ fn main() -> Result<()> {
                         .map(|t| t.elapsed().as_secs_f32())
                         .unwrap_or(f32::MAX);
 
-                    if silence > ctx.dictation_timeout_secs {
-                        // Sustained silence → flush and return to idle.
-                        debug!(silence, "Dictation timeout, returning to idle");
+                    if silence > ctx.dictation_silence_secs
+                        && !utterance_audio.is_empty()
+                    {
+                        // Speech ended → flush and return to idle so
+                        // commands are accepted immediately.
+                        debug!(silence, "Dictation silence, flushing and returning to idle");
                         flush_utterance(&mut utterance_audio, &ctx);
                         mode = ListenMode::Idle;
                         vad.replace(&idle_vad_config)?;
@@ -1959,13 +1963,6 @@ fn main() -> Result<()> {
                         was_detected = false;
                         last_speech_time = None;
                         ctx.set_tray_status(TrayStatus::Listening);
-                    } else if silence > ctx.dictation_silence_secs
-                        && !utterance_audio.is_empty()
-                    {
-                        // Speech ended → send accumulated audio.
-                        debug!(silence, "Dictation silence, flushing utterance");
-                        flush_utterance(&mut utterance_audio, &ctx);
-                        // Stay in dictation mode for the next utterance.
                     }
 
                     // Force-flush if utterance is too long.
