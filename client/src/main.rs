@@ -1580,6 +1580,11 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
     info!(text = %text, "Classification result");
     finish_segment_ui(ctx);
 
+    // Undo is a special command not handled by process_voice_commands.
+    if is_undo_command(&text) {
+        return ClassifyResult::Command(text);
+    }
+
     // Check if the text starts with a command keyword.
     let actions = process_voice_commands(&text);
     let has_text = actions.iter().any(|a| matches!(a, TextAction::Text(_) | TextAction::OwnedText(_)));
