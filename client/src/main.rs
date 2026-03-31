@@ -634,7 +634,33 @@ fn command_hotwords() -> String {
     words.sort_unstable();
     words.dedup();
 
-    words.join(",")
+    // Multi-word command phrases — boosting these as phrases gives stronger
+    // recognition than individual words alone.
+    let phrases: &[&str] = &[
+        "slash command",
+        "click upper left",
+        "click upper right",
+        "click lower left",
+        "click lower right",
+        "scroll up",
+        "scroll down",
+        "scroll top",
+        "scroll bottom",
+        "press enter",
+        "press tab",
+        "press space",
+        "press backspace",
+        "press delete",
+        "press escape",
+        "press control",
+        "press shift",
+        "press alt",
+        "press super",
+    ];
+
+    let mut all: Vec<&str> = words;
+    all.extend_from_slice(phrases);
+    all.join(",")
 }
 
 /// Returns true if `s` contains at least one alphanumeric character (i.e. is
@@ -2132,6 +2158,10 @@ fn main() -> Result<()> {
                                         ClassifyResult::Command(text) => {
                                             execute_commands(&text, &ctx);
                                             last_speech_time = Some(Instant::now());
+                                            // Drain processed audio so the next
+                                            // segment's prefill doesn't overlap.
+                                            audio_buf.clear();
+                                            vad_pos = 0;
                                         }
                                         ClassifyResult::Text => {
                                             // Text detected → enter dictation mode.
