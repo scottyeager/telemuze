@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 /// Wraps the sherpa-onnx OfflineRecognizer for Parakeet TDT inference.
@@ -89,6 +89,9 @@ impl SttEngine {
         pcm_16khz: &[f32],
         hotwords: Option<&str>,
     ) -> Result<String> {
+        let audio_duration_secs = pcm_16khz.len() as f64 / 16_000.0;
+
+        // Phase 1: Try decoding with hotwords (if any).
         let stream = match hotwords {
             Some(hw) if !hw.is_empty() => {
                 debug!(hotwords = %hw, "Passing hotwords to sherpa-onnx");
@@ -98,8 +101,10 @@ impl SttEngine {
         };
         stream.accept_waveform(16000, pcm_16khz);
 
+        let has_hotwords = matches!(hotwords, Some(hw) if !hw.is_empty());
+
         match self.decode_timeout {
-            Some(timeout) => {
+            Some(timeout) if has_hotwords => {
                 // Run decode on a background thread with a timeout to
                 // catch infinite beam search loops (e.g. from extreme
                 // hotword scores).
@@ -112,6 +117,7 @@ impl SttEngine {
                 let stream_ptr = &stream as *const sherpa_onnx::OfflineStream as usize;
 
                 let (tx, rx) = std::sync::mpsc::channel();
+                let start = Instant::now();
 
                 std::thread::spawn(move || {
                     unsafe {
@@ -126,20 +132,37 @@ impl SttEngine {
                     // Leak the stream so the background thread (which
                     // is still running decode) doesn't hit freed memory.
                     std::mem::forget(stream);
+                    let elapsed = start.elapsed();
                     warn!(
-                        "STT decode timed out after {timeout:?} — aborting request. \
-                         This usually means hotword scores are too high, causing \
-                         an infinite beam search loop. The server may need to be \
-                         restarted if the stuck thread does not finish."
+                        "STT decode timed out after {elapsed:?} on {audio_duration_secs:.1}s audio \
+                         — retrying without hotwords. Hotwords were: {:?}",
+                        hotwords.unwrap_or("")
                     );
-                    anyhow::bail!(
-                        "STT decode timed out after {timeout:?} — \
-                         possible infinite beam search loop"
-                    );
+
+                    // Phase 2: Retry without hotwords to avoid the beam
+                    // search pathology. This path is reliable and fast.
+                    let fallback_stream = self.recognizer.create_stream();
+                    fallback_stream.accept_waveform(16000, pcm_16khz);
+                    let fallback_start = Instant::now();
+                    self.recognizer.decode(&fallback_stream);
+                    let fallback_elapsed = fallback_start.elapsed();
+                    info!("Fallback decode (no hotwords) completed in {fallback_elapsed:?}");
+
+                    let result = fallback_stream
+                        .get_result()
+                        .context("sherpa-onnx returned no recognition result")?;
+                    debug!(tokens = ?result.tokens, "Fallback recognition tokens");
+                    return Ok(result.text);
                 }
+
+                let elapsed = start.elapsed();
+                debug!("STT decode completed in {elapsed:?} ({audio_duration_secs:.1}s audio)");
             }
-            None => {
+            _ => {
+                let start = Instant::now();
                 self.recognizer.decode(&stream);
+                let elapsed = start.elapsed();
+                debug!("STT decode completed in {elapsed:?} ({audio_duration_secs:.1}s audio)");
             }
         }
 
