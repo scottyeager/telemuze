@@ -27,24 +27,26 @@ def gen_icon(filename, shape_fn, r, g, b):
         f.write(data)
     print(f"  {filename}: {len(data)} bytes")
 
-def listening(dist, s):
+def filled(dist, s):
     return aa_fill(s / 2.0 - 3.0 - dist)
 
-def recording(dist, s):
+def filled_lg(dist, s):
     return aa_fill(s / 2.0 - 2.0 - dist)
 
-def idle(dist, s):
+def ring(dist, s):
     return aa_ring(dist, s / 2.0 - 4.0, 1.8)
 
-def processing(dist, s):
+def bullseye(dist, s):
     outer = aa_ring(dist, s / 2.0 - 3.5, 1.5)
     inner = aa_fill(2.5 - dist)
     return 1.0 - (1.0 - outer) * (1.0 - inner)
 
 if __name__ == "__main__":
     print(f"Generating {SIZE}x{SIZE} tray icons...")
-    gen_icon("idle.rgba",       idle,       0x88, 0x88, 0x88)
-    gen_icon("listening.rgba",  listening,  0x4C, 0xAF, 0x50)
-    gen_icon("recording.rgba",  recording,  0xF4, 0x43, 0x36)
-    gen_icon("processing.rgba", processing, 0x42, 0xA5, 0xF5)
+    gen_icon("idle.rgba",                 ring,     0x88, 0x88, 0x88)
+    gen_icon("listening.rgba",            ring,     0x4C, 0xAF, 0x50)
+    gen_icon("dictating.rgba",            filled,   0x4C, 0xAF, 0x50)
+    gen_icon("recording.rgba",            filled_lg, 0xF4, 0x43, 0x36)
+    gen_icon("processing.rgba",           bullseye, 0x4C, 0xAF, 0x50)
+    gen_icon("recording_processing.rgba", bullseye, 0xF4, 0x43, 0x36)
     print("Done.")

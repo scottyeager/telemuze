@@ -20,7 +20,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use tray::TrayStatus;
 
@@ -1562,7 +1562,7 @@ enum ClassifyResult {
 
 /// Send audio to the server for STT and classify the result as command or text.
 /// Does NOT output anything — use `output_transcription` for that.
-fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
+fn classify_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> ClassifyResult {
     let duration_secs = samples.len() as f64 / SAMPLE_RATE as f64;
     info!(duration_secs, "Classifying speech segment");
 
@@ -1576,7 +1576,7 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
         Ok(w) => w,
         Err(e) => {
             error!("WAV encode failed: {e}");
-            finish_segment_ui(ctx);
+            finish_segment_ui(ctx, mode);
             return ClassifyResult::Error;
         }
     };
@@ -1586,7 +1586,7 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
         Ok(t) => t,
         Err(e) => {
             error!("Classification request failed: {e}");
-            finish_segment_ui(ctx);
+            finish_segment_ui(ctx, mode);
             if ctx.sound {
                 play_sound("dialog-error");
             }
@@ -1597,12 +1597,12 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
     let text = text.trim().to_string();
     if text.is_empty() {
         info!("Classification returned empty");
-        finish_segment_ui(ctx);
+        finish_segment_ui(ctx, mode);
         return ClassifyResult::Empty;
     }
 
     info!(text = %text, "Classification result");
-    finish_segment_ui(ctx);
+    finish_segment_ui(ctx, mode);
 
     // Undo is a special command not handled by process_voice_commands.
     if is_undo_command(&text) {
@@ -1703,7 +1703,7 @@ fn execute_commands(text: &str, ctx: &AppContext) {
 }
 
 /// Send accumulated dictation audio to the server, output the transcription.
-fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
+fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: ListenMode) {
     if utterance_audio.is_empty() {
         return;
     }
@@ -1711,7 +1711,6 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
     let duration_secs = utterance_audio.len() as f64 / SAMPLE_RATE as f64;
     info!(duration_secs, "Transcribing dictation segment");
 
-    ctx.set_tray_status(TrayStatus::Processing);
     if ctx.notify {
         let id = show_notification("Processing...", "Transcribing dictation", ctx.notify_id.get());
         ctx.notify_id.set(id);
@@ -1722,7 +1721,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
         Err(e) => {
             error!("WAV encode failed: {e}");
             utterance_audio.clear();
-            finish_segment_ui(ctx);
+            finish_segment_ui(ctx, tray_mode);
             return;
         }
     };
@@ -1733,7 +1732,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
         Err(e) => {
             error!("Dictation request failed: {e}");
             utterance_audio.clear();
-            finish_segment_ui(ctx);
+            finish_segment_ui(ctx, tray_mode);
             if ctx.notify {
                 let id = show_notification(
                     "Dictation failed",
@@ -1754,14 +1753,14 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
     let text = text.trim();
     if text.is_empty() {
         info!("Dictation returned empty");
-        finish_segment_ui(ctx);
+        finish_segment_ui(ctx, tray_mode);
         return;
     }
 
     let word_count = text.split_whitespace().count();
     if word_count < ctx.min_dictation_words {
         info!(word_count, min = ctx.min_dictation_words, text, "Dictation too short, dropping");
-        finish_segment_ui(ctx);
+        finish_segment_ui(ctx, tray_mode);
         return;
     }
 
@@ -1866,11 +1865,14 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
         play_sound("message-new-instant");
     }
 
-    finish_segment_ui(ctx);
+    finish_segment_ui(ctx, tray_mode);
 }
 
-fn finish_segment_ui(ctx: &AppContext) {
-    ctx.set_tray_status(TrayStatus::Listening);
+fn finish_segment_ui(ctx: &AppContext, mode: ListenMode) {
+    ctx.set_tray_status(match mode {
+        ListenMode::Idle => TrayStatus::Listening,
+        ListenMode::Dictation => TrayStatus::Dictating,
+    });
     if ctx.notify {
         let id = show_notification(
             "Listening...",
@@ -1886,7 +1888,8 @@ fn finish_segment_ui(ctx: &AppContext) {
 fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mode: ListenMode) {
     // In dictation mode, send accumulated audio if any.
     if mode == ListenMode::Dictation {
-        flush_utterance(utterance_audio, ctx);
+        ctx.set_tray_status(TrayStatus::Processing);
+        flush_utterance(utterance_audio, ctx, ListenMode::Idle);
     }
 
     // Drain any remaining VAD segments (idle mode commands).
@@ -1896,7 +1899,7 @@ fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mo
             if mode == ListenMode::Idle {
                 let samples = seg.samples().to_vec();
                 if samples.len() >= (SAMPLE_RATE as usize / 10) {
-                    if let ClassifyResult::Command(text) = classify_segment(&samples, ctx) {
+                    if let ClassifyResult::Command(text) = classify_segment(&samples, ctx, ListenMode::Idle) {
                         execute_commands(&text, ctx);
                     }
                 }
@@ -2089,6 +2092,7 @@ fn main() -> Result<()> {
     let mut mode = ListenMode::Idle;
     let mut last_speech_time: Option<Instant> = None;
     let mut utterance_audio: Vec<f32> = Vec::new();
+    let mut recording_hold_until: Option<Instant> = None;
     let prefill_samples = ctx.prefill_samples;
 
     loop {
@@ -2110,21 +2114,26 @@ fn main() -> Result<()> {
                         // Speech ended → flush and return to idle so
                         // commands are accepted immediately.
                         debug!(silence, "Dictation silence, flushing and returning to idle");
-                        flush_utterance(&mut utterance_audio, &ctx);
+                        ctx.set_tray_status(TrayStatus::Processing);
+                        flush_utterance(&mut utterance_audio, &ctx, ListenMode::Idle);
                         mode = ListenMode::Idle;
                         vad.switch_to_idle();
                         audio_buf.clear();
                         vad_pos = 0;
                         was_detected = false;
                         last_speech_time = None;
-                        ctx.set_tray_status(TrayStatus::Listening);
+                        recording_hold_until = None;
                     }
 
                     // Force-flush if utterance is too long.
                     if utterance_audio.len() > ctx.dictation_max_speech_samples {
                         let secs = utterance_audio.len() as f32 / SAMPLE_RATE as f32;
                         debug!(duration = secs, "Dictation max speech, force-flushing");
-                        flush_utterance(&mut utterance_audio, &ctx);
+                        ctx.set_tray_status(TrayStatus::RecordingProcessing);
+                        flush_utterance(&mut utterance_audio, &ctx, ListenMode::Dictation);
+                        // Reset so the next speech frame properly re-enters Recording.
+                        was_detected = false;
+                        recording_hold_until = None;
                     }
                 }
 
@@ -2149,6 +2158,7 @@ fn main() -> Result<()> {
                     let now_detected = vad.detector().detected();
                     if now_detected {
                         last_speech_time = Some(Instant::now());
+                        recording_hold_until = None; // cancel pending transition
                         if !was_detected {
                             ctx.set_tray_status(TrayStatus::Recording);
                             if ctx.notify {
@@ -2161,7 +2171,19 @@ fn main() -> Result<()> {
                             }
                         }
                     } else if was_detected {
-                        ctx.set_tray_status(TrayStatus::Listening);
+                        // Start debounce hold instead of immediately transitioning.
+                        recording_hold_until = Some(Instant::now() + Duration::from_millis(300));
+                    }
+                    // Check debounce expiry.
+                    if let Some(deadline) = recording_hold_until {
+                        if !now_detected && Instant::now() >= deadline {
+                            recording_hold_until = None;
+                            let status = match mode {
+                                ListenMode::Idle => TrayStatus::Listening,
+                                ListenMode::Dictation => TrayStatus::Dictating,
+                            };
+                            ctx.set_tray_status(status);
+                        }
                     }
                     was_detected = now_detected;
 
@@ -2190,10 +2212,11 @@ fn main() -> Result<()> {
                                         continue;
                                     }
 
-                                    match classify_segment(&samples, &ctx) {
+                                    match classify_segment(&samples, &ctx, ListenMode::Idle) {
                                         ClassifyResult::Command(text) => {
                                             execute_commands(&text, &ctx);
                                             last_speech_time = Some(Instant::now());
+                                            recording_hold_until = None;
                                             // Drain processed audio so the next
                                             // segment's prefill doesn't overlap.
                                             audio_buf.clear();
@@ -2206,6 +2229,8 @@ fn main() -> Result<()> {
                                             utterance_audio = samples;
                                             mode = ListenMode::Dictation;
                                             last_speech_time = Some(Instant::now());
+                                            recording_hold_until = None;
+                                            ctx.set_tray_status(TrayStatus::Dictating);
 
                                             // Switch VAD, keep audio flowing.
                                             vad.detector().pop();
@@ -2266,6 +2291,7 @@ fn main() -> Result<()> {
                     was_detected = false;
                     mode = ListenMode::Idle;
                     last_speech_time = None;
+                    recording_hold_until = None;
                     vad.switch_to_idle();
                     listening = false;
                     info!("Paused");
@@ -2296,6 +2322,7 @@ fn main() -> Result<()> {
                 audio_buf.clear();
                 vad_pos = 0;
                 was_detected = false;
+                recording_hold_until = None;
                 vad.detector().reset();
             }
 
