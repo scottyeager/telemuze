@@ -32,13 +32,15 @@ async fn handle_transcription(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut file_data: Option<Vec<u8>> = None;
+    let mut raw_hotwords: Option<String> = None;
+    let mut hotwords_score: Option<f32> = None;
 
     // Extract the file from multipart form data
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
 
-        if name == "file" {
-            match field.bytes().await {
+        match name.as_str() {
+            "file" => match field.bytes().await {
                 Ok(bytes) => file_data = Some(bytes.to_vec()),
                 Err(e) => {
                     error!("Failed to read file field: {e}");
@@ -48,10 +50,22 @@ async fn handle_transcription(
                     )
                         .into_response();
                 }
+            },
+            "hotwords" => {
+                if let Ok(text) = field.text().await {
+                    raw_hotwords = Some(text);
+                }
             }
+            "hotwords_score" => {
+                if let Ok(text) = field.text().await {
+                    hotwords_score = text.parse().ok();
+                }
+            }
+            _ => {} // `model` and other fields accepted but ignored
         }
-        // `model` field is accepted but ignored — we always use our loaded model
     }
+
+    let hotwords = raw_hotwords.map(|hw| crate::hotwords::parse_hotwords(&hw, hotwords_score));
 
     let file_data = match file_data {
         Some(d) => d,
@@ -79,8 +93,12 @@ async fn handle_transcription(
         }
     };
 
+    if hotwords.is_some() {
+        info!("Hotwords: {:?}", hotwords.as_deref().unwrap());
+    }
+
     // Run STT (no LLM correction for OpenAI compatibility)
-    match state.stt_engine.lock().unwrap().transcribe(&pcm) {
+    match state.stt_engine.lock().unwrap().transcribe_with_hotwords(&pcm, hotwords.as_deref()) {
         Ok(text) => {
             info!("Transcription complete: {} chars", text.len());
             Json(TranscriptionResponse { text }).into_response()

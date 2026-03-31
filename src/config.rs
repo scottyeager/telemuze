@@ -72,6 +72,11 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_FUZZY_THRESHOLD", default_value_t = 0.85)]
     pub fuzzy_threshold: f64,
 
+    /// Score boost applied to hotwords during recognition (0.0 = disabled).
+    /// Requires modified_beam_search decoding. Typical range: 1.0–4.0.
+    #[arg(long, env = "TELEMUZE_HOTWORDS_SCORE", default_value_t = 1.5)]
+    pub hotwords_score: f32,
+
     /// Telegram API ID (from https://my.telegram.org)
     #[arg(long, env = "TELEGRAM_API_ID", default_value_t = 0)]
     pub telegram_api_id: i32,

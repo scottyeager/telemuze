@@ -60,7 +60,7 @@ impl AppState {
         };
 
         info!("Loading STT model from {:?}...", stt_path);
-        let stt_engine = SttEngine::new(&stt_path)?;
+        let stt_engine = SttEngine::new(&stt_path, config.hotwords_score)?;
         info!("STT model loaded.");
 
         // Initialize LLM engine:
@@ -142,12 +142,21 @@ impl AppState {
     ///
     /// Returns transcribed segments (skipping empty/failed ones).
     pub fn vad_transcribe(&self, pcm: &[f32]) -> Result<Vec<TranscribedSegment>> {
+        self.vad_transcribe_with_hotwords(pcm, None)
+    }
+
+    /// Run VAD segmentation + per-segment STT with optional hotwords.
+    pub fn vad_transcribe_with_hotwords(
+        &self,
+        pcm: &[f32],
+        hotwords: Option<&str>,
+    ) -> Result<Vec<TranscribedSegment>> {
         let segments = self.vad_engine.lock().unwrap().segment_audio(pcm)?;
         info!("VAD found {} speech segments", segments.len());
 
         let mut results = Vec::with_capacity(segments.len());
         for (i, seg) in segments.iter().enumerate() {
-            match self.stt_engine.lock().unwrap().transcribe(&seg.samples) {
+            match self.stt_engine.lock().unwrap().transcribe_with_hotwords(&seg.samples, hotwords) {
                 Ok(text) if !text.trim().is_empty() => {
                     info!(
                         "Segment {}/{}: [{:.1}s - {:.1}s] '{text}'",
@@ -181,8 +190,14 @@ impl AppState {
     }
 
     /// Transcribe a single speech segment, returning the text (or empty on failure).
-    pub fn transcribe_segment(&self, seg: &SpeechSegment, index: usize, total: usize) -> Option<TranscribedSegment> {
-        match self.stt_engine.lock().unwrap().transcribe(&seg.samples) {
+    pub fn transcribe_segment(
+        &self,
+        seg: &SpeechSegment,
+        index: usize,
+        total: usize,
+        hotwords: Option<&str>,
+    ) -> Option<TranscribedSegment> {
+        match self.stt_engine.lock().unwrap().transcribe_with_hotwords(&seg.samples, hotwords) {
             Ok(text) if !text.trim().is_empty() => {
                 info!(
                     "Segment {}/{}: [{:.1}s - {:.1}s] '{text}'",

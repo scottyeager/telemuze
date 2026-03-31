@@ -268,7 +268,7 @@ async fn transcribe_and_reply(
                 .await;
         }
 
-        if let Some(result) = state.transcribe_segment(seg, i, total) {
+        if let Some(result) = state.transcribe_segment(seg, i, total, None) {
             results.push(result);
         }
     }

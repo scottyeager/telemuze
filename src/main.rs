@@ -2,6 +2,7 @@ mod audio;
 mod config;
 mod endpoints;
 mod engines;
+pub mod hotwords;
 mod models;
 mod state;
 mod telegram;

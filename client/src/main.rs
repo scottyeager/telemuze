@@ -17,6 +17,8 @@ use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 use std::cell::Cell;
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
@@ -132,6 +134,18 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_DICTATION_MAX_SPEECH)]
     dictation_max_speech: f32,
 
+    /// Comma-separated list of words to boost during dictation (hotwords).
+    #[arg(long, env = "TELEMUZE_HOTWORDS")]
+    hotwords: Option<String>,
+
+    /// Score boost for command hotwords in idle mode (0.0 = disabled). Range: 1.0–4.0.
+    #[arg(long, env = "TELEMUZE_COMMAND_HOTWORDS_SCORE", default_value_t = 1.5)]
+    command_hotwords_score: f32,
+
+    /// Score boost for user-provided dictation hotwords (0.0 = disabled). Range: 1.0–4.0.
+    #[arg(long, env = "TELEMUZE_DICTATION_HOTWORDS_SCORE", default_value_t = 1.5)]
+    dictation_hotwords_score: f32,
+
     /// Seconds after last output before continuation lowercasing resets
     /// (treats next segment as a fresh utterance).
     #[arg(long, default_value_t = DEFAULT_LOWERCASE_TIMEOUT)]
@@ -149,6 +163,10 @@ struct Cli {
     /// Number of scroll ticks per "scroll up" / "scroll down" voice command.
     #[arg(long, default_value_t = DEFAULT_SCROLL_TICKS)]
     scroll_ticks: u32,
+
+    /// Dump each audio segment to a WAV file in this directory for debugging.
+    #[arg(long)]
+    dump_audio: Option<PathBuf>,
 
     /// Enable verbose logging (parsed actions, key injection details).
     #[arg(long, short, env = "TELEMUZE_VERBOSE")]
@@ -261,6 +279,14 @@ struct AppContext {
     display_server: String,
     notify_id: Cell<u32>,
     tray_handle: Option<tray::TrayHandle>,
+    /// Hotwords derived from command vocabulary, used in idle mode.
+    command_hotwords: String,
+    command_hotwords_score: f32,
+    /// User-provided hotwords from --hotwords flag, used in dictation mode.
+    dictation_hotwords: Option<String>,
+    dictation_hotwords_score: f32,
+    dump_audio_dir: Option<PathBuf>,
+    dump_audio_counter: AtomicU32,
 }
 
 impl AppContext {
@@ -296,6 +322,24 @@ impl AppContext {
             display_server,
             notify_id: Cell::new(0),
             tray_handle: None,
+            command_hotwords: command_hotwords(),
+            command_hotwords_score: cli.command_hotwords_score,
+            dictation_hotwords: cli.hotwords.clone(),
+            dictation_hotwords_score: cli.dictation_hotwords_score,
+            dump_audio_dir: cli.dump_audio.clone(),
+            dump_audio_counter: AtomicU32::new(0),
+        }
+    }
+
+    /// If `--dump-audio` is set, write the WAV data to a sequentially numbered file.
+    fn maybe_dump_wav(&self, wav: &[u8], label: &str) {
+        if let Some(dir) = &self.dump_audio_dir {
+            let n = self.dump_audio_counter.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("{n:04}_{label}.wav"));
+            match std::fs::write(&path, wav) {
+                Ok(()) => info!(?path, "Dumped audio segment"),
+                Err(e) => warn!(?path, "Failed to dump audio: {e}"),
+            }
         }
     }
 
@@ -558,6 +602,39 @@ enum TextAction<'a> {
     OwnedText(String),
     /// A voice command was recognized.
     Command(VoiceAction),
+}
+
+/// Build a comma-separated hotwords string from the command vocabulary.
+/// These are all words that might appear in voice commands, used to boost
+/// recognition accuracy when we don't yet know if an utterance is a command.
+fn command_hotwords() -> String {
+    let mut words: Vec<&str> = Vec::new();
+
+    // Command trigger keywords
+    words.extend_from_slice(&["press", "click", "scroll", "slash", "command", "undo"]);
+
+    // Click quadrant words
+    words.extend_from_slice(&["upper", "lower", "left", "right"]);
+
+    // Scroll directions
+    words.extend_from_slice(&["up", "down", "top", "bottom"]);
+
+    // Key names (named keys only; single letters are too ambiguous)
+    words.extend_from_slice(&[
+        "enter", "return", "tab", "space", "backspace", "delete",
+        "escape", "home", "end",
+    ]);
+
+    // Modifier keys
+    words.extend_from_slice(&[
+        "control", "ctrl", "shift", "alt", "super", "meta",
+    ]);
+
+    // Deduplicate (some words appear in multiple roles, e.g. "left", "right", "up", "down")
+    words.sort_unstable();
+    words.dedup();
+
+    words.join(",")
 }
 
 /// Returns true if `s` contains at least one alphanumeric character (i.e. is
@@ -1294,11 +1371,19 @@ fn send_to_server(
     url: &str,
     wav_data: Vec<u8>,
     smart: bool,
+    hotwords: Option<&str>,
+    hotwords_score: f32,
 ) -> Result<String> {
     let part = reqwest::blocking::multipart::Part::bytes(wav_data)
         .file_name("audio.wav")
         .mime_str("audio/wav")?;
-    let form = reqwest::blocking::multipart::Form::new().part("file", part);
+    let mut form = reqwest::blocking::multipart::Form::new().part("file", part);
+    if let Some(hw) = hotwords {
+        form = form.text("hotwords", hw.to_string());
+        if hotwords_score > 0.0 {
+            form = form.text("hotwords_score", hotwords_score.to_string());
+        }
+    }
 
     let response = client
         .post(url)
@@ -1445,8 +1530,9 @@ fn classify_segment(samples: &[f32], ctx: &AppContext) -> ClassifyResult {
             return ClassifyResult::Error;
         }
     };
+    ctx.maybe_dump_wav(&wav, "idle");
 
-    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart) {
+    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart, Some(&ctx.command_hotwords), ctx.command_hotwords_score) {
         Ok(t) => t,
         Err(e) => {
             error!("Classification request failed: {e}");
@@ -1585,8 +1671,9 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
             return;
         }
     };
+    ctx.maybe_dump_wav(&wav, "dictation");
 
-    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart) {
+    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart, ctx.dictation_hotwords.as_deref(), ctx.dictation_hotwords_score) {
         Ok(t) => t,
         Err(e) => {
             error!("Dictation request failed: {e}");
@@ -1814,6 +1901,12 @@ fn main() -> Result<()> {
         .with_context(|| format!("Failed to bind socket: {}", cli.socket))?;
 
     let mut ctx = AppContext::new(&cli);
+
+    if let Some(dir) = &ctx.dump_audio_dir {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create dump-audio directory: {}", dir.display()))?;
+        info!(?dir, "Audio dump enabled");
+    }
 
     // Unified event channel for audio and IPC
     let (tx, rx) = mpsc::sync_channel::<Event>(64);

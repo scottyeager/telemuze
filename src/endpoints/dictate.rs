@@ -26,21 +26,36 @@ async fn handle_smart_dictation(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut file_data: Option<Vec<u8>> = None;
+    let mut raw_hotwords: Option<String> = None;
+    let mut hotwords_score: Option<f32> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
 
-        if name == "file" {
-            match field.bytes().await {
+        match name.as_str() {
+            "file" => match field.bytes().await {
                 Ok(bytes) => file_data = Some(bytes.to_vec()),
                 Err(e) => {
                     error!("Failed to read file field: {e}");
                     return (StatusCode::BAD_REQUEST, "Failed to read uploaded file")
                         .into_response();
                 }
+            },
+            "hotwords" => {
+                if let Ok(text) = field.text().await {
+                    raw_hotwords = Some(text);
+                }
             }
+            "hotwords_score" => {
+                if let Ok(text) = field.text().await {
+                    hotwords_score = text.parse().ok();
+                }
+            }
+            _ => {}
         }
     }
+
+    let hotwords = raw_hotwords.map(|hw| crate::hotwords::parse_hotwords(&hw, hotwords_score));
 
     let file_data = match file_data {
         Some(d) => d,
@@ -64,8 +79,12 @@ async fn handle_smart_dictation(
         }
     };
 
+    if hotwords.is_some() {
+        info!("Hotwords: {:?}", hotwords.as_deref().unwrap());
+    }
+
     // Step 2: STT transcription
-    let raw_text = match state.stt_engine.lock().unwrap().transcribe(&pcm) {
+    let raw_text = match state.stt_engine.lock().unwrap().transcribe_with_hotwords(&pcm, hotwords.as_deref()) {
         Ok(text) => text,
         Err(e) => {
             error!("STT failed: {e}");

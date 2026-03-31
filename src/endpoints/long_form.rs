@@ -41,12 +41,14 @@ async fn handle_long_form(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut file_data: Option<Vec<u8>> = None;
+    let mut raw_hotwords: Option<String> = None;
+    let mut hotwords_score: Option<f32> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
 
-        if name == "file" {
-            match field.bytes().await {
+        match name.as_str() {
+            "file" => match field.bytes().await {
                 Ok(bytes) => file_data = Some(bytes.to_vec()),
                 Err(e) => {
                     error!("Failed to read file field: {e}");
@@ -56,9 +58,22 @@ async fn handle_long_form(
                     )
                         .into_response();
                 }
+            },
+            "hotwords" => {
+                if let Ok(text) = field.text().await {
+                    raw_hotwords = Some(text);
+                }
             }
+            "hotwords_score" => {
+                if let Ok(text) = field.text().await {
+                    hotwords_score = text.parse().ok();
+                }
+            }
+            _ => {}
         }
     }
+
+    let hotwords = raw_hotwords.map(|hw| crate::hotwords::parse_hotwords(&hw, hotwords_score));
 
     let file_data = match file_data {
         Some(d) => d,
@@ -89,8 +104,12 @@ async fn handle_long_form(
     let duration_secs = pcm.len() as f64 / 16_000.0;
     info!("Audio duration: {:.1}s", duration_secs);
 
+    if hotwords.is_some() {
+        info!("Hotwords: {:?}", hotwords.as_deref().unwrap());
+    }
+
     // VAD segmentation + per-segment STT
-    let segments = match state.vad_transcribe(&pcm) {
+    let segments = match state.vad_transcribe_with_hotwords(&pcm, hotwords.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             error!("VAD transcription failed: {e}");
