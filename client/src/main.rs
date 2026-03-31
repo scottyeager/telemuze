@@ -164,6 +164,11 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_SCROLL_TICKS)]
     scroll_ticks: u32,
 
+    /// Minimum number of words for a dictation output to be kept (shorter outputs
+    /// are silently dropped). Set to 1 to keep everything.
+    #[arg(long, default_value_t = 2)]
+    min_dictation_words: usize,
+
     /// Dump each audio segment to a WAV file in this directory for debugging.
     #[arg(long)]
     dump_audio: Option<PathBuf>,
@@ -285,6 +290,7 @@ struct AppContext {
     /// User-provided hotwords from --hotwords flag, used in dictation mode.
     dictation_hotwords: Option<String>,
     dictation_hotwords_score: f32,
+    min_dictation_words: usize,
     dump_audio_dir: Option<PathBuf>,
     dump_audio_counter: AtomicU32,
 }
@@ -326,6 +332,7 @@ impl AppContext {
             command_hotwords_score: cli.command_hotwords_score,
             dictation_hotwords: cli.hotwords.clone(),
             dictation_hotwords_score: cli.dictation_hotwords_score,
+            min_dictation_words: cli.min_dictation_words,
             dump_audio_dir: cli.dump_audio.clone(),
             dump_audio_counter: AtomicU32::new(0),
         }
@@ -1730,6 +1737,13 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext) {
     let text = text.trim();
     if text.is_empty() {
         info!("Dictation returned empty");
+        finish_segment_ui(ctx);
+        return;
+    }
+
+    let word_count = text.split_whitespace().count();
+    if word_count < ctx.min_dictation_words {
+        info!(word_count, min = ctx.min_dictation_words, text, "Dictation too short, dropping");
         finish_segment_ui(ctx);
         return;
     }
