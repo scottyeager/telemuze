@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use sherpa_onnx::{OfflineRecognizer, OfflineRecognizerConfig};
 use std::path::Path;
-use tracing::info;
+use tracing::{debug, info};
 
 /// Wraps the sherpa-onnx OfflineRecognizer for Parakeet TDT inference.
 pub struct SttEngine {
@@ -26,6 +26,7 @@ impl SttEngine {
     /// - decoder.int8.onnx
     /// - joiner.int8.onnx
     /// - tokens.txt
+    /// - bpe.vocab (for hotword support)
     pub fn new(model_dir: &Path, hotwords_score: f32) -> Result<Self> {
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.transducer.encoder =
@@ -40,6 +41,17 @@ impl SttEngine {
         config.model_config.num_threads = 4;
         config.decoding_method = Some("modified_beam_search".into());
         config.hotwords_score = hotwords_score;
+
+        // Enable BPE hotword encoding so sherpa-onnx tokenizes hotwords
+        // using the SentencePiece vocabulary rather than the default
+        // "cjkchar" mode which breaks ▁-prefixed BPE tokens.
+        let bpe_vocab_path = model_dir.join("bpe.vocab");
+        if bpe_vocab_path.exists() {
+            config.model_config.modeling_unit = Some("bpe".into());
+            config.model_config.bpe_vocab =
+                Some(bpe_vocab_path.to_string_lossy().into_owned());
+            info!("BPE hotword encoding enabled via {}", bpe_vocab_path.display());
+        }
 
         info!(
             "Creating sherpa-onnx recognizer from {:?} (decoding=modified_beam_search, hotwords_score={hotwords_score})",
@@ -59,13 +71,18 @@ impl SttEngine {
     /// Transcribe with optional per-request hotwords.
     ///
     /// `hotwords` should be one word/phrase per line in sherpa-onnx format.
+    /// Sherpa-onnx handles BPE tokenization internally when `bpe.vocab` is
+    /// configured, so hotwords can be plain words (e.g. "PRESS ENTER").
     pub fn transcribe_with_hotwords(
         &self,
         pcm_16khz: &[f32],
         hotwords: Option<&str>,
     ) -> Result<String> {
         let stream = match hotwords {
-            Some(hw) if !hw.is_empty() => self.recognizer.create_stream_with_hotwords(hw),
+            Some(hw) if !hw.is_empty() => {
+                debug!(hotwords = %hw, "Passing hotwords to sherpa-onnx");
+                self.recognizer.create_stream_with_hotwords(hw)
+            }
             _ => self.recognizer.create_stream(),
         };
         stream.accept_waveform(16000, pcm_16khz);
@@ -73,6 +90,7 @@ impl SttEngine {
         let result = stream
             .get_result()
             .context("sherpa-onnx returned no recognition result")?;
+        debug!(tokens = ?result.tokens, "Recognition tokens");
         Ok(result.text)
     }
 }
