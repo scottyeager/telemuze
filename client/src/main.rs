@@ -555,6 +555,36 @@ fn scroll(up: bool, ticks: u32) {
 
 // ── Voice commands ──────────────────────────────────────────────────────
 
+/// Alternate trigger phrases for "slash command" (multi-word, used by find_slash_command).
+const SLASH_TRIGGERS: &[&[&str]] = &[
+    &["slash", "command"],
+    &["flash", "command"],
+    &["splash", "command"],
+];
+
+/// Alternate trigger words for "click".
+const CLICK_TRIGGERS: &[&str] = &["click", "look", "lick"];
+
+/// Alternate trigger words for "press".
+const PRESS_TRIGGERS: &[&str] = &["press"];
+
+/// Alternate trigger words for "scroll".
+const SCROLL_TRIGGERS: &[&str] = &["scroll"];
+
+/// Find the earliest occurrence of any trigger word from `triggers` in
+/// `haystack[search_start..]`.  Returns `(position_relative_to_search_start, matched_len)`.
+fn find_any_trigger(haystack: &str, search_start: usize, triggers: &[&str]) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for &trigger in triggers {
+        if let Some(p) = haystack[search_start..].find(trigger) {
+            if best.as_ref().is_none_or(|&(bp, _)| p < bp) {
+                best = Some((p, trigger.len()));
+            }
+        }
+    }
+    best
+}
+
 /// An action that a voice command can trigger.
 #[derive(Clone, Debug)]
 enum VoiceAction {
@@ -634,8 +664,14 @@ enum TextAction<'a> {
 fn command_hotwords() -> String {
     let mut words: Vec<&str> = Vec::new();
 
-    // Command trigger keywords
+    // Command trigger keywords (canonical + aliases)
     words.extend_from_slice(&["press", "click", "scroll", "slash", "command", "undo"]);
+    words.extend_from_slice(CLICK_TRIGGERS);
+    words.extend_from_slice(PRESS_TRIGGERS);
+    words.extend_from_slice(SCROLL_TRIGGERS);
+    for trigger in SLASH_TRIGGERS {
+        words.extend_from_slice(trigger);
+    }
 
     // Click quadrant words
     words.extend_from_slice(&["upper", "lower", "left", "right"]);
@@ -660,30 +696,44 @@ fn command_hotwords() -> String {
 
     // Multi-word command phrases — boosting these as phrases gives stronger
     // recognition than individual words alone.
-    let phrases: &[&str] = &[
-        "slash command",
-        "click upper left",
-        "click upper right",
-        "click lower left",
-        "click lower right",
-        "scroll up",
-        "scroll down",
-        "scroll top",
-        "scroll bottom",
-        "press enter",
-        "press tab",
-        "press space",
-        "press backspace",
-        "press delete",
-        "press escape",
-        "press control",
-        "press shift",
-        "press alt",
-        "press super",
+    let mut phrases: Vec<String> = vec![
+        "slash command".into(),
+        "click upper left".into(),
+        "click upper right".into(),
+        "click lower left".into(),
+        "click lower right".into(),
+        "scroll up".into(),
+        "scroll down".into(),
+        "scroll top".into(),
+        "scroll bottom".into(),
+        "press enter".into(),
+        "press tab".into(),
+        "press space".into(),
+        "press backspace".into(),
+        "press delete".into(),
+        "press escape".into(),
+        "press control".into(),
+        "press shift".into(),
+        "press alt".into(),
+        "press super".into(),
     ];
 
+    // Add alias phrases for slash command triggers
+    for trigger in SLASH_TRIGGERS {
+        phrases.push(trigger.join(" "));
+    }
+    // Add alias phrases for click quadrant commands
+    for &trigger in CLICK_TRIGGERS {
+        for dir in &["upper left", "upper right", "lower left", "lower right"] {
+            phrases.push(format!("{trigger} {dir}"));
+        }
+    }
+
+    phrases.sort();
+    phrases.dedup();
+
     let mut all: Vec<&str> = words;
-    all.extend_from_slice(phrases);
+    all.extend(phrases.iter().map(|s| s.as_str()));
     all.join(",")
 }
 
@@ -697,31 +747,35 @@ fn has_word_chars(s: &str) -> bool {
 /// Returns `(start, end, slash_word)` where `slash_word` is the captured word
 /// lowercased with a leading `/`.
 fn find_slash_command(lower: &str, from: usize) -> Option<(usize, usize, String)> {
-    let trigger = &["slash", "command"];
-    if let Some((start, end)) = find_phrase(lower, from, trigger) {
-        // Skip whitespace/punctuation after "slash command"
-        let rest = &lower[end..];
-        let skip = rest
-            .chars()
-            .take_while(|c| {
-                c.is_whitespace()
-                    || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"')
-            })
-            .map(|c| c.len_utf8())
-            .sum::<usize>();
-        let after = &rest[skip..];
-        // Capture the next word (alphanumeric chars)
-        let word_len = after
-            .chars()
-            .take_while(|c| c.is_alphanumeric())
-            .map(|c| c.len_utf8())
-            .sum::<usize>();
-        if word_len > 0 {
-            let word = &after[..word_len];
-            return Some((start, end + skip + word_len, format!("/{word}")));
+    let mut best: Option<(usize, usize, String)> = None;
+    for trigger in SLASH_TRIGGERS {
+        if let Some((start, end)) = find_phrase(lower, from, trigger) {
+            if best.as_ref().is_none_or(|b| start < b.0) {
+                // Skip whitespace/punctuation after the trigger phrase
+                let rest = &lower[end..];
+                let skip = rest
+                    .chars()
+                    .take_while(|c| {
+                        c.is_whitespace()
+                            || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"')
+                    })
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
+                let after = &rest[skip..];
+                // Capture the next word (alphanumeric chars)
+                let word_len = after
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric())
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>();
+                if word_len > 0 {
+                    let word = &after[..word_len];
+                    best = Some((start, end + skip + word_len, format!("/{word}")));
+                }
+            }
         }
     }
-    None
+    best
 }
 
 /// Parse a spoken number word into its value. Returns None if the word is not a number.
@@ -806,11 +860,11 @@ fn find_click_coordinate(lower: &str, from: usize) -> Option<(usize, usize, u32,
     let haystack = &lower[from..];
 
     let mut search_start = 0;
-    while let Some(p) = haystack[search_start..].find("click") {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, CLICK_TRIGGERS) {
         let click_start = from + search_start + p;
-        let after_click = click_start + "click".len();
+        let after_click = click_start + matched_len;
 
-        // Collect the words after "click", skipping punctuation/whitespace
+        // Collect the words after the trigger, skipping punctuation/whitespace
         let rest = &lower[after_click..];
         let word_chars: Vec<&str> = rest
             .split(|c: char| c.is_whitespace() || matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"'))
@@ -851,7 +905,7 @@ fn find_click_coordinate(lower: &str, from: usize) -> Option<(usize, usize, u32,
             }
         }
 
-        search_start = search_start + p + "click".len();
+        search_start = search_start + p + matched_len;
     }
 
     None
@@ -876,11 +930,11 @@ fn find_modified_key(lower: &str, from: usize) -> Option<(usize, usize, VoiceAct
     let haystack = &lower[from..];
     let mut best: Option<(usize, usize, VoiceAction)> = None;
 
-    // Scan for "press" — then check if the next word is a modifier
+    // Scan for "press" (or aliases) — then check if the next word is a modifier
     let mut search_start = 0;
-    while let Some(p) = haystack[search_start..].find("press") {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, PRESS_TRIGGERS) {
         let press_start = from + search_start + p;
-        let after_press = press_start + "press".len();
+        let after_press = press_start + matched_len;
 
         // The word after "press" must be a modifier alias
         if let Some((modifier_word, mod_word_end)) = next_word(lower, after_press) {
@@ -902,7 +956,7 @@ fn find_modified_key(lower: &str, from: usize) -> Option<(usize, usize, VoiceAct
             }
         }
 
-        search_start = search_start + p + "press".len();
+        search_start = search_start + p + matched_len;
     }
 
     best
@@ -915,9 +969,9 @@ fn find_key_press(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction
     let mut best: Option<(usize, usize, VoiceAction)> = None;
 
     let mut search_start = 0;
-    while let Some(p) = haystack[search_start..].find("press") {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, PRESS_TRIGGERS) {
         let press_start = from + search_start + p;
-        let after_press = press_start + "press".len();
+        let after_press = press_start + matched_len;
 
         // The word after "press" must not be a modifier — those are handled by
         // find_modified_key and we don't want "press control c" to fire as
@@ -933,7 +987,7 @@ fn find_key_press(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction
             }
         }
 
-        search_start = search_start + p + "press".len();
+        search_start = search_start + p + matched_len;
     }
 
     best
@@ -1043,9 +1097,9 @@ fn find_scroll(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> 
     let mut best: Option<(usize, usize, VoiceAction)> = None;
 
     let mut search_start = 0;
-    while let Some(p) = haystack[search_start..].find("scroll") {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, SCROLL_TRIGGERS) {
         let scroll_start = from + search_start + p;
-        let after_scroll = scroll_start + "scroll".len();
+        let after_scroll = scroll_start + matched_len;
 
         // Collect words after "scroll", consuming direction words greedily
         let mut pos = after_scroll;
@@ -1125,7 +1179,7 @@ fn find_scroll(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> 
             }
         }
 
-        search_start = search_start + p + "scroll".len();
+        search_start = search_start + p + matched_len;
     }
 
     best
@@ -1172,11 +1226,15 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
         // precedes the command, ending command mode.
         let no_text_before = |start: usize| !has_word_chars(&text[cursor..start]);
 
-        // Static commands (click quadrant)
+        // Static commands (click quadrant) — try each click alias
         for cmd in commands {
-            if let Some((start, end)) = find_phrase(&lower, cursor, cmd.words) {
-                if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
-                    best = Some((start, end, cmd.action.clone()));
+            for &trigger in CLICK_TRIGGERS {
+                let mut words: Vec<&str> = cmd.words.to_vec();
+                words[0] = trigger;
+                if let Some((start, end)) = find_phrase(&lower, cursor, &words) {
+                    if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
+                        best = Some((start, end, cmd.action.clone()));
+                    }
                 }
             }
         }
