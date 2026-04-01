@@ -11,7 +11,10 @@ use tracing::{debug, info, warn};
 
 /// Wraps the sherpa-onnx OfflineRecognizer for Parakeet TDT inference.
 pub struct SttEngine {
+    /// Primary recognizer using modified_beam_search (supports hotwords).
     recognizer: OfflineRecognizer,
+    /// Fallback recognizer using greedy_search (no hotwords, but reliable).
+    greedy_recognizer: OfflineRecognizer,
     decode_timeout: Option<Duration>,
 }
 
@@ -65,13 +68,23 @@ impl SttEngine {
             model_dir
         );
         let recognizer = OfflineRecognizer::create(&config)
-            .context("Failed to create sherpa-onnx OfflineRecognizer")?;
+            .context("Failed to create sherpa-onnx OfflineRecognizer (beam search)")?;
+
+        // Create a second recognizer with greedy_search for fallback.
+        // Greedy search doesn't support hotwords but is immune to the
+        // beam search pathologies that can cause hangs.
+        let mut greedy_config = config.clone();
+        greedy_config.decoding_method = Some("greedy_search".into());
+        greedy_config.hotwords_score = 0.0;
+        info!("Creating greedy_search fallback recognizer");
+        let greedy_recognizer = OfflineRecognizer::create(&greedy_config)
+            .context("Failed to create sherpa-onnx OfflineRecognizer (greedy search)")?;
 
         if let Some(t) = decode_timeout {
             info!("STT decode timeout: {t:?}");
         }
 
-        Ok(Self { recognizer, decode_timeout })
+        Ok(Self { recognizer, greedy_recognizer, decode_timeout })
     }
 
     /// Transcribe mono 16kHz f32 PCM audio to text.
@@ -103,66 +116,31 @@ impl SttEngine {
 
         let has_hotwords = matches!(hotwords, Some(hw) if !hw.is_empty());
 
-        match self.decode_timeout {
-            Some(timeout) if has_hotwords => {
-                // Run decode on a background thread with a timeout to
-                // catch infinite beam search loops (e.g. from extreme
-                // hotword scores).
-                //
-                // Cast pointers to usize so they are Send. The
-                // recognizer lives as long as the server. The stream
-                // is either dropped normally (success) or deliberately
-                // leaked (timeout) so both pointers stay valid.
-                let rec_ptr = &self.recognizer as *const OfflineRecognizer as usize;
-                let stream_ptr = &stream as *const sherpa_onnx::OfflineStream as usize;
+        match self.decode_with_timeout(&stream, audio_duration_secs) {
+            Ok(()) => {}
+            Err(_) => {
+                // Leak the stream so the background thread (which
+                // is still running decode) doesn't hit freed memory.
+                std::mem::forget(stream);
+                warn!(
+                    "Beam search decode timed out on {audio_duration_secs:.1}s audio \
+                     — falling back to greedy search. Hotwords were: {:?}",
+                    hotwords.unwrap_or("(none)")
+                );
 
-                let (tx, rx) = std::sync::mpsc::channel();
-                let start = Instant::now();
+                // Phase 2: Fall back to greedy_search which is immune
+                // to the beam search pathologies that cause hangs.
+                let fallback_stream = self.greedy_recognizer.create_stream();
+                fallback_stream.accept_waveform(16000, pcm_16khz);
+                let fallback_start = Instant::now();
+                self.greedy_recognizer.decode(&fallback_stream);
+                info!("Greedy fallback decode completed in {:?}", fallback_start.elapsed());
 
-                std::thread::spawn(move || {
-                    unsafe {
-                        let rec = &*(rec_ptr as *const OfflineRecognizer);
-                        let s = &*(stream_ptr as *const sherpa_onnx::OfflineStream);
-                        rec.decode(s);
-                    }
-                    let _ = tx.send(());
-                });
-
-                if rx.recv_timeout(timeout).is_err() {
-                    // Leak the stream so the background thread (which
-                    // is still running decode) doesn't hit freed memory.
-                    std::mem::forget(stream);
-                    let elapsed = start.elapsed();
-                    warn!(
-                        "STT decode timed out after {elapsed:?} on {audio_duration_secs:.1}s audio \
-                         — retrying without hotwords. Hotwords were: {:?}",
-                        hotwords.unwrap_or("")
-                    );
-
-                    // Phase 2: Retry without hotwords to avoid the beam
-                    // search pathology. This path is reliable and fast.
-                    let fallback_stream = self.recognizer.create_stream();
-                    fallback_stream.accept_waveform(16000, pcm_16khz);
-                    let fallback_start = Instant::now();
-                    self.recognizer.decode(&fallback_stream);
-                    let fallback_elapsed = fallback_start.elapsed();
-                    info!("Fallback decode (no hotwords) completed in {fallback_elapsed:?}");
-
-                    let result = fallback_stream
-                        .get_result()
-                        .context("sherpa-onnx returned no recognition result")?;
-                    debug!(tokens = ?result.tokens, "Fallback recognition tokens");
-                    return Ok(result.text);
-                }
-
-                let elapsed = start.elapsed();
-                debug!("STT decode completed in {elapsed:?} ({audio_duration_secs:.1}s audio)");
-            }
-            _ => {
-                let start = Instant::now();
-                self.recognizer.decode(&stream);
-                let elapsed = start.elapsed();
-                debug!("STT decode completed in {elapsed:?} ({audio_duration_secs:.1}s audio)");
+                let result = fallback_stream
+                    .get_result()
+                    .context("sherpa-onnx returned no recognition result")?;
+                debug!(tokens = ?result.tokens, "Greedy fallback recognition tokens");
+                return Ok(result.text);
             }
         }
 
@@ -171,5 +149,52 @@ impl SttEngine {
             .context("sherpa-onnx returned no recognition result")?;
         debug!(tokens = ?result.tokens, "Recognition tokens");
         Ok(result.text)
+    }
+
+    /// Run `recognizer.decode()` on a background thread with a timeout.
+    ///
+    /// Returns `Ok(())` if decode completed, `Err(())` if it timed out.
+    /// On timeout the stream is NOT freed here — the caller must leak it
+    /// to keep the background thread's pointers valid.
+    fn decode_with_timeout(
+        &self,
+        stream: &sherpa_onnx::OfflineStream,
+        audio_duration_secs: f64,
+    ) -> std::result::Result<(), ()> {
+        let timeout = match self.decode_timeout {
+            Some(t) => t,
+            None => {
+                let start = Instant::now();
+                self.recognizer.decode(stream);
+                debug!("STT decode completed in {:?} ({audio_duration_secs:.1}s audio)", start.elapsed());
+                return Ok(());
+            }
+        };
+
+        let rec_ptr = &self.recognizer as *const OfflineRecognizer as usize;
+        let stream_ptr = stream as *const sherpa_onnx::OfflineStream as usize;
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let start = Instant::now();
+
+        std::thread::spawn(move || {
+            unsafe {
+                let rec = &*(rec_ptr as *const OfflineRecognizer);
+                let s = &*(stream_ptr as *const sherpa_onnx::OfflineStream);
+                rec.decode(s);
+            }
+            let _ = tx.send(());
+        });
+
+        if rx.recv_timeout(timeout).is_err() {
+            warn!(
+                "STT decode timed out after {:?} on {audio_duration_secs:.1}s audio",
+                start.elapsed()
+            );
+            return Err(());
+        }
+
+        debug!("STT decode completed in {:?} ({audio_duration_secs:.1}s audio)", start.elapsed());
+        Ok(())
     }
 }
