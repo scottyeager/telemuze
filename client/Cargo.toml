@@ -10,6 +10,10 @@ description = "Streaming transcription client for Telemuze"
 name = "telemuze-listen"
 path = "src/main.rs"
 
+[[bin]]
+name = "keyword-test"
+path = "src/bin/keyword_test.rs"
+
 [dependencies]
 # Audio capture
 cpal = "0.15"
@@ -40,6 +44,13 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# BPE tokenization for keyword spotting (pure Rust protobuf parser, no C++ linking)
+sentencepiece-model = "0.1"
+
+# Model archive extraction
+tar = "0.4"
+bzip2 = "0.5"
 
 # Utilities
 anyhow = "1"
