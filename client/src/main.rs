@@ -30,6 +30,7 @@ use tray::TrayStatus;
 
 const SAMPLE_RATE: u32 = 16_000;
 const WINDOW_SIZE: usize = 512; // sherpa-onnx Silero VAD frame size
+const VAD_RESET_SECS: u64 = 45; // Must be < buffer_size_in_seconds (60)
 
 // ── VAD defaults ───────────────────────────────────────────────────────────
 
@@ -1958,6 +1959,7 @@ fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mo
         }
         vad.detector().pop();
     }
+    vad.detector().reset();
 }
 
 // ── Socket cleanup guard ───────────────────────────────────────────────────
@@ -2167,6 +2169,7 @@ fn main() -> Result<()> {
     let mut last_speech_time: Option<Instant> = None;
     let mut utterance_audio: Vec<f32> = Vec::new();
     let mut recording_hold_until: Option<Instant> = None;
+    let mut last_vad_reset = Instant::now();
     let prefill_samples = ctx.prefill_samples;
 
     loop {
@@ -2195,6 +2198,7 @@ fn main() -> Result<()> {
                         audio_buf.clear();
                         vad_pos = 0;
                         was_detected = false;
+                        last_vad_reset = Instant::now();
                         last_speech_time = None;
                         recording_hold_until = None;
                     }
@@ -2291,10 +2295,12 @@ fn main() -> Result<()> {
                                             execute_commands(&text, &ctx);
                                             last_speech_time = Some(Instant::now());
                                             recording_hold_until = None;
-                                            // Drain processed audio so the next
-                                            // segment's prefill doesn't overlap.
+                                            // Reset VAD and drain audio so internal
+                                            // buffer doesn't accumulate across commands.
                                             audio_buf.clear();
                                             vad_pos = 0;
+                                            vad.detector().reset();
+                                            last_vad_reset = Instant::now();
                                         }
                                         ClassifyResult::Text => {
                                             // Text detected → enter dictation mode.
@@ -2312,6 +2318,7 @@ fn main() -> Result<()> {
                                             audio_buf.clear();
                                             vad_pos = 0;
                                             was_detected = false;
+                                            last_vad_reset = Instant::now();
                                             // Break out of both while loops.
                                             break;
                                         }
@@ -2335,23 +2342,32 @@ fn main() -> Result<()> {
                     }
                 }
 
-                // Prevent unbounded memory growth during silence (idle mode).
-                if mode == ListenMode::Idle
-                    && !vad.detector().detected()
-                    && vad_pos > SAMPLE_RATE as usize * 5
-                {
-                    let keep = prefill_samples.min(vad_pos);
-                    audio_buf.drain(..vad_pos - keep);
-                    vad_pos = keep;
-                    vad.detector().reset();
-                }
-
-                // In dictation mode, drain audio_buf periodically (VAD only
-                // needs recent frames, utterance_audio has the full audio).
-                if mode == ListenMode::Dictation && vad_pos > SAMPLE_RATE as usize * 5 {
+                // Prevent VAD internal buffer overflow (60s limit).
+                // One rule: always reset before VAD_RESET_SECS regardless of
+                // mode or detection state.
+                if last_vad_reset.elapsed() > Duration::from_secs(VAD_RESET_SECS) {
+                    // Drain any pending segments before resetting.
+                    vad.detector().flush();
+                    while !vad.detector().is_empty() {
+                        if mode == ListenMode::Idle {
+                            if let Some(seg) = vad.detector().front() {
+                                let samples = seg.samples().to_vec();
+                                if samples.len() >= (SAMPLE_RATE as usize / 10) {
+                                    if let ClassifyResult::Command(text) =
+                                        classify_segment(&samples, &ctx, ListenMode::Idle)
+                                    {
+                                        execute_commands(&text, &ctx);
+                                    }
+                                }
+                            }
+                        }
+                        vad.detector().pop();
+                    }
                     audio_buf.clear();
                     vad_pos = 0;
                     vad.detector().reset();
+                    last_vad_reset = Instant::now();
+                    was_detected = false;
                 }
             }
 
@@ -2367,6 +2383,7 @@ fn main() -> Result<()> {
                     last_speech_time = None;
                     recording_hold_until = None;
                     vad.switch_to_idle();
+                    last_vad_reset = Instant::now();
                     listening = false;
                     info!("Paused");
                     ctx.set_tray_status(TrayStatus::Idle);
@@ -2398,6 +2415,7 @@ fn main() -> Result<()> {
                 was_detected = false;
                 recording_hold_until = None;
                 vad.detector().reset();
+                last_vad_reset = Instant::now();
             }
 
             Ok(Event::Ipc(IpcCommand::Stop)) => {
