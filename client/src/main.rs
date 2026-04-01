@@ -1947,17 +1947,19 @@ fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mo
     // Drain any remaining VAD segments (idle mode commands).
     vad.detector().flush();
     while !vad.detector().is_empty() {
-        if let Some(seg) = vad.detector().front() {
-            if mode == ListenMode::Idle {
-                let samples = seg.samples().to_vec();
-                if samples.len() >= (SAMPLE_RATE as usize / 10) {
-                    if let ClassifyResult::Command(text) = classify_segment(&samples, ctx, ListenMode::Idle) {
-                        execute_commands(&text, ctx);
-                    }
+        let segment_data = vad.detector().front().and_then(|seg| {
+            let samples = seg.samples().to_vec();
+            (mode == ListenMode::Idle).then_some(samples)
+        });
+        vad.detector().pop();
+
+        if let Some(samples) = segment_data {
+            if samples.len() >= (SAMPLE_RATE as usize / 10) {
+                if let ClassifyResult::Command(text) = classify_segment(&samples, ctx, ListenMode::Idle) {
+                    execute_commands(&text, ctx);
                 }
             }
         }
-        vad.detector().pop();
     }
     vad.detector().reset();
 }
@@ -2266,66 +2268,68 @@ fn main() -> Result<()> {
                     was_detected = now_detected;
 
                     // ── Handle VAD segments ───────────────────────────
+                    // Safety: always drop(seg) + pop() before any reset or
+                    // mode switch to avoid use-after-free of the C segment.
                     while !vad.detector().is_empty() {
                         match mode {
                             ListenMode::Idle => {
-                                if let Some(seg) = vad.detector().front() {
-                                    let seg_start = seg.start() as usize;
-                                    let seg_samples = seg.samples().to_vec();
-
-                                    // Prepend prefill audio.
-                                    let prefill_start = seg_start.saturating_sub(prefill_samples);
-                                    let samples = if prefill_start < seg_start && prefill_start < audio_buf.len() {
-                                        let prefill_end = seg_start.min(audio_buf.len());
-                                        let mut pre = audio_buf[prefill_start..prefill_end].to_vec();
-                                        pre.extend_from_slice(&seg_samples);
-                                        pre
-                                    } else {
-                                        seg_samples
-                                    };
-
-                                    // Skip tiny segments.
-                                    if samples.len() < (SAMPLE_RATE as usize / 10) {
-                                        vad.detector().pop();
-                                        continue;
-                                    }
-
-                                    match classify_segment(&samples, &ctx, ListenMode::Idle) {
-                                        ClassifyResult::Command(text) => {
-                                            execute_commands(&text, &ctx);
-                                            last_speech_time = Some(Instant::now());
-                                            recording_hold_until = None;
-                                            // Reset VAD and drain audio so internal
-                                            // buffer doesn't accumulate across commands.
-                                            audio_buf.clear();
-                                            vad_pos = 0;
-                                            vad.detector().reset();
-                                            last_vad_reset = Instant::now();
-                                        }
-                                        ClassifyResult::Text => {
-                                            // Text detected → enter dictation mode.
-                                            // Save this segment's audio as start of utterance.
-                                            debug!("Switching to dictation mode");
-                                            utterance_audio = samples;
-                                            mode = ListenMode::Dictation;
-                                            last_speech_time = Some(Instant::now());
-                                            recording_hold_until = None;
-                                            ctx.set_tray_status(TrayStatus::Dictating);
-
-                                            // Switch VAD, keep audio flowing.
-                                            vad.detector().pop();
-                                            vad.switch_to_dictation();
-                                            audio_buf.clear();
-                                            vad_pos = 0;
-                                            was_detected = false;
-                                            last_vad_reset = Instant::now();
-                                            // Break out of both while loops.
-                                            break;
-                                        }
-                                        ClassifyResult::Empty | ClassifyResult::Error => {}
-                                    }
-                                }
+                                let segment_data = vad.detector().front().map(|seg| {
+                                    let start = seg.start() as usize;
+                                    let samples = seg.samples().to_vec();
+                                    (start, samples)
+                                });
                                 vad.detector().pop();
+
+                                let Some((seg_start, seg_samples)) = segment_data else {
+                                    continue;
+                                };
+
+                                // Prepend prefill audio.
+                                let prefill_start = seg_start.saturating_sub(prefill_samples);
+                                let samples = if prefill_start < seg_start && prefill_start < audio_buf.len() {
+                                    let prefill_end = seg_start.min(audio_buf.len());
+                                    let mut pre = audio_buf[prefill_start..prefill_end].to_vec();
+                                    pre.extend_from_slice(&seg_samples);
+                                    pre
+                                } else {
+                                    seg_samples
+                                };
+
+                                // Skip tiny segments.
+                                if samples.len() < (SAMPLE_RATE as usize / 10) {
+                                    continue;
+                                }
+
+                                match classify_segment(&samples, &ctx, ListenMode::Idle) {
+                                    ClassifyResult::Command(text) => {
+                                        execute_commands(&text, &ctx);
+                                        last_speech_time = Some(Instant::now());
+                                        recording_hold_until = None;
+                                        // Reset VAD and drain audio so internal
+                                        // buffer doesn't accumulate across commands.
+                                        audio_buf.clear();
+                                        vad_pos = 0;
+                                        vad.detector().reset();
+                                        last_vad_reset = Instant::now();
+                                    }
+                                    ClassifyResult::Text => {
+                                        // Text detected → enter dictation mode.
+                                        debug!("Switching to dictation mode");
+                                        utterance_audio = samples;
+                                        mode = ListenMode::Dictation;
+                                        last_speech_time = Some(Instant::now());
+                                        recording_hold_until = None;
+                                        ctx.set_tray_status(TrayStatus::Dictating);
+
+                                        vad.switch_to_dictation();
+                                        audio_buf.clear();
+                                        vad_pos = 0;
+                                        was_detected = false;
+                                        last_vad_reset = Instant::now();
+                                        break;
+                                    }
+                                    ClassifyResult::Empty | ClassifyResult::Error => {}
+                                }
                             }
                             ListenMode::Dictation => {
                                 // Discard VAD segments in dictation mode —
@@ -2352,6 +2356,8 @@ fn main() -> Result<()> {
                         if mode == ListenMode::Idle {
                             if let Some(seg) = vad.detector().front() {
                                 let samples = seg.samples().to_vec();
+                                drop(seg);
+                                vad.detector().pop();
                                 if samples.len() >= (SAMPLE_RATE as usize / 10) {
                                     if let ClassifyResult::Command(text) =
                                         classify_segment(&samples, &ctx, ListenMode::Idle)
@@ -2359,6 +2365,7 @@ fn main() -> Result<()> {
                                         execute_commands(&text, &ctx);
                                     }
                                 }
+                                continue;
                             }
                         }
                         vad.detector().pop();
