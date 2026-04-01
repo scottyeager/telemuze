@@ -8,10 +8,12 @@
 //! Use `toggle` to pause/resume, `flush` to force a segment boundary,
 //! and `stop` to shut down.
 
+mod config;
 mod tray;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use config::{ResolvedAliases, ResolvedConfig};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 use std::cell::Cell;
@@ -67,6 +69,15 @@ enum IpcCommand {
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
+
+    /// Path to TOML configuration file.
+    #[arg(long, env = "TELEMUZE_CONFIG")]
+    config: Option<PathBuf>,
+
+    /// Print the full resolved configuration as TOML (with comments) and exit.
+    /// Reads the current config file, fills in any missing options with defaults.
+    #[arg(long)]
+    dump_config: bool,
 
     /// Telemuze server URL
     #[arg(long, env = "TELEMUZE_URL", default_value = "http://127.0.0.1:7313")]
@@ -310,48 +321,55 @@ struct AppContext {
     min_dictation_words: usize,
     dump_audio_dir: Option<PathBuf>,
     dump_audio_counter: AtomicU32,
+    /// Voice command trigger aliases (from config file or defaults).
+    aliases: ResolvedAliases,
+    /// Modifier key mappings (spoken word → canonical name).
+    modifiers: Vec<(String, String)>,
 }
 
 impl AppContext {
-    fn new(cli: &Cli) -> Self {
-        let base_url = cli.url.trim_end_matches('/');
-        let endpoint_url = if cli.smart {
+    fn new(cfg: ResolvedConfig) -> Self {
+        let base_url = cfg.url.trim_end_matches('/');
+        let endpoint_url = if cfg.smart {
             format!("{base_url}/v1/dictate/smart")
         } else {
             format!("{base_url}/v1/audio/transcriptions")
         };
 
-        let display_server = cli
+        let display_server = cfg
             .display_server
-            .clone()
             .unwrap_or_else(detect_display_server);
+
+        let command_hotwords = build_command_hotwords(&cfg.aliases, &cfg.modifiers);
 
         Self {
             http_client: reqwest::blocking::Client::new(),
             endpoint_url,
-            smart: cli.smart,
-            type_text: cli.type_text,
-            notify: cli.notify,
-            sound: cli.sound,
-            continuation_lowercase: cli.continuation_lowercase,
-            scroll_ticks: cli.scroll_ticks,
-            prefill_samples: (cli.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
-            dictation_silence_secs: cli.dictation_silence,
-            lowercase_timeout_secs: cli.lowercase_timeout,
-            dictation_max_speech_samples: (cli.dictation_max_speech * SAMPLE_RATE as f32) as usize,
+            smart: cfg.smart,
+            type_text: cfg.type_text,
+            notify: cfg.notify,
+            sound: cfg.sound,
+            continuation_lowercase: cfg.continuation_lowercase,
+            scroll_ticks: cfg.scroll_ticks,
+            prefill_samples: (cfg.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
+            dictation_silence_secs: cfg.dictation_silence,
+            lowercase_timeout_secs: cfg.lowercase_timeout,
+            dictation_max_speech_samples: (cfg.dictation_max_speech * SAMPLE_RATE as f32) as usize,
             last_ended_with_punctuation: Cell::new(true),
             last_output_time: Cell::new(None),
             last_typed_chars: Cell::new(0),
             display_server,
             notify_id: Cell::new(0),
             tray_handle: None,
-            command_hotwords: command_hotwords(),
-            command_hotwords_score: cli.command_hotwords_score,
-            dictation_hotwords: cli.hotwords.clone(),
-            dictation_hotwords_score: cli.dictation_hotwords_score,
-            min_dictation_words: cli.min_dictation_words,
-            dump_audio_dir: cli.dump_audio.clone(),
+            command_hotwords,
+            command_hotwords_score: cfg.command_hotwords_score,
+            dictation_hotwords: cfg.hotwords,
+            dictation_hotwords_score: cfg.dictation_hotwords_score,
+            min_dictation_words: cfg.min_dictation_words,
+            dump_audio_dir: cfg.dump_audio,
             dump_audio_counter: AtomicU32::new(0),
+            aliases: cfg.aliases,
+            modifiers: cfg.modifiers,
         }
     }
 
@@ -555,28 +573,12 @@ fn scroll(up: bool, ticks: u32) {
 
 // ── Voice commands ──────────────────────────────────────────────────────
 
-/// Alternate trigger phrases for "slash command" (multi-word, used by find_slash_command).
-const SLASH_TRIGGERS: &[&[&str]] = &[
-    &["slash", "command"],
-    &["flash", "command"],
-    &["splash", "command"],
-];
-
-/// Alternate trigger words for "click".
-const CLICK_TRIGGERS: &[&str] = &["click", "look", "lick"];
-
-/// Alternate trigger words for "press".
-const PRESS_TRIGGERS: &[&str] = &["press"];
-
-/// Alternate trigger words for "scroll".
-const SCROLL_TRIGGERS: &[&str] = &["scroll"];
-
 /// Find the earliest occurrence of any trigger word from `triggers` in
 /// `haystack[search_start..]`.  Returns `(position_relative_to_search_start, matched_len)`.
-fn find_any_trigger(haystack: &str, search_start: usize, triggers: &[&str]) -> Option<(usize, usize)> {
+fn find_any_trigger(haystack: &str, search_start: usize, triggers: &[String]) -> Option<(usize, usize)> {
     let mut best: Option<(usize, usize)> = None;
-    for &trigger in triggers {
-        if let Some(p) = haystack[search_start..].find(trigger) {
+    for trigger in triggers {
+        if let Some(p) = haystack[search_start..].find(trigger.as_str()) {
             if best.as_ref().is_none_or(|&(bp, _)| p < bp) {
                 best = Some((p, trigger.len()));
             }
@@ -661,34 +663,35 @@ enum TextAction<'a> {
 /// Build a comma-separated hotwords string from the command vocabulary.
 /// These are all words that might appear in voice commands, used to boost
 /// recognition accuracy when we don't yet know if an utterance is a command.
-fn command_hotwords() -> String {
-    let mut words: Vec<&str> = Vec::new();
+fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, String)]) -> String {
+    let mut words: Vec<String> = Vec::new();
 
     // Command trigger keywords (canonical + aliases)
-    words.extend_from_slice(&["press", "click", "scroll", "slash", "command", "undo"]);
-    words.extend_from_slice(CLICK_TRIGGERS);
-    words.extend_from_slice(PRESS_TRIGGERS);
-    words.extend_from_slice(SCROLL_TRIGGERS);
-    for trigger in SLASH_TRIGGERS {
-        words.extend_from_slice(trigger);
+    words.extend(["press", "click", "scroll", "slash", "command", "undo"].iter().map(|s| s.to_string()));
+    words.extend(aliases.click.iter().cloned());
+    words.extend(aliases.press.iter().cloned());
+    words.extend(aliases.scroll.iter().cloned());
+    words.extend(aliases.undo.iter().cloned());
+    for trigger in &aliases.slash_command {
+        words.extend(trigger.iter().cloned());
     }
 
     // Click quadrant words
-    words.extend_from_slice(&["upper", "lower", "left", "right"]);
+    words.extend(["upper", "lower", "left", "right"].iter().map(|s| s.to_string()));
 
     // Scroll directions
-    words.extend_from_slice(&["up", "down", "top", "bottom"]);
+    words.extend(["up", "down", "top", "bottom"].iter().map(|s| s.to_string()));
 
     // Key names (named keys only; single letters are too ambiguous)
-    words.extend_from_slice(&[
+    words.extend([
         "enter", "return", "tab", "space", "backspace", "delete",
         "escape", "home", "end",
-    ]);
+    ].iter().map(|s| s.to_string()));
 
     // Modifier keys
-    words.extend_from_slice(&[
-        "control", "ctrl", "shift", "alt", "super", "meta",
-    ]);
+    for (alias, _) in modifiers {
+        words.push(alias.clone());
+    }
 
     // Deduplicate (some words appear in multiple roles, e.g. "left", "right", "up", "down")
     words.sort_unstable();
@@ -719,11 +722,11 @@ fn command_hotwords() -> String {
     ];
 
     // Add alias phrases for slash command triggers
-    for trigger in SLASH_TRIGGERS {
+    for trigger in &aliases.slash_command {
         phrases.push(trigger.join(" "));
     }
     // Add alias phrases for click quadrant commands
-    for &trigger in CLICK_TRIGGERS {
+    for trigger in &aliases.click {
         for dir in &["upper left", "upper right", "lower left", "lower right"] {
             phrases.push(format!("{trigger} {dir}"));
         }
@@ -732,8 +735,8 @@ fn command_hotwords() -> String {
     phrases.sort();
     phrases.dedup();
 
-    let mut all: Vec<&str> = words;
-    all.extend(phrases.iter().map(|s| s.as_str()));
+    let mut all = words;
+    all.extend(phrases);
     all.join(",")
 }
 
@@ -746,10 +749,11 @@ fn has_word_chars(s: &str) -> bool {
 /// Try to find "slash command <word>" at position `from` in `lower`.
 /// Returns `(start, end, slash_word)` where `slash_word` is the captured word
 /// lowercased with a leading `/`.
-fn find_slash_command(lower: &str, from: usize) -> Option<(usize, usize, String)> {
+fn find_slash_command(lower: &str, from: usize, slash_triggers: &[Vec<String>]) -> Option<(usize, usize, String)> {
     let mut best: Option<(usize, usize, String)> = None;
-    for trigger in SLASH_TRIGGERS {
-        if let Some((start, end)) = find_phrase(lower, from, trigger) {
+    for trigger in slash_triggers {
+        let trigger_refs: Vec<&str> = trigger.iter().map(|s| s.as_str()).collect();
+        if let Some((start, end)) = find_phrase(lower, from, &trigger_refs) {
             if best.as_ref().is_none_or(|b| start < b.0) {
                 // Skip whitespace/punctuation after the trigger phrase
                 let rest = &lower[end..];
@@ -856,11 +860,11 @@ fn parse_spoken_number(words: &[&str], word_idx: usize) -> Option<(u32, usize)> 
 
 /// Try to find "click <number> <number>" in `lower` starting from `from`.
 /// Returns (start_byte, end_byte, x, y) or None.
-fn find_click_coordinate(lower: &str, from: usize) -> Option<(usize, usize, u32, u32)> {
+fn find_click_coordinate(lower: &str, from: usize, click_triggers: &[String]) -> Option<(usize, usize, u32, u32)> {
     let haystack = &lower[from..];
 
     let mut search_start = 0;
-    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, CLICK_TRIGGERS) {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, click_triggers) {
         let click_start = from + search_start + p;
         let after_click = click_start + matched_len;
 
@@ -911,34 +915,23 @@ fn find_click_coordinate(lower: &str, from: usize) -> Option<(usize, usize, u32,
     None
 }
 
-/// Modifier names the user might say, mapped to the xdotool/wtype name.
-const MODIFIER_ALIASES: &[(&str, &str)] = &[
-    ("control", "ctrl"),
-    ("ctrl", "ctrl"),
-    ("shift", "shift"),
-    ("alt", "alt"),
-    ("super", "super"),
-    ("command", "super"),
-    ("meta", "super"),
-];
-
 /// Try to find "press <modifier> <key>" in `lower` starting from `from`.
 /// Supports any modifier (ctrl, shift, alt, super) and recognises single
 /// letters a–z plus common named keys.  "press" is required.
 /// Returns (start_byte, end_byte, VoiceAction) or None.
-fn find_modified_key(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> {
+fn find_modified_key(lower: &str, from: usize, press_triggers: &[String], modifiers: &[(String, String)]) -> Option<(usize, usize, VoiceAction)> {
     let haystack = &lower[from..];
     let mut best: Option<(usize, usize, VoiceAction)> = None;
 
     // Scan for "press" (or aliases) — then check if the next word is a modifier
     let mut search_start = 0;
-    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, PRESS_TRIGGERS) {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, press_triggers) {
         let press_start = from + search_start + p;
         let after_press = press_start + matched_len;
 
         // The word after "press" must be a modifier alias
         if let Some((modifier_word, mod_word_end)) = next_word(lower, after_press) {
-            if let Some(canonical) = modifier_canonical(modifier_word) {
+            if let Some(canonical) = modifier_canonical(modifier_word, modifiers) {
                 // The word after the modifier must be a key name
                 if let Some((key_name, word_end)) = next_key_word(lower, mod_word_end) {
                     let candidate = (
@@ -964,12 +957,12 @@ fn find_modified_key(lower: &str, from: usize) -> Option<(usize, usize, VoiceAct
 
 /// Try to find "press <key>" (without a modifier) in `lower` starting from
 /// `from`.  Returns (start_byte, end_byte, VoiceAction) or None.
-fn find_key_press(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> {
+fn find_key_press(lower: &str, from: usize, press_triggers: &[String]) -> Option<(usize, usize, VoiceAction)> {
     let haystack = &lower[from..];
     let mut best: Option<(usize, usize, VoiceAction)> = None;
 
     let mut search_start = 0;
-    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, PRESS_TRIGGERS) {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, press_triggers) {
         let press_start = from + search_start + p;
         let after_press = press_start + matched_len;
 
@@ -1043,11 +1036,11 @@ fn next_word(lower: &str, pos: usize) -> Option<(&str, usize)> {
 }
 
 /// If `word` is a modifier alias, return its canonical xdotool/wtype name.
-fn modifier_canonical(word: &str) -> Option<&'static str> {
-    MODIFIER_ALIASES
+fn modifier_canonical<'a>(word: &str, modifiers: &'a [(String, String)]) -> Option<&'a str> {
+    modifiers
         .iter()
-        .find(|&&(alias, _)| alias == word)
-        .map(|&(_, canonical)| canonical)
+        .find(|(alias, _)| alias == word)
+        .map(|(_, canonical)| canonical.as_str())
 }
 
 fn is_separator(c: char) -> bool {
@@ -1092,12 +1085,12 @@ fn key_name(word: &str) -> Option<&'static str> {
 /// from `from`.  Repeated direction words multiply the scroll count.
 /// "top" and "bottom" scroll 100 repeats in the respective direction.
 /// Returns (start_byte, end_byte, VoiceAction) or None.
-fn find_scroll(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> {
+fn find_scroll(lower: &str, from: usize, scroll_triggers: &[String]) -> Option<(usize, usize, VoiceAction)> {
     let haystack = &lower[from..];
     let mut best: Option<(usize, usize, VoiceAction)> = None;
 
     let mut search_start = 0;
-    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, SCROLL_TRIGGERS) {
+    while let Some((p, matched_len)) = find_any_trigger(haystack, search_start, scroll_triggers) {
         let scroll_start = from + search_start + p;
         let after_scroll = scroll_start + matched_len;
 
@@ -1185,19 +1178,19 @@ fn find_scroll(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> 
     best
 }
 
-/// Returns true when the entire segment is the word "undo" (possibly followed
-/// by punctuation), e.g. "Undo", "undo.", "Undo!".
-fn is_undo_command(text: &str) -> bool {
+/// Returns true when the entire segment matches one of the undo triggers
+/// (possibly followed by punctuation), e.g. "Undo", "undo.", "Undo!".
+fn is_undo_command(text: &str, undo_triggers: &[String]) -> bool {
     let stripped: String = text
         .chars()
         .filter(|c| !c.is_whitespace() && !matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"'))
         .collect();
-    stripped.eq_ignore_ascii_case("undo")
+    undo_triggers.iter().any(|t| stripped.eq_ignore_ascii_case(t))
 }
 
 /// Scan `text` for voice command phrases (case-insensitive, tolerant of
 /// punctuation between words) and split into text segments and command actions.
-fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
+fn process_voice_commands<'a>(text: &'a str, ctx: &AppContext) -> Vec<TextAction<'a>> {
     let lower = text.to_lowercase();
     let commands = voice_commands();
     let mut actions: Vec<TextAction<'_>> = Vec::new();
@@ -1228,9 +1221,9 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
 
         // Static commands (click quadrant) — try each click alias
         for cmd in commands {
-            for &trigger in CLICK_TRIGGERS {
+            for trigger in &ctx.aliases.click {
                 let mut words: Vec<&str> = cmd.words.to_vec();
-                words[0] = trigger;
+                words[0] = trigger.as_str();
                 if let Some((start, end)) = find_phrase(&lower, cursor, &words) {
                     if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                         best = Some((start, end, cmd.action.clone()));
@@ -1240,28 +1233,28 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
         }
 
         // "scroll up/down/top/bottom [up/down...]" dynamic command
-        if let Some((start, end, action)) = find_scroll(&lower, cursor) {
+        if let Some((start, end, action)) = find_scroll(&lower, cursor, &ctx.aliases.scroll) {
             if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, action));
             }
         }
 
         // "click <number> <number>" coordinate command
-        if let Some((start, end, x, y)) = find_click_coordinate(&lower, cursor) {
+        if let Some((start, end, x, y)) = find_click_coordinate(&lower, cursor, &ctx.aliases.click) {
             if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, VoiceAction::ClickCoordinate { x, y }));
             }
         }
 
         // "[press] <modifier> <key>" dynamic command
-        if let Some((start, end, action)) = find_modified_key(&lower, cursor) {
+        if let Some((start, end, action)) = find_modified_key(&lower, cursor, &ctx.aliases.press, &ctx.modifiers) {
             if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, action));
             }
         }
 
         // "press <key>" (unmodified) dynamic command
-        if let Some((start, end, action)) = find_key_press(&lower, cursor) {
+        if let Some((start, end, action)) = find_key_press(&lower, cursor, &ctx.aliases.press) {
             if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, action));
             }
@@ -1269,7 +1262,7 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
 
         // "slash command <word>" at the very beginning of the text
         let slash = if cursor == 0 {
-            find_slash_command(&lower, 0)
+            find_slash_command(&lower, 0, &ctx.aliases.slash_command)
                 .filter(|(start, ..)| !has_word_chars(&text[..*start]))
         } else {
             None
@@ -1301,7 +1294,7 @@ fn process_voice_commands(text: &str) -> Vec<TextAction<'_>> {
                 loop {
                     // Try modifier+key first (e.g. "control c")
                     if let Some((mod_word, mod_end)) = next_word(&lower, cursor) {
-                        if let Some(canonical) = modifier_canonical(mod_word) {
+                        if let Some(canonical) = modifier_canonical(mod_word, &ctx.modifiers) {
                             if let Some((kn, key_end)) = next_key_word(&lower, mod_end) {
                                 actions.push(TextAction::Command(VoiceAction::ModifiedKey {
                                     modifiers: vec![canonical.into()],
@@ -1663,12 +1656,12 @@ fn classify_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Clas
     finish_segment_ui(ctx, mode);
 
     // Undo is a special command not handled by process_voice_commands.
-    if is_undo_command(&text) {
+    if is_undo_command(&text, &ctx.aliases.undo) {
         return ClassifyResult::Command(text);
     }
 
     // Check if the text starts with a command keyword.
-    let actions = process_voice_commands(&text);
+    let actions = process_voice_commands(&text, ctx);
     let has_text = actions.iter().any(|a| matches!(a, TextAction::Text(_) | TextAction::OwnedText(_)));
 
     if has_text {
@@ -1680,7 +1673,7 @@ fn classify_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Clas
 
 /// Execute voice commands from a transcription (used in idle mode).
 fn execute_commands(text: &str, ctx: &AppContext) {
-    if is_undo_command(text) {
+    if is_undo_command(text, &ctx.aliases.undo) {
         let n = ctx.last_typed_chars.get();
         if n > 0 && ctx.type_text {
             debug!(count = n, "Sending undo backspaces");
@@ -1694,7 +1687,7 @@ fn execute_commands(text: &str, ctx: &AppContext) {
         return;
     }
 
-    let actions = process_voice_commands(text);
+    let actions = process_voice_commands(text, ctx);
     debug!(?actions, "Parsed voice actions");
 
     let mut just_typed = false;
@@ -1836,7 +1829,7 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
     ctx.last_output_time.set(Some(Instant::now()));
 
     // In dictation mode, output all text (commands at start are still processed).
-    let actions = process_voice_commands(&text);
+    let actions = process_voice_commands(&text, ctx);
     debug!(?actions, "Parsed dictation actions");
 
     let mut just_typed = false;
@@ -1991,7 +1984,8 @@ impl Drop for SocketGuard<'_> {
 // ── Main ───────────────────────────────────────────────────────────────────
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)?;
 
     // Handle subcommands that send IPC to a running daemon
     match &cli.command {
@@ -2001,12 +1995,20 @@ fn main() -> Result<()> {
         None => {} // Start the daemon
     }
 
+    // Merge config file + CLI args
+    let (cfg, config_path) = config::resolve(&cli, &matches)?;
+
+    if cli.dump_config {
+        print!("{}", config::dump(&cfg));
+        return Ok(());
+    }
+
     // ── Logging ───────────────────────────────────────────────────────
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| {
-                    if cli.verbose {
+                    if cfg.verbose {
                         "telemuze_listen=debug".into()
                     } else {
                         "telemuze_listen=info".into()
@@ -2015,15 +2017,29 @@ fn main() -> Result<()> {
         )
         .init();
 
+    if let Some(path) = &config_path {
+        info!(path = %path.display(), "Loaded config");
+    }
+
     // ── Start the daemon ───────────────────────────────────────────────
 
+    let socket_path = cfg.socket.clone();
+    let paused = cfg.paused;
+    let tray_enabled = cfg.tray;
+    let vad_model_path = cfg.vad_model_path.clone();
+    let vad_threshold = cfg.vad_threshold;
+    let idle_silence = cfg.idle_silence;
+    let dictation_silence = cfg.dictation_silence;
+    let min_speech = cfg.min_speech;
+    let max_speech = cfg.max_speech;
+
     // Clean up stale socket
-    let _ = std::fs::remove_file(&cli.socket);
+    let _ = std::fs::remove_file(&socket_path);
 
-    let listener = UnixListener::bind(&cli.socket)
-        .with_context(|| format!("Failed to bind socket: {}", cli.socket))?;
+    let listener = UnixListener::bind(&socket_path)
+        .with_context(|| format!("Failed to bind socket: {}", socket_path))?;
 
-    let mut ctx = AppContext::new(&cli);
+    let mut ctx = AppContext::new(cfg);
 
     if let Some(dir) = &ctx.dump_audio_dir {
         std::fs::create_dir_all(dir)
@@ -2035,8 +2051,8 @@ fn main() -> Result<()> {
     let (tx, rx) = mpsc::sync_channel::<Event>(64);
 
     // Spawn system tray if requested
-    if cli.tray {
-        let initial = if cli.paused {
+    if tray_enabled {
+        let initial = if paused {
             TrayStatus::Idle
         } else {
             TrayStatus::Listening
@@ -2049,7 +2065,7 @@ fn main() -> Result<()> {
 
     // Socket cleanup on exit
     let _guard = SocketGuard {
-        path: &cli.socket,
+        path: &socket_path,
         notify_id: &ctx.notify_id,
         notify: ctx.notify,
         tray_handle: ctx.tray_handle.clone(),
@@ -2062,7 +2078,7 @@ fn main() -> Result<()> {
     spawn_signal_handler(tx.clone());
 
     // Resolve VAD model path
-    let vad_path = match &cli.vad_model_path {
+    let vad_path = match &vad_model_path {
         Some(p) => std::path::PathBuf::from(p),
         None => {
             let default = dirs_next::data_dir()
@@ -2080,16 +2096,16 @@ fn main() -> Result<()> {
     // Build VAD configs for each mode.
     let idle_vad_config = make_vad_config(
         &vad_path_str,
-        cli.vad_threshold,
-        cli.idle_silence,
-        cli.min_speech,
-        cli.max_speech,
+        vad_threshold,
+        idle_silence,
+        min_speech,
+        max_speech,
     );
     let dictation_vad_config = make_vad_config(
         &vad_path_str,
-        cli.vad_threshold,
-        cli.dictation_silence,
-        cli.min_speech,
+        vad_threshold,
+        dictation_silence,
+        min_speech,
         DEFAULT_DICTATION_MAX_SPEECH,
     );
 
@@ -2125,7 +2141,7 @@ fn main() -> Result<()> {
         )
         .context("Failed to build audio input stream")?;
 
-    let mut listening = !cli.paused;
+    let mut listening = !paused;
     if listening {
         stream.play().context("Failed to start audio stream")?;
     }
