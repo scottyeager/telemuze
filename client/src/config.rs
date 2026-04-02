@@ -40,6 +40,14 @@ pub struct FileConfig {
     pub scroll_ticks: Option<u32>,
     pub dump_audio: Option<PathBuf>,
 
+    // ── Keyword spotting ──────────────────────────────────────────────────
+    pub no_kws: Option<bool>,
+    pub kws_model_dir: Option<PathBuf>,
+    pub kws_threshold: Option<f32>,
+    pub kws_score: Option<f32>,
+    pub kws_threads: Option<i32>,
+    pub kws_timeout: Option<f32>,
+
     #[serde(default)]
     pub aliases: AliasConfig,
 
@@ -87,6 +95,12 @@ pub struct ResolvedConfig {
     pub paused: bool,
     pub scroll_ticks: u32,
     pub dump_audio: Option<PathBuf>,
+    pub no_kws: bool,
+    pub kws_model_dir: Option<PathBuf>,
+    pub kws_threshold: f32,
+    pub kws_score: f32,
+    pub kws_threads: i32,
+    pub kws_timeout: f32,
     pub aliases: ResolvedAliases,
     pub modifiers: Vec<(String, String)>,
 }
@@ -104,7 +118,7 @@ pub struct ResolvedAliases {
 // ── Default aliases (match the previously hardcoded consts) ──────────────
 
 fn default_click() -> Vec<String> {
-    vec!["click".into(), "look".into(), "lick".into()]
+    vec!["mouse".into(), "click".into(), "look".into(), "lick".into()]
 }
 
 fn default_press() -> Vec<String> {
@@ -324,6 +338,37 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     }
     line("");
 
+    line("# ── Keyword spotting ─────────────────────────────────────────────────────");
+    line("# Disable keyword spotting and fall back to server-side command classification.");
+    line("# Options: true | false");
+    line(&format!("no-kws = {}", cfg.no_kws));
+    line("");
+
+    line("# Path to KWS model directory. Auto-downloads if omitted.");
+    match &cfg.kws_model_dir {
+        Some(p) => line(&format!("kws-model-dir = \"{}\"", p.display())),
+        None => line("# kws-model-dir = \"/path/to/kws-model\""),
+    }
+    line("");
+
+    line("# Keyword detection threshold (lower = more sensitive, higher = fewer false positives).");
+    line("# Range: 0.0–1.0");
+    line(&format!("kws-threshold = {}", cfg.kws_threshold));
+    line("");
+
+    line("# Keyword boost score.");
+    line(&format!("kws-score = {}", cfg.kws_score));
+    line("");
+
+    line("# Number of threads for the KWS model.");
+    line(&format!("kws-threads = {}", cfg.kws_threads));
+    line("");
+
+    line("# Seconds to wait for keyword detection after VAD speech onset");
+    line("# before falling through to dictation mode.");
+    line(&format!("kws-timeout = {}", cfg.kws_timeout));
+    line("");
+
     line("# ── Voice command trigger aliases ────────────────────────────────────────");
     line("# Each key maps a command type to alternate spoken words that trigger it.");
     line("# The STT model sometimes mishears these words, so add common misrecognitions.");
@@ -459,6 +504,12 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         paused: r_bool!(paused, "paused"),
         scroll_ticks: r!(scroll_ticks, "scroll-ticks"),
         dump_audio: r_opt!(dump_audio, "dump-audio"),
+        no_kws: r_bool!(no_kws, "no-kws"),
+        kws_model_dir: r_opt!(kws_model_dir, "kws-model-dir"),
+        kws_threshold: r!(kws_threshold, "kws-threshold"),
+        kws_score: r!(kws_score, "kws-score"),
+        kws_threads: r!(kws_threads, "kws-threads"),
+        kws_timeout: r!(kws_timeout, "kws-timeout"),
         aliases,
         modifiers,
     }, config_path))

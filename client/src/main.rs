@@ -9,6 +9,7 @@
 //! and `stop` to shut down.
 
 mod config;
+mod kws;
 mod tray;
 
 use anyhow::{Context, Result};
@@ -45,6 +46,13 @@ const DEFAULT_LOWERCASE_TIMEOUT: f32 = 5.0;
 
 const DEFAULT_SCROLL_TICKS: u32 = 5;
 const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
+
+// ── KWS defaults ──────────────────────────────────────────────────────────
+
+const DEFAULT_KWS_THRESHOLD: f32 = 0.25;
+const DEFAULT_KWS_SCORE: f32 = 1.0;
+const DEFAULT_KWS_THREADS: i32 = 2;
+const DEFAULT_KWS_TIMEOUT: f32 = 1.0;
 
 // ── Event types ────────────────────────────────────────────────────────────
 
@@ -188,6 +196,33 @@ struct Cli {
     /// Enable verbose logging (parsed actions, key injection details).
     #[arg(long, short, env = "TELEMUZE_VERBOSE")]
     verbose: bool,
+
+    // ── Keyword spotting ──────────────────────────────────────────────────
+
+    /// Disable keyword spotting (fall back to server-side classification).
+    #[arg(long)]
+    no_kws: bool,
+
+    /// Path to KWS model directory (auto-downloads if omitted).
+    #[arg(long, env = "TELEMUZE_KWS_MODEL_DIR")]
+    kws_model_dir: Option<PathBuf>,
+
+    /// Keyword detection threshold (0.0–1.0). Lower = more sensitive.
+    #[arg(long, default_value_t = DEFAULT_KWS_THRESHOLD)]
+    kws_threshold: f32,
+
+    /// Keyword boost score.
+    #[arg(long, default_value_t = DEFAULT_KWS_SCORE)]
+    kws_score: f32,
+
+    /// Number of threads for the KWS model.
+    #[arg(long, default_value_t = DEFAULT_KWS_THREADS)]
+    kws_threads: i32,
+
+    /// Seconds to wait for keyword detection after VAD speech onset before
+    /// falling through to dictation mode.
+    #[arg(long, default_value_t = DEFAULT_KWS_TIMEOUT)]
+    kws_timeout: f32,
 }
 
 #[derive(Subcommand)]
@@ -739,6 +774,37 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     let mut all = words;
     all.extend(phrases);
     all.join(",")
+}
+
+/// Build a comma-separated keywords string for the KeywordSpotter.
+/// Only trigger words are included — the KWS just identifies the command type.
+fn build_kws_keywords(aliases: &ResolvedAliases) -> String {
+    let mut keywords: Vec<String> = Vec::new();
+
+    // Click/mouse trigger aliases
+    for alias in &aliases.click {
+        keywords.push(alias.clone());
+    }
+    // Press trigger aliases
+    for alias in &aliases.press {
+        keywords.push(alias.clone());
+    }
+    // Scroll trigger aliases
+    for alias in &aliases.scroll {
+        keywords.push(alias.clone());
+    }
+    // Undo trigger aliases
+    for alias in &aliases.undo {
+        keywords.push(alias.clone());
+    }
+    // Slash command trigger phrases
+    for trigger in &aliases.slash_command {
+        keywords.push(trigger.join(" "));
+    }
+
+    keywords.sort();
+    keywords.dedup();
+    keywords.join(",")
 }
 
 /// Returns true if `s` contains at least one alphanumeric character (i.e. is
@@ -1754,6 +1820,300 @@ fn execute_commands(text: &str, ctx: &AppContext) {
     }
 }
 
+/// Execute undo directly (used by KWS when it detects "undo").
+fn execute_undo(ctx: &AppContext) {
+    let n = ctx.last_typed_chars.get();
+    if n > 0 && ctx.type_text {
+        debug!(count = n, "Sending undo backspaces");
+        for _ in 0..n {
+            send_key("BackSpace", &ctx.display_server);
+        }
+        ctx.last_typed_chars.set(0);
+    } else if !ctx.type_text {
+        println!("[undo]");
+    }
+}
+
+/// Send a command segment to the server for STT and return the text.
+/// Used after KWS has identified the segment as a command.
+fn transcribe_command_segment(samples: &[f32], ctx: &AppContext) -> Option<String> {
+    let duration_secs = samples.len() as f64 / SAMPLE_RATE as f64;
+    info!(duration_secs, "Transcribing command segment");
+
+    ctx.set_tray_status(TrayStatus::Processing);
+
+    let wav = match encode_wav(samples) {
+        Ok(w) => w,
+        Err(e) => {
+            error!("WAV encode failed: {e}");
+            return None;
+        }
+    };
+    ctx.maybe_dump_wav(&wav, "kws_cmd");
+
+    let text = match send_to_server(
+        &ctx.http_client,
+        &ctx.endpoint_url,
+        wav,
+        ctx.smart,
+        Some(&ctx.command_hotwords),
+        ctx.command_hotwords_score,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("Command transcription failed: {e}");
+            if ctx.sound {
+                play_sound("dialog-error");
+            }
+            return None;
+        }
+    };
+
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        info!("Command transcription returned empty");
+        return None;
+    }
+
+    info!(text = %text, "Command transcription result");
+    Some(text)
+}
+
+/// Execute a command identified by KWS keyword label + STT transcription text.
+/// Skips the trigger word(s) from the STT text and parses parameters.
+fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
+    let lower = stt_text.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    debug!(keyword, text = stt_text, "Executing KWS command");
+
+    // Determine how many trigger words to skip from the STT response
+    let skip = match keyword {
+        "slash_command" | "flash_command" | "splash_command" => 2,
+        _ => 1, // mouse, press, scroll, undo
+    };
+
+    let params: Vec<&str> = words.iter().skip(skip).copied().collect();
+    let params_str = params.join(" ");
+
+    match keyword {
+        "mouse" | "click" | "look" | "lick" => {
+            // Try quadrant: "upper left", "upper right", "lower left", "lower right"
+            let (right, bottom) = match params_str.as_str() {
+                s if s.contains("upper") && s.contains("left") => (false, false),
+                s if s.contains("upper") && s.contains("right") => (true, false),
+                s if s.contains("lower") && s.contains("left") => (false, true),
+                s if s.contains("lower") && s.contains("right") => (true, true),
+                _ => {
+                    // Try coordinate: two numbers
+                    if params.len() >= 2 {
+                        if let (Some(x), Some(y)) = (
+                            parse_spoken_number_simple(&params, 0),
+                            parse_spoken_number_simple(&params, 1),
+                        ) {
+                            if ctx.type_text {
+                                click_coordinate(x, y);
+                            } else {
+                                println!("[click {x} {y}]");
+                            }
+                            if ctx.sound {
+                                play_sound("message-new-instant");
+                            }
+                            return;
+                        }
+                    }
+                    debug!(params = ?params, "Could not parse click parameters");
+                    return;
+                }
+            };
+            if ctx.type_text {
+                click_quadrant(right, bottom);
+            } else {
+                let h = if right { "right" } else { "left" };
+                let v = if bottom { "lower" } else { "upper" };
+                println!("[click {v} {h}]");
+            }
+            if ctx.sound {
+                play_sound("message-new-instant");
+            }
+        }
+        "press" => {
+            // Parse key names and modifiers from params
+            if params.is_empty() {
+                debug!("No key specified after 'press'");
+                return;
+            }
+            execute_press_params(&params, ctx);
+        }
+        "scroll" => {
+            if params.is_empty() {
+                debug!("No direction specified after 'scroll'");
+                return;
+            }
+            let mut up: Option<bool> = None;
+            let mut repeats: u32 = 0;
+            for word in &params {
+                match *word {
+                    "up" => {
+                        if up == Some(false) { break; }
+                        up = Some(true);
+                        repeats += 1;
+                    }
+                    "down" => {
+                        if up == Some(true) { break; }
+                        up = Some(false);
+                        repeats += 1;
+                    }
+                    "top" => {
+                        up = Some(true);
+                        repeats = 100;
+                        break;
+                    }
+                    "bottom" => {
+                        up = Some(false);
+                        repeats = 100;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            if let Some(is_up) = up {
+                let action = VoiceAction::Scroll { up: is_up, repeats };
+                execute_voice_action(&action, ctx);
+                if ctx.sound {
+                    play_sound("message-new-instant");
+                }
+            } else {
+                debug!("Could not parse scroll direction from: {params_str}");
+            }
+        }
+        "slash_command" | "flash_command" | "splash_command" => {
+            if params.is_empty() {
+                debug!("No command name after 'slash command'");
+                return;
+            }
+            let cmd_name = params[0];
+            let slash_text = format!("/{cmd_name}");
+            if ctx.type_text {
+                type_into_window(&slash_text, &ctx.display_server);
+                ctx.last_typed_chars.set(slash_text.len());
+            } else {
+                println!("{slash_text}");
+            }
+            if ctx.sound {
+                play_sound("message-new-instant");
+            }
+        }
+        "undo" => {
+            execute_undo(ctx);
+        }
+        _ => {
+            debug!(keyword, "Unknown KWS keyword label");
+        }
+    }
+}
+
+/// Parse a simple number from a word (digit string or spoken word).
+fn parse_spoken_number_simple(words: &[&str], idx: usize) -> Option<u32> {
+    let word = words.get(idx)?;
+    // Try direct digit parse first
+    if let Ok(n) = word.parse::<u32>() {
+        return Some(n);
+    }
+    // Fall back to spoken number words
+    parse_number_word(word)
+}
+
+/// Execute a "press" command with parsed parameter words.
+fn execute_press_params(params: &[&str], ctx: &AppContext) {
+    let mut i = 0;
+    let mut first = true;
+    while i < params.len() {
+        // Check for modifier+key
+        if let Some(canonical) = modifier_canonical(params[i], &ctx.modifiers) {
+            if i + 1 < params.len() {
+                if let Some(key) = key_name(params[i + 1]) {
+                    let action = VoiceAction::ModifiedKey {
+                        modifiers: vec![canonical.into()],
+                        key: key.into(),
+                    };
+                    execute_voice_action_with_delay(&action, ctx, !first);
+                    first = false;
+                    i += 2;
+                    continue;
+                }
+            }
+        }
+        // Check for plain key name
+        if let Some(key) = key_name(params[i]) {
+            let action = VoiceAction::Key(key.into());
+            execute_voice_action_with_delay(&action, ctx, !first);
+            first = false;
+            i += 1;
+            continue;
+        }
+        // Unrecognized word — stop parsing
+        break;
+    }
+    if first {
+        debug!(params = ?params, "Could not parse any key names from press params");
+    } else if ctx.sound {
+        play_sound("message-new-instant");
+    }
+}
+
+/// Execute a single voice action (key press, click, scroll).
+fn execute_voice_action(action: &VoiceAction, ctx: &AppContext) {
+    match action {
+        VoiceAction::Key(ref key) => {
+            if ctx.type_text {
+                send_key(key, &ctx.display_server);
+            } else {
+                println!();
+            }
+        }
+        VoiceAction::ModifiedKey { ref modifiers, ref key } => {
+            if ctx.type_text {
+                let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
+                send_modified_key(&mod_refs, key, &ctx.display_server);
+            } else {
+                println!();
+            }
+        }
+        VoiceAction::ClickQuadrant { right, bottom } => {
+            if ctx.type_text {
+                click_quadrant(*right, *bottom);
+            } else {
+                let h = if *right { "right" } else { "left" };
+                let v = if *bottom { "lower" } else { "upper" };
+                println!("[click {v} {h}]");
+            }
+        }
+        VoiceAction::ClickCoordinate { x, y } => {
+            if ctx.type_text {
+                click_coordinate(*x, *y);
+            } else {
+                println!("[click {x} {y}]");
+            }
+        }
+        VoiceAction::Scroll { up, repeats } => {
+            if ctx.type_text {
+                scroll(*up, *repeats * ctx.scroll_ticks);
+            } else {
+                let dir = if *up { "up" } else { "down" };
+                println!("[scroll {dir} x{repeats}]");
+            }
+        }
+    }
+}
+
+/// Execute a voice action with an optional delay (for chained key presses).
+fn execute_voice_action_with_delay(action: &VoiceAction, ctx: &AppContext, delay: bool) {
+    if delay && ctx.type_text {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    execute_voice_action(action, ctx);
+}
+
 /// Send accumulated dictation audio to the server, output the transcription.
 fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: ListenMode) {
     if utterance_audio.is_empty() {
@@ -2036,6 +2396,15 @@ fn main() -> Result<()> {
     let dictation_silence = cfg.dictation_silence;
     let min_speech = cfg.min_speech;
     let max_speech = cfg.max_speech;
+    let no_kws = cfg.no_kws;
+    let kws_cfg = kws::KwsConfig {
+        model_dir: cfg.kws_model_dir.clone().unwrap_or_else(kws::default_model_dir),
+        keywords: build_kws_keywords(&cfg.aliases),
+        keywords_score: cfg.kws_score,
+        keywords_threshold: cfg.kws_threshold,
+        num_threads: cfg.kws_threads,
+    };
+    let kws_timeout_secs = cfg.kws_timeout;
 
     // Clean up stale socket
     let _ = std::fs::remove_file(&socket_path);
@@ -2145,6 +2514,25 @@ fn main() -> Result<()> {
         )
         .context("Failed to build audio input stream")?;
 
+    // ── Keyword spotter (initialized after audio to avoid ALSA/onnxruntime interference) ──
+    let kws_state = if !no_kws {
+        info!("Initializing keyword spotter");
+        match kws::init_keyword_spotter(&kws_cfg) {
+            Ok(spotter) => {
+                let kws_stream = spotter.create_stream();
+                info!("Keyword spotter ready");
+                Some((spotter, kws_stream))
+            }
+            Err(e) => {
+                warn!("Keyword spotter unavailable, falling back to server classification: {e}");
+                None
+            }
+        }
+    } else {
+        info!("Keyword spotting disabled (--no-kws)");
+        None
+    };
+
     let mut listening = !paused;
     if listening {
         stream.play().context("Failed to start audio stream")?;
@@ -2173,6 +2561,10 @@ fn main() -> Result<()> {
     let mut recording_hold_until: Option<Instant> = None;
     let mut last_vad_reset = Instant::now();
     let prefill_samples = ctx.prefill_samples;
+
+    // KWS state
+    let mut pending_keyword: Option<String> = None;
+    let mut kws_active_since: Option<Instant> = None;
 
     loop {
         match rx.recv() {
@@ -2228,6 +2620,68 @@ fn main() -> Result<()> {
 
                 audio_buf.extend_from_slice(&chunk);
 
+                // ── Feed KWS when classification window is active ────
+                if kws_active_since.is_some() {
+                    if let Some((ref spotter, ref kws_stream)) = kws_state {
+                        kws_stream.accept_waveform(SAMPLE_RATE as i32, &chunk);
+                        while spotter.is_ready(kws_stream) {
+                            spotter.decode(kws_stream);
+                            if let Some(result) = spotter.get_result(kws_stream) {
+                                if !result.keyword.is_empty() {
+                                    let keyword = result.keyword.clone();
+                                    debug!(keyword, "KWS detected keyword");
+                                    spotter.reset(kws_stream);
+
+                                    if keyword == "undo" {
+                                        execute_undo(&ctx);
+                                        kws_active_since = None;
+                                        pending_keyword = None;
+                                    } else {
+                                        pending_keyword = Some(keyword);
+                                        kws_active_since = None;
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Check classification timeout
+                    let timed_out = kws_active_since
+                        .is_some_and(|t| t.elapsed() > Duration::from_secs_f32(kws_timeout_secs));
+                    if timed_out {
+                        debug!("KWS timeout — no keyword detected, entering dictation");
+                        kws_active_since = None;
+                        if let Some((ref spotter, ref kws_stream)) = kws_state {
+                            spotter.reset(kws_stream);
+                        }
+
+                        // Drain any pending VAD segments and enter dictation mode
+                        // with accumulated audio.
+                        let mut seg_audio = Vec::new();
+                        while !vad.detector().is_empty() {
+                            if let Some(seg) = vad.detector().front() {
+                                seg_audio.extend_from_slice(seg.samples());
+                                drop(seg);
+                            }
+                            vad.detector().pop();
+                        }
+                        if !seg_audio.is_empty() {
+                            utterance_audio = seg_audio;
+                        }
+                        mode = ListenMode::Dictation;
+                        last_speech_time = Some(Instant::now());
+                        recording_hold_until = None;
+                        ctx.set_tray_status(TrayStatus::Dictating);
+                        vad.switch_to_dictation();
+                        audio_buf.clear();
+                        vad_pos = 0;
+                        was_detected = false;
+                        last_vad_reset = Instant::now();
+                        continue; // Skip VAD processing for this chunk
+                    }
+                }
+
                 // ── Process frames through VAD ────────────────────────
                 while vad_pos + WINDOW_SIZE <= audio_buf.len() {
                     let frame = &audio_buf[vad_pos..vad_pos + WINDOW_SIZE];
@@ -2248,6 +2702,11 @@ fn main() -> Result<()> {
                                     ctx.notify_id.get(),
                                 );
                                 ctx.notify_id.set(id);
+                            }
+                            // Start KWS classification window on speech onset in idle mode
+                            if mode == ListenMode::Idle && kws_state.is_some() && kws_active_since.is_none() {
+                                kws_active_since = Some(Instant::now());
+                                debug!("KWS classification window started");
                             }
                         }
                     } else if was_detected {
@@ -2300,27 +2759,36 @@ fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                match classify_segment(&samples, &ctx, ListenMode::Idle) {
-                                    ClassifyResult::Command(text) => {
-                                        execute_commands(&text, &ctx);
+                                if kws_state.is_some() {
+                                    // ── KWS-based classification ──────────
+                                    if let Some(ref keyword) = pending_keyword.take() {
+                                        // KWS identified a command → send to server for parameters.
+                                        kws_active_since = None;
+                                        match transcribe_command_segment(&samples, &ctx) {
+                                            Some(text) => {
+                                                execute_kws_command(keyword, &text, &ctx);
+                                            }
+                                            None => {
+                                                debug!("Command transcription returned empty");
+                                            }
+                                        }
                                         last_speech_time = Some(Instant::now());
                                         recording_hold_until = None;
-                                        // Reset VAD and drain audio so internal
-                                        // buffer doesn't accumulate across commands.
                                         audio_buf.clear();
                                         vad_pos = 0;
                                         vad.detector().reset();
                                         last_vad_reset = Instant::now();
-                                    }
-                                    ClassifyResult::Text => {
-                                        // Text detected → enter dictation mode.
-                                        debug!("Switching to dictation mode");
+                                        if let Some((ref spotter, ref kws_stream)) = kws_state {
+                                            spotter.reset(kws_stream);
+                                        }
+                                    } else if kws_active_since.is_none() {
+                                        // KWS timed out → enter dictation mode.
+                                        debug!("Switching to dictation mode (KWS timeout)");
                                         utterance_audio = samples;
                                         mode = ListenMode::Dictation;
                                         last_speech_time = Some(Instant::now());
                                         recording_hold_until = None;
                                         ctx.set_tray_status(TrayStatus::Dictating);
-
                                         vad.switch_to_dictation();
                                         audio_buf.clear();
                                         vad_pos = 0;
@@ -2328,7 +2796,35 @@ fn main() -> Result<()> {
                                         last_vad_reset = Instant::now();
                                         break;
                                     }
-                                    ClassifyResult::Empty | ClassifyResult::Error => {}
+                                    // else: KWS still active (waiting for detection or timeout)
+                                } else {
+                                    // ── Fallback: server-side classification ──
+                                    match classify_segment(&samples, &ctx, ListenMode::Idle) {
+                                        ClassifyResult::Command(text) => {
+                                            execute_commands(&text, &ctx);
+                                            last_speech_time = Some(Instant::now());
+                                            recording_hold_until = None;
+                                            audio_buf.clear();
+                                            vad_pos = 0;
+                                            vad.detector().reset();
+                                            last_vad_reset = Instant::now();
+                                        }
+                                        ClassifyResult::Text => {
+                                            debug!("Switching to dictation mode");
+                                            utterance_audio = samples;
+                                            mode = ListenMode::Dictation;
+                                            last_speech_time = Some(Instant::now());
+                                            recording_hold_until = None;
+                                            ctx.set_tray_status(TrayStatus::Dictating);
+                                            vad.switch_to_dictation();
+                                            audio_buf.clear();
+                                            vad_pos = 0;
+                                            was_detected = false;
+                                            last_vad_reset = Instant::now();
+                                            break;
+                                        }
+                                        ClassifyResult::Empty | ClassifyResult::Error => {}
+                                    }
                                 }
                             }
                             ListenMode::Dictation => {
@@ -2353,7 +2849,8 @@ fn main() -> Result<()> {
                     // Drain any pending segments before resetting.
                     vad.detector().flush();
                     while !vad.detector().is_empty() {
-                        if mode == ListenMode::Idle {
+                        if mode == ListenMode::Idle && kws_state.is_none() {
+                            // Fallback path only: try to classify drained segments
                             if let Some(seg) = vad.detector().front() {
                                 let samples = seg.samples().to_vec();
                                 drop(seg);
@@ -2375,6 +2872,12 @@ fn main() -> Result<()> {
                     vad.detector().reset();
                     last_vad_reset = Instant::now();
                     was_detected = false;
+                    // Reset KWS state on VAD reset
+                    kws_active_since = None;
+                    pending_keyword = None;
+                    if let Some((ref spotter, ref kws_stream)) = kws_state {
+                        spotter.reset(kws_stream);
+                    }
                 }
             }
 
@@ -2391,6 +2894,11 @@ fn main() -> Result<()> {
                     recording_hold_until = None;
                     vad.switch_to_idle();
                     last_vad_reset = Instant::now();
+                    kws_active_since = None;
+                    pending_keyword = None;
+                    if let Some((ref spotter, ref kws_stream)) = kws_state {
+                        spotter.reset(kws_stream);
+                    }
                     listening = false;
                     info!("Paused");
                     ctx.set_tray_status(TrayStatus::Idle);
@@ -2423,6 +2931,11 @@ fn main() -> Result<()> {
                 recording_hold_until = None;
                 vad.detector().reset();
                 last_vad_reset = Instant::now();
+                kws_active_since = None;
+                pending_keyword = None;
+                if let Some((ref spotter, ref kws_stream)) = kws_state {
+                    spotter.reset(kws_stream);
+                }
             }
 
             Ok(Event::Ipc(IpcCommand::Stop)) => {

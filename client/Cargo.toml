@@ -6,6 +6,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Streaming transcription client for Telemuze"
 
+[lib]
+name = "telemuze_listen"
+path = "src/lib.rs"
+
 [[bin]]
 name = "telemuze-listen"
 path = "src/main.rs"
