@@ -20,6 +20,9 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 const SAMPLE_RATE: u32 = 16_000;
+/// Reset the keyword spotter stream after this many seconds of audio without a
+/// detection, preventing unbounded internal-state growth and rising CPU usage.
+const RESET_INTERVAL_SECS: u32 = 60;
 
 const MODEL_NAME: &str = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
 const MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2";
@@ -329,10 +332,13 @@ fn main() -> Result<()> {
     signal_hook::flag::register_conditional_default(signal_hook::consts::SIGTERM, running.clone())?;
 
     let mut total_samples = 0u64;
+    let mut samples_since_reset = 0u64;
+    let reset_threshold = RESET_INTERVAL_SECS as u64 * SAMPLE_RATE as u64;
     while running.load(Ordering::Relaxed) {
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(samples) => {
                 total_samples += samples.len() as u64;
+                samples_since_reset += samples.len() as u64;
                 kws_stream.accept_waveform(SAMPLE_RATE as i32, &samples);
 
                 while kws.is_ready(&kws_stream) {
@@ -342,8 +348,15 @@ fn main() -> Result<()> {
                             let secs = total_samples as f64 / SAMPLE_RATE as f64;
                             println!("[{secs:.1}s] {}", result.keyword);
                             kws.reset(&kws_stream);
+                            samples_since_reset = 0;
                         }
                     }
+                }
+
+                if samples_since_reset >= reset_threshold {
+                    debug!("Periodic stream reset after {RESET_INTERVAL_SECS}s without detection");
+                    kws.reset(&kws_stream);
+                    samples_since_reset = 0;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
