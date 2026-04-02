@@ -1,12 +1,14 @@
 // Test binary for parakeet_realtime_eou_120m-v1 end-of-utterance detection.
 //
-// This model is a streaming transducer (same as Nemotron) but emits an <EOU>
-// token when it detects the speaker has finished their utterance. This provides
-// semantic turn-taking rather than silence-based endpoint detection.
+// This model is a cache-aware streaming FastConformer-RNNT that emits an <EOU>
+// token when it detects the speaker has finished their utterance. Sherpa-onnx
+// handles encoder cache management internally (window_size=25, chunk_shift=16,
+// 70-frame attention context), so we just feed audio and decode continuously.
 //
 // Usage:
 //   cargo run --bin eou-test
-//   cargo run --bin eou-test -- --model-dir /path/to/model --no-int8
+//   cargo run --bin eou-test -- -v
+//   cargo run --bin eou-test -- --no-endpoint  # EOU-only, no silence fallback
 //
 // Model dir defaults to ~/.local/share/telemuze/models/parakeet-realtime-eou-120m-v1
 
@@ -16,11 +18,10 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
 const SAMPLE_RATE: u32 = 16000;
-const EOU_MARKER: &str = "<EOU>";
 
 #[derive(Parser)]
 #[command(
@@ -62,6 +63,10 @@ struct Args {
     /// Disable silence-based endpoint detection (rely solely on <EOU> token)
     #[arg(long)]
     no_endpoint: bool,
+
+    /// Penalty for blank token (positive = fewer blanks = more token emissions)
+    #[arg(long, default_value_t = 0.0)]
+    blank_penalty: f32,
 
     /// Verbose logging
     #[arg(short, long)]
@@ -157,12 +162,11 @@ fn main() -> Result<()> {
     config.feat_config.feature_dim = args.feat_dim;
 
     config.decoding_method = Some("greedy_search".into());
-    // Silence-based endpoint detection as fallback — set generous thresholds
-    // since the <EOU> token is the primary end-of-utterance signal.
     config.enable_endpoint = !args.no_endpoint;
     config.rule1_min_trailing_silence = args.rule1_silence;
     config.rule2_min_trailing_silence = args.rule2_silence;
     config.rule3_min_utterance_length = args.rule3_max_length;
+    config.blank_penalty = args.blank_penalty;
 
     info!("Creating online recognizer (this may take a moment)...");
     let recognizer =
@@ -170,8 +174,11 @@ fn main() -> Result<()> {
 
     let stream = recognizer.create_stream();
 
-    eprintln!("Listening (feat_dim={}, greedy_search)... Ctrl+C to stop", args.feat_dim);
-    eprintln!("Watching for {EOU_MARKER} tokens in decoded output.\n");
+    eprintln!(
+        "Listening (feat_dim={})... Ctrl+C to stop",
+        args.feat_dim
+    );
+    eprintln!("Watching for <EOU> tokens in decoded output.\n");
 
     // Ctrl+C handler.
     let running = Arc::new(AtomicBool::new(true));
@@ -182,67 +189,101 @@ fn main() -> Result<()> {
     let mut last_text = String::new();
     let mut segment_idx = 0u32;
     let mut eou_count = 0u32;
+    let mut decode_calls = 0u64;
 
     while running.load(Ordering::Relaxed) {
         match audio_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(samples) => {
                 total_samples += samples.len() as u64;
+                let audio_secs = total_samples as f64 / SAMPLE_RATE as f64;
                 stream.accept_waveform(SAMPLE_RATE as i32, &samples);
 
+                let chunk_start = Instant::now();
+                let mut chunk_decodes = 0u32;
+
                 while recognizer.is_ready(&stream) {
+                    let t0 = Instant::now();
                     recognizer.decode(&stream);
+                    let decode_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                    decode_calls += 1;
+                    chunk_decodes += 1;
+
+                    if decode_ms > 50.0 {
+                        debug!(
+                            "Slow decode: {decode_ms:.1}ms (call #{decode_calls}, \
+                             audio={audio_secs:.1}s)"
+                        );
+                    }
 
                     if let Some(result) = recognizer.get_result(&stream) {
-                        // Check individual tokens for <EOU> — it may not
-                        // appear in the joined text field.
                         let has_eou = result.tokens.iter().any(|t| t.contains("EOU"));
                         let text = result.text.trim().to_string();
 
-                        if has_eou || (!text.is_empty() && text != last_text) {
+                        if has_eou {
                             let secs = total_samples as f64 / SAMPLE_RATE as f64;
                             debug!("tokens: {:?}", result.tokens);
 
-                            if has_eou {
-                                // Build text from non-EOU tokens
-                                let utterance: String = result.tokens.iter()
-                                    .filter(|t| !t.contains("EOU") && !t.contains("EOB") && !t.contains("blk"))
-                                    .cloned()
-                                    .collect::<String>()
-                                    .trim()
-                                    .to_string();
-                                eou_count += 1;
-                                if !utterance.is_empty() {
-                                    eprintln!(
-                                        "\r\x1b[K[{secs:.1}s] #{segment_idx}: {utterance} \x1b[32m[EOU]\x1b[0m"
-                                    );
-                                } else {
-                                    eprintln!(
-                                        "\r\x1b[K[{secs:.1}s] #{segment_idx}: \x1b[32m[EOU detected]\x1b[0m"
-                                    );
-                                }
-                                segment_idx += 1;
-                                last_text.clear();
-                                recognizer.reset(&stream);
-                                break;
+                            // Strip special tokens from final text.
+                            let final_text: String = result
+                                .tokens
+                                .iter()
+                                .filter(|t| {
+                                    !t.contains("EOU") && !t.contains("EOB") && !t.contains("blk")
+                                })
+                                .cloned()
+                                .collect::<String>();
+                            let final_text = final_text.trim();
+
+                            eou_count += 1;
+                            if !final_text.is_empty() {
+                                eprintln!(
+                                    "\r\x1b[K[{secs:.1}s] #{segment_idx}: {final_text} \x1b[32m[EOU]\x1b[0m"
+                                );
                             } else {
-                                eprint!("\r\x1b[K[{secs:.1}s] #{segment_idx}: {text}");
-                                last_text = text;
+                                eprintln!(
+                                    "\r\x1b[K[{secs:.1}s] #{segment_idx}: \x1b[32m[EOU detected]\x1b[0m"
+                                );
                             }
+                            segment_idx += 1;
+                            last_text.clear();
+                            recognizer.reset(&stream);
+                            break;
+                        } else if !text.is_empty() && text != last_text {
+                            let secs = total_samples as f64 / SAMPLE_RATE as f64;
+                            debug!("tokens: {:?}", result.tokens);
+                            eprint!("\r\x1b[K[{secs:.1}s] #{segment_idx}: {text}");
+                            last_text = text;
                         }
                     }
 
                     // Fallback: silence-based endpoint detection.
                     if recognizer.is_endpoint(&stream) {
-                        if !last_text.is_empty() {
-                            let secs = total_samples as f64 / SAMPLE_RATE as f64;
+                        let secs = total_samples as f64 / SAMPLE_RATE as f64;
+                        let text = last_text.trim().to_string();
+                        if !text.is_empty() {
                             eprintln!(
-                                "\r\x1b[K[{secs:.1}s] #{segment_idx}: {last_text} \x1b[33m[silence]\x1b[0m"
+                                "\r\x1b[K[{secs:.1}s] #{segment_idx}: {text} \x1b[33m[silence]\x1b[0m"
                             );
                             segment_idx += 1;
-                            last_text.clear();
                         }
+                        last_text.clear();
                         recognizer.reset(&stream);
                     }
+                }
+
+                let chunk_ms = chunk_start.elapsed().as_secs_f64() * 1000.0;
+                if chunk_decodes > 0 {
+                    debug!(
+                        "Chunk: {chunk_decodes} decodes in {chunk_ms:.1}ms \
+                         ({:.1}ms/decode), audio={audio_secs:.1}s",
+                        chunk_ms / chunk_decodes as f64
+                    );
+                }
+                if chunk_ms > 500.0 {
+                    debug!(
+                        "Decode loop took {chunk_ms:.0}ms for {chunk_decodes} decodes — \
+                         falling behind real-time!"
+                    );
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
@@ -251,12 +292,13 @@ fn main() -> Result<()> {
     }
 
     // Flush any remaining text.
-    if !last_text.is_empty() {
+    let text = last_text.trim();
+    if !text.is_empty() {
         let secs = total_samples as f64 / SAMPLE_RATE as f64;
-        eprintln!("\r\x1b[K[{secs:.1}s] #{segment_idx}: {last_text}");
+        eprintln!("\r\x1b[K[{secs:.1}s] #{segment_idx}: {text}");
     }
 
-    eprintln!("\n--- Stats: {segment_idx} segments, {eou_count} EOU detections ---");
+    eprintln!("\n--- Stats: {segment_idx} segments, {eou_count} EOU ---");
 
     drop(audio_stream);
     info!("Shutting down");
