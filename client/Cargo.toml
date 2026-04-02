@@ -18,6 +18,10 @@ path = "src/main.rs"
 name = "keyword-test"
 path = "src/bin/keyword_test.rs"
 
+[[bin]]
+name = "streaming-test"
+path = "src/bin/streaming_test.rs"
+
 [dependencies]
 # Audio capture
 cpal = "0.15"
