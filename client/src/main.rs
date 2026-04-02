@@ -31,7 +31,6 @@ use tray::TrayStatus;
 
 const SAMPLE_RATE: u32 = 16_000;
 const WINDOW_SIZE: usize = 512; // sherpa-onnx Silero VAD frame size
-const VAD_RESET_SECS: u64 = 45; // Must be < buffer_size_in_seconds (60)
 
 // ── VAD defaults ───────────────────────────────────────────────────────────
 
@@ -282,47 +281,25 @@ fn make_vad_config(
     }
 }
 
-fn create_vad(config: &VadModelConfig) -> Result<VoiceActivityDetector> {
-    // Buffer size in seconds — generous to avoid overflow.
-    VoiceActivityDetector::create(config, 60.0)
-        .context("Failed to create VAD detector")
-}
-
-/// Safety: VadModelConfig is just data. VoiceActivityDetector wraps C++ but
-/// is only used from the main thread.
-struct Vad {
-    idle: VoiceActivityDetector,
-    dictation: VoiceActivityDetector,
-    use_dictation: bool,
-}
+/// Wrapper to allow VoiceActivityDetector (which contains a raw pointer)
+/// to be used in a context that requires Send. Safety: only used from the
+/// main thread; the Send bound is needed because mpsc::Receiver is Send.
+struct Vad(VoiceActivityDetector);
 
 unsafe impl Send for Vad {}
 
 impl Vad {
-    fn new(idle_config: &VadModelConfig, dictation_config: &VadModelConfig) -> Result<Self> {
-        Ok(Self {
-            idle: create_vad(idle_config)?,
-            dictation: create_vad(dictation_config)?,
-            use_dictation: false,
-        })
+    fn new(config: &VadModelConfig) -> Result<Self> {
+        let det = VoiceActivityDetector::create(config, 60.0)
+            .context("Failed to create VAD detector")?;
+        Ok(Self(det))
     }
 
-    fn detector(&self) -> &VoiceActivityDetector {
-        if self.use_dictation {
-            &self.dictation
-        } else {
-            &self.idle
+    /// Drain all pending segments without processing them.
+    fn drain(&self) {
+        while !self.0.is_empty() {
+            self.0.pop();
         }
-    }
-
-    fn switch_to_idle(&mut self) {
-        self.use_dictation = false;
-        self.idle.reset();
-    }
-
-    fn switch_to_dictation(&mut self) {
-        self.use_dictation = true;
-        self.dictation.reset();
     }
 }
 
@@ -2305,13 +2282,13 @@ fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mo
     }
 
     // Drain any remaining VAD segments (idle mode commands).
-    vad.detector().flush();
-    while !vad.detector().is_empty() {
-        let segment_data = vad.detector().front().and_then(|seg| {
+    vad.0.flush();
+    while !vad.0.is_empty() {
+        let segment_data = vad.0.front().and_then(|seg| {
             let samples = seg.samples().to_vec();
             (mode == ListenMode::Idle).then_some(samples)
         });
-        vad.detector().pop();
+        vad.0.pop();
 
         if let Some(samples) = segment_data {
             if samples.len() >= (SAMPLE_RATE as usize / 10) {
@@ -2321,7 +2298,6 @@ fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mo
             }
         }
     }
-    vad.detector().reset();
 }
 
 // ── Socket cleanup guard ───────────────────────────────────────────────────
@@ -2393,7 +2369,6 @@ fn main() -> Result<()> {
     let vad_model_path = cfg.vad_model_path.clone();
     let vad_threshold = cfg.vad_threshold;
     let idle_silence = cfg.idle_silence;
-    let dictation_silence = cfg.dictation_silence;
     let min_speech = cfg.min_speech;
     let max_speech = cfg.max_speech;
     let no_kws = cfg.no_kws;
@@ -2466,24 +2441,18 @@ fn main() -> Result<()> {
 
     let vad_path_str = vad_path.to_string_lossy().into_owned();
 
-    // Build VAD configs for each mode.
-    let idle_vad_config = make_vad_config(
+    // Single VAD with idle-mode parameters. Dictation mode uses its own
+    // silence tracking and ignores VAD segments, so one config suffices.
+    let vad_config = make_vad_config(
         &vad_path_str,
         vad_threshold,
         idle_silence,
         min_speech,
         max_speech,
     );
-    let dictation_vad_config = make_vad_config(
-        &vad_path_str,
-        vad_threshold,
-        dictation_silence,
-        min_speech,
-        DEFAULT_DICTATION_MAX_SPEECH,
-    );
 
     info!(path = %vad_path.display(), "Loading VAD model");
-    let mut vad = Vad::new(&idle_vad_config, &dictation_vad_config)?;
+    let mut vad = Vad::new(&vad_config)?;
 
     // Set up audio capture
     let host = cpal::default_host();
@@ -2559,12 +2528,12 @@ fn main() -> Result<()> {
     let mut last_speech_time: Option<Instant> = None;
     let mut utterance_audio: Vec<f32> = Vec::new();
     let mut recording_hold_until: Option<Instant> = None;
-    let mut last_vad_reset = Instant::now();
     let prefill_samples = ctx.prefill_samples;
 
     // KWS state
     let mut pending_keyword: Option<String> = None;
     let mut kws_active_since: Option<Instant> = None;
+    let mut kws_buf_start: Option<usize> = None; // audio_buf index at speech onset (with prefill)
 
     loop {
         match rx.recv() {
@@ -2588,11 +2557,8 @@ fn main() -> Result<()> {
                         ctx.set_tray_status(TrayStatus::Processing);
                         flush_utterance(&mut utterance_audio, &ctx, ListenMode::Idle);
                         mode = ListenMode::Idle;
-                        vad.switch_to_idle();
-                        audio_buf.clear();
-                        vad_pos = 0;
+                        vad.drain();
                         was_detected = false;
-                        last_vad_reset = Instant::now();
                         last_speech_time = None;
                         recording_hold_until = None;
                     }
@@ -2613,7 +2579,7 @@ fn main() -> Result<()> {
                 // Only append when we have an utterance in progress or
                 // speech is currently detected (to start a new one).
                 if mode == ListenMode::Dictation
-                    && (!utterance_audio.is_empty() || vad.detector().detected())
+                    && (!utterance_audio.is_empty() || vad.0.detected())
                 {
                     utterance_audio.extend_from_slice(&chunk);
                 }
@@ -2635,10 +2601,12 @@ fn main() -> Result<()> {
                                     if keyword == "undo" {
                                         execute_undo(&ctx);
                                         kws_active_since = None;
+                                        kws_buf_start = None;
                                         pending_keyword = None;
                                     } else {
                                         pending_keyword = Some(keyword);
                                         kws_active_since = None;
+                                        kws_buf_start = None;
                                     }
                                     break;
                                 }
@@ -2656,40 +2624,37 @@ fn main() -> Result<()> {
                             spotter.reset(kws_stream);
                         }
 
-                        // Drain any pending VAD segments and enter dictation mode
-                        // with accumulated audio.
-                        let mut seg_audio = Vec::new();
-                        while !vad.detector().is_empty() {
-                            if let Some(seg) = vad.detector().front() {
-                                seg_audio.extend_from_slice(seg.samples());
-                                drop(seg);
-                            }
-                            vad.detector().pop();
+                        // Discard any pending VAD segments (we'll use audio_buf
+                        // directly to avoid losing speech before/between segments).
+                        while !vad.0.is_empty() {
+                            vad.0.pop();
                         }
-                        if !seg_audio.is_empty() {
-                            utterance_audio = seg_audio;
-                        }
+
+                        // Recover all audio from speech onset (with prefill) through
+                        // the current chunk.  Compaction was suppressed while KWS was
+                        // active, so the data is still in audio_buf.
+                        let start = kws_buf_start.unwrap_or(0).min(audio_buf.len());
+                        utterance_audio = audio_buf[start..].to_vec();
+                        kws_buf_start = None;
+
                         mode = ListenMode::Dictation;
                         last_speech_time = Some(Instant::now());
                         recording_hold_until = None;
                         ctx.set_tray_status(TrayStatus::Dictating);
-                        vad.switch_to_dictation();
-                        audio_buf.clear();
-                        vad_pos = 0;
                         was_detected = false;
-                        last_vad_reset = Instant::now();
                         continue; // Skip VAD processing for this chunk
                     }
                 }
 
                 // ── Process frames through VAD ────────────────────────
+                let mut switched_to_dictation = false;
                 while vad_pos + WINDOW_SIZE <= audio_buf.len() {
                     let frame = &audio_buf[vad_pos..vad_pos + WINDOW_SIZE];
-                    vad.detector().accept_waveform(frame);
+                    vad.0.accept_waveform(frame);
                     vad_pos += WINDOW_SIZE;
 
                     // Track speech transitions for UI and silence timing.
-                    let now_detected = vad.detector().detected();
+                    let now_detected = vad.0.detected();
                     if now_detected {
                         last_speech_time = Some(Instant::now());
                         recording_hold_until = None; // cancel pending transition
@@ -2706,6 +2671,9 @@ fn main() -> Result<()> {
                             // Start KWS classification window on speech onset in idle mode
                             if mode == ListenMode::Idle && kws_state.is_some() && kws_active_since.is_none() {
                                 kws_active_since = Some(Instant::now());
+                                // Record where in audio_buf speech started (with prefill)
+                                // so we can recover all audio if KWS times out.
+                                kws_buf_start = Some(vad_pos.saturating_sub(WINDOW_SIZE + prefill_samples));
                                 debug!("KWS classification window started");
                             }
                         }
@@ -2729,15 +2697,15 @@ fn main() -> Result<()> {
                     // ── Handle VAD segments ───────────────────────────
                     // Safety: always drop(seg) + pop() before any reset or
                     // mode switch to avoid use-after-free of the C segment.
-                    while !vad.detector().is_empty() {
+                    while !vad.0.is_empty() {
                         match mode {
                             ListenMode::Idle => {
-                                let segment_data = vad.detector().front().map(|seg| {
+                                let segment_data = vad.0.front().map(|seg| {
                                     let start = seg.start() as usize;
                                     let samples = seg.samples().to_vec();
                                     (start, samples)
                                 });
-                                vad.detector().pop();
+                                vad.0.pop();
 
                                 let Some((seg_start, seg_samples)) = segment_data else {
                                     continue;
@@ -2764,6 +2732,7 @@ fn main() -> Result<()> {
                                     if let Some(ref keyword) = pending_keyword.take() {
                                         // KWS identified a command → send to server for parameters.
                                         kws_active_since = None;
+                                        kws_buf_start = None;
                                         match transcribe_command_segment(&samples, &ctx) {
                                             Some(text) => {
                                                 execute_kws_command(keyword, &text, &ctx);
@@ -2774,26 +2743,21 @@ fn main() -> Result<()> {
                                         }
                                         last_speech_time = Some(Instant::now());
                                         recording_hold_until = None;
-                                        audio_buf.clear();
-                                        vad_pos = 0;
-                                        vad.detector().reset();
-                                        last_vad_reset = Instant::now();
+                                        vad.drain();
                                         if let Some((ref spotter, ref kws_stream)) = kws_state {
                                             spotter.reset(kws_stream);
                                         }
                                     } else if kws_active_since.is_none() {
                                         // KWS timed out → enter dictation mode.
                                         debug!("Switching to dictation mode (KWS timeout)");
+                                        kws_buf_start = None;
                                         utterance_audio = samples;
                                         mode = ListenMode::Dictation;
                                         last_speech_time = Some(Instant::now());
                                         recording_hold_until = None;
                                         ctx.set_tray_status(TrayStatus::Dictating);
-                                        vad.switch_to_dictation();
-                                        audio_buf.clear();
-                                        vad_pos = 0;
                                         was_detected = false;
-                                        last_vad_reset = Instant::now();
+                                        switched_to_dictation = true;
                                         break;
                                     }
                                     // else: KWS still active (waiting for detection or timeout)
@@ -2804,10 +2768,7 @@ fn main() -> Result<()> {
                                             execute_commands(&text, &ctx);
                                             last_speech_time = Some(Instant::now());
                                             recording_hold_until = None;
-                                            audio_buf.clear();
-                                            vad_pos = 0;
-                                            vad.detector().reset();
-                                            last_vad_reset = Instant::now();
+                                            vad.drain();
                                         }
                                         ClassifyResult::Text => {
                                             debug!("Switching to dictation mode");
@@ -2816,11 +2777,9 @@ fn main() -> Result<()> {
                                             last_speech_time = Some(Instant::now());
                                             recording_hold_until = None;
                                             ctx.set_tray_status(TrayStatus::Dictating);
-                                            vad.switch_to_dictation();
-                                            audio_buf.clear();
-                                            vad_pos = 0;
+                                            vad.drain();
                                             was_detected = false;
-                                            last_vad_reset = Instant::now();
+                                            switched_to_dictation = true;
                                             break;
                                         }
                                         ClassifyResult::Empty | ClassifyResult::Error => {}
@@ -2830,53 +2789,33 @@ fn main() -> Result<()> {
                             ListenMode::Dictation => {
                                 // Discard VAD segments in dictation mode —
                                 // we use our own silence tracking.
-                                vad.detector().pop();
+                                vad.0.pop();
                             }
                         }
                     }
 
                     // If we just switched to dictation, break the frame loop
                     // so the next chunk starts accumulating in utterance_audio.
-                    if mode == ListenMode::Dictation && audio_buf.is_empty() {
+                    if switched_to_dictation {
                         break;
                     }
                 }
 
-                // Prevent VAD internal buffer overflow (60s limit).
-                // One rule: always reset before VAD_RESET_SECS regardless of
-                // mode or detection state.
-                if last_vad_reset.elapsed() > Duration::from_secs(VAD_RESET_SECS) {
-                    // Drain any pending segments before resetting.
-                    vad.detector().flush();
-                    while !vad.detector().is_empty() {
-                        if mode == ListenMode::Idle && kws_state.is_none() {
-                            // Fallback path only: try to classify drained segments
-                            if let Some(seg) = vad.detector().front() {
-                                let samples = seg.samples().to_vec();
-                                drop(seg);
-                                vad.detector().pop();
-                                if samples.len() >= (SAMPLE_RATE as usize / 10) {
-                                    if let ClassifyResult::Command(text) =
-                                        classify_segment(&samples, &ctx, ListenMode::Idle)
-                                    {
-                                        execute_commands(&text, &ctx);
-                                    }
-                                }
-                                continue;
-                            }
+                // Compact audio_buf: keep only the prefill window before the
+                // current position plus any unprocessed tail.  This prevents
+                // unbounded growth while preserving data for segment prefill.
+                // Suppress compaction while KWS is active so we can recover
+                // the full speech audio if KWS times out (~1s, ~64KB).
+                if kws_active_since.is_none() {
+                    let keep_from = vad_pos.saturating_sub(prefill_samples);
+                    if keep_from > 0 {
+                        // Adjust kws_buf_start if it survived (shouldn't happen
+                        // when kws_active_since is None, but be safe).
+                        if let Some(ref mut start) = kws_buf_start {
+                            *start = start.saturating_sub(keep_from);
                         }
-                        vad.detector().pop();
-                    }
-                    audio_buf.clear();
-                    vad_pos = 0;
-                    vad.detector().reset();
-                    last_vad_reset = Instant::now();
-                    was_detected = false;
-                    // Reset KWS state on VAD reset
-                    kws_active_since = None;
-                    pending_keyword = None;
-                    if let Some((ref spotter, ref kws_stream)) = kws_state {
-                        spotter.reset(kws_stream);
+                        audio_buf.drain(..keep_from);
+                        vad_pos -= keep_from;
                     }
                 }
             }
@@ -2886,15 +2825,12 @@ fn main() -> Result<()> {
                     // Pause: flush any in-progress speech, stop audio.
                     drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
                     stream.pause().ok();
-                    audio_buf.clear();
-                    vad_pos = 0;
                     was_detected = false;
                     mode = ListenMode::Idle;
                     last_speech_time = None;
                     recording_hold_until = None;
-                    vad.switch_to_idle();
-                    last_vad_reset = Instant::now();
                     kws_active_since = None;
+                    kws_buf_start = None;
                     pending_keyword = None;
                     if let Some((ref spotter, ref kws_stream)) = kws_state {
                         spotter.reset(kws_stream);
@@ -2925,13 +2861,10 @@ fn main() -> Result<()> {
 
             Ok(Event::Ipc(IpcCommand::Flush)) => {
                 drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
-                audio_buf.clear();
-                vad_pos = 0;
                 was_detected = false;
                 recording_hold_until = None;
-                vad.detector().reset();
-                last_vad_reset = Instant::now();
                 kws_active_since = None;
+                kws_buf_start = None;
                 pending_keyword = None;
                 if let Some((ref spotter, ref kws_stream)) = kws_state {
                     spotter.reset(kws_stream);
