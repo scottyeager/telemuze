@@ -1,19 +1,80 @@
 // Keyword spotting support using sherpa-onnx KeywordSpotter.
 //
-// Provides BPE tokenization, model management, and KeywordSpotter initialization.
+// Provides BPE and phone-based tokenization, model management, and
+// KeywordSpotter initialization.  Two models are supported:
+//
+//  - **Gigaspeech** (English, BPE tokenization)
+//  - **ZhEn** (Chinese + English, phone/pinyin tokenization)
 
 use anyhow::{bail, Context, Result};
 use sentencepiece_model::SentencePieceModel;
 use sherpa_onnx::{KeywordSpotter, KeywordSpotterConfig};
 use std::collections::HashMap;
 use std::fs;
+use std::io::BufRead;
 use std::path::{Path, PathBuf};
 use tracing::debug;
 
 pub const SAMPLE_RATE: u32 = 16_000;
 
-const MODEL_NAME: &str = "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01";
-const MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2";
+// ── Model catalogue ────────────────────────────────────────────────────────
+
+/// Supported KWS model variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KwsModel {
+    /// English-only, BPE tokenization (GigaSpeech corpus).
+    Gigaspeech,
+    /// Chinese + English, phone/pinyin tokenization.
+    ZhEn,
+}
+
+impl KwsModel {
+    pub fn dir_name(&self) -> &str {
+        match self {
+            Self::Gigaspeech => "sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01",
+            Self::ZhEn => "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        match self {
+            Self::Gigaspeech => "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01.tar.bz2",
+            Self::ZhEn => "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
+        }
+    }
+
+    /// Optional filename substring used to pick a consistent set of model
+    /// files when multiple chunk-size variants exist in the same directory.
+    pub fn chunk_hint(&self) -> Option<&str> {
+        match self {
+            Self::Gigaspeech => None,
+            Self::ZhEn => Some("chunk-16"),
+        }
+    }
+}
+
+impl std::fmt::Display for KwsModel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Gigaspeech => write!(f, "gigaspeech"),
+            Self::ZhEn => write!(f, "zh-en"),
+        }
+    }
+}
+
+impl std::str::FromStr for KwsModel {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "gigaspeech" => Ok(Self::Gigaspeech),
+            "zh-en" | "zhen" => Ok(Self::ZhEn),
+            _ => bail!("Unknown KWS model '{s}' — expected 'gigaspeech' or 'zh-en'"),
+        }
+    }
+}
+
+/// The default model used when none is specified.
+pub const DEFAULT_MODEL: KwsModel = KwsModel::Gigaspeech;
 
 // ── BPE tokenizer ───────────────────────────────────────────────────────────
 
@@ -89,21 +150,98 @@ impl BpeTokenizer {
     }
 }
 
+// ── Phone tokenizer (for ZhEn model) ───────────────────────────────────────
+
+/// A phone-based encoder using a CMU-style pronunciation lexicon (`en.phone`).
+///
+/// Each word is looked up in the lexicon and expanded to its ARPAbet phone
+/// sequence.  The lexicon uses the format `WORD PHONE1 PHONE2 …` with one
+/// entry per line and uppercase words.
+pub struct PhoneTokenizer {
+    /// UPPERCASE_WORD → vec of phone strings
+    lexicon: HashMap<String, Vec<String>>,
+}
+
+impl PhoneTokenizer {
+    pub fn load(phone_path: &Path) -> Result<Self> {
+        let file = fs::File::open(phone_path)
+            .with_context(|| format!("Cannot open phone lexicon {}", phone_path.display()))?;
+        let reader = std::io::BufReader::new(file);
+
+        let mut lexicon = HashMap::new();
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut parts = line.split_whitespace();
+            let word = match parts.next() {
+                Some(w) => w.to_uppercase(),
+                None => continue,
+            };
+            let phones: Vec<String> = parts.map(|s| s.to_string()).collect();
+            if !phones.is_empty() {
+                // Keep first pronunciation when duplicates exist (e.g. 'READ')
+                lexicon.entry(word).or_insert(phones);
+            }
+        }
+
+        Ok(Self { lexicon })
+    }
+
+    /// Encode a phrase into its phone sequence.  Returns an error if any word
+    /// is not found in the lexicon.
+    pub fn encode(&self, text: &str) -> Result<Vec<String>> {
+        let mut phones = Vec::new();
+        for word in text.split_whitespace() {
+            let key = word.to_uppercase();
+            match self.lexicon.get(&key) {
+                Some(p) => phones.extend(p.iter().cloned()),
+                None => bail!("Word '{word}' not found in phone lexicon"),
+            }
+        }
+        Ok(phones)
+    }
+}
+
 // ── Model management ────────────────────────────────────────────────────────
 
-/// Find the encoder/decoder/joiner/tokens files in model_dir, preferring int8 variants.
-pub fn find_model_files(model_dir: &Path) -> Result<(String, String, String, String)> {
+/// Find the encoder/decoder/joiner/tokens files in model_dir, preferring int8
+/// variants.  When `chunk_hint` is `Some("chunk-16")`, only files whose name
+/// contains that substring are considered (needed for models that ship with
+/// multiple chunk-size variants).
+pub fn find_model_files(
+    model_dir: &Path,
+    chunk_hint: Option<&str>,
+) -> Result<(String, String, String, String)> {
     let entries: Vec<String> = fs::read_dir(model_dir)
         .context("Cannot read model directory")?
         .filter_map(|e| e.ok())
         .filter_map(|e| e.file_name().into_string().ok())
         .collect();
 
+    let matches_chunk = |f: &str| -> bool {
+        match chunk_hint {
+            Some(hint) => f.contains(hint),
+            None => true,
+        }
+    };
+
     let find = |prefix: &str| -> Result<String> {
-        if let Some(f) = entries.iter().find(|f| f.starts_with(prefix) && f.contains("int8") && f.ends_with(".onnx")) {
+        // Prefer int8 + matching chunk
+        if let Some(f) = entries.iter().find(|f| {
+            f.starts_with(prefix)
+                && f.contains("int8")
+                && f.ends_with(".onnx")
+                && matches_chunk(f)
+        }) {
             return Ok(model_dir.join(f).to_string_lossy().into_owned());
         }
-        if let Some(f) = entries.iter().find(|f| f.starts_with(prefix) && f.ends_with(".onnx")) {
+        // Fall back to fp32 + matching chunk
+        if let Some(f) = entries.iter().find(|f| {
+            f.starts_with(prefix) && f.ends_with(".onnx") && matches_chunk(f)
+        }) {
             return Ok(model_dir.join(f).to_string_lossy().into_owned());
         }
         bail!("No {prefix}*.onnx found in {}", model_dir.display());
@@ -122,14 +260,30 @@ pub fn find_model_files(model_dir: &Path) -> Result<(String, String, String, Str
 }
 
 /// Tokenize plain-text keywords into the format expected by KeywordSpotter.
-/// Input: comma-separated keywords. Output: newline-delimited BPE-tokenized lines.
+/// Input: comma-separated keywords. Output: newline-delimited tokenized lines.
+///
+/// The tokenization strategy depends on which model files are present:
+///  - If `bpe.model` exists → BPE tokenization (Gigaspeech model).
+///  - If `en.phone` exists  → Phone tokenization (ZhEn model).
 pub fn tokenize_keywords(keywords: &str, model_dir: &Path) -> Result<String> {
-    let bpe_model_path = model_dir.join("bpe.model");
-    if !bpe_model_path.exists() {
-        bail!("bpe.model not found in {} — cannot tokenize plain-text keywords", model_dir.display());
+    let bpe_path = model_dir.join("bpe.model");
+    let phone_path = model_dir.join("en.phone");
+
+    enum Tok {
+        Bpe(BpeTokenizer),
+        Phone(PhoneTokenizer),
     }
 
-    let tokenizer = BpeTokenizer::load(&bpe_model_path)?;
+    let tok = if bpe_path.exists() {
+        Tok::Bpe(BpeTokenizer::load(&bpe_path)?)
+    } else if phone_path.exists() {
+        Tok::Phone(PhoneTokenizer::load(&phone_path)?)
+    } else {
+        bail!(
+            "Neither bpe.model nor en.phone found in {} — cannot tokenize plain-text keywords",
+            model_dir.display()
+        );
+    };
 
     let mut lines = Vec::new();
     for kw in keywords.split(',') {
@@ -137,8 +291,11 @@ pub fn tokenize_keywords(keywords: &str, model_dir: &Path) -> Result<String> {
         if kw.is_empty() {
             continue;
         }
-        let tokens = tokenizer.encode(kw);
-        let label = kw.replace(' ', "_");
+        let tokens = match &tok {
+            Tok::Bpe(t) => t.encode(kw),
+            Tok::Phone(t) => t.encode(kw)?,
+        };
+        let label = kw.replace(' ', "_").to_uppercase();
         let line = format!("{} @{}", tokens.join(" "), label);
         debug!("Keyword '{kw}' → {line}");
         lines.push(line);
@@ -152,7 +309,7 @@ pub fn tokenize_keywords(keywords: &str, model_dir: &Path) -> Result<String> {
 }
 
 /// Download and extract the KWS model if not present.
-pub fn ensure_model(model_dir: &Path) -> Result<()> {
+pub fn ensure_model(model_dir: &Path, model: KwsModel) -> Result<()> {
     let has_encoder = fs::read_dir(model_dir)
         .ok()
         .map(|entries| {
@@ -173,8 +330,9 @@ pub fn ensure_model(model_dir: &Path) -> Result<()> {
     let parent = model_dir.parent().context("Model dir has no parent")?;
     fs::create_dir_all(parent)?;
 
-    eprintln!("Downloading KWS model...");
-    let response = reqwest::blocking::get(MODEL_URL).context("Failed to download model")?;
+    let url = model.url();
+    eprintln!("Downloading KWS model ({model})...");
+    let response = reqwest::blocking::get(url).context("Failed to download model")?;
     if !response.status().is_success() {
         bail!("Download failed with status {}", response.status());
     }
@@ -190,19 +348,25 @@ pub fn ensure_model(model_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Default model directory under XDG data dir.
-pub fn default_model_dir() -> PathBuf {
+/// Default model directory under XDG data dir for the given model.
+pub fn default_model_dir_for(model: KwsModel) -> PathBuf {
     dirs_next::data_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("telemuze")
         .join("models")
-        .join(MODEL_NAME)
+        .join(model.dir_name())
+}
+
+/// Default model directory under XDG data dir (uses [`DEFAULT_MODEL`]).
+pub fn default_model_dir() -> PathBuf {
+    default_model_dir_for(DEFAULT_MODEL)
 }
 
 // ── KeywordSpotter initialization ───────────────────────────────────────────
 
 /// Configuration for initializing the keyword spotter.
 pub struct KwsConfig {
+    pub model: KwsModel,
     pub model_dir: PathBuf,
     pub keywords: String,
     pub keywords_score: f32,
@@ -213,9 +377,10 @@ pub struct KwsConfig {
 /// Initialize the KeywordSpotter and create a stream.
 /// The `keywords` field should be comma-separated plain-text keywords.
 pub fn init_keyword_spotter(cfg: &KwsConfig) -> Result<KeywordSpotter> {
-    ensure_model(&cfg.model_dir)?;
+    ensure_model(&cfg.model_dir, cfg.model)?;
 
-    let (encoder, decoder, joiner, tokens) = find_model_files(&cfg.model_dir)?;
+    let (encoder, decoder, joiner, tokens) =
+        find_model_files(&cfg.model_dir, cfg.model.chunk_hint())?;
     debug!("KWS encoder: {encoder}");
     debug!("KWS decoder: {decoder}");
     debug!("KWS joiner:  {joiner}");

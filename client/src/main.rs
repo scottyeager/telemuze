@@ -2374,6 +2374,7 @@ fn main() -> Result<()> {
     let max_speech = cfg.max_speech;
     let no_kws = cfg.no_kws;
     let kws_cfg = kws::KwsConfig {
+        model: kws::DEFAULT_MODEL,
         model_dir: cfg.kws_model_dir.clone().unwrap_or_else(kws::default_model_dir),
         keywords: build_kws_keywords(&cfg.aliases),
         keywords_score: cfg.kws_score,

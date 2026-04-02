@@ -1,10 +1,12 @@
 // Test binary for sherpa-onnx keyword spotting from live microphone input.
 //
-// Downloads the English KWS model on first run, tokenizes plain-text keywords
-// via sentencepiece BPE, and streams audio from the default input device.
+// Downloads the selected KWS model on first run, tokenizes plain-text keywords
+// (BPE for gigaspeech, phone-based for zh-en), and streams audio from the
+// default input device.
 //
 // Usage:
 //   cargo run --bin keyword-test -- --keywords "hello,stop,hey computer"
+//   cargo run --bin keyword-test -- --model zh-en --keywords "light up,hello"
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
@@ -24,7 +26,11 @@ const RESET_INTERVAL_SECS: u32 = 60;
 #[derive(Parser)]
 #[command(name = "keyword-test", about = "Test sherpa-onnx keyword spotting from live mic")]
 struct Args {
-    /// Path to model directory (auto-downloads English GigaSpeech model if omitted)
+    /// Model variant: "gigaspeech" (English, BPE) or "zh-en" (Chinese+English, phone)
+    #[arg(long, default_value = "gigaspeech")]
+    model: String,
+
+    /// Path to model directory (auto-downloads the selected model if omitted)
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
@@ -68,7 +74,10 @@ fn main() -> Result<()> {
         bail!("Provide either --keywords or --keywords-file");
     }
 
-    let model_dir = args.model_dir.unwrap_or_else(kws::default_model_dir);
+    let model: kws::KwsModel = args.model.parse()?;
+    let model_dir = args
+        .model_dir
+        .unwrap_or_else(|| kws::default_model_dir_for(model));
 
     // Set up audio capture FIRST — before loading the model, because
     // onnxruntime initialization can interfere with ALSA thread setup.
@@ -105,8 +114,9 @@ fn main() -> Result<()> {
     let spotter = if let Some(ref kw_file) = args.keywords_file {
         use sherpa_onnx::KeywordSpotterConfig;
 
-        kws::ensure_model(&model_dir)?;
-        let (encoder, decoder, joiner, tokens) = kws::find_model_files(&model_dir)?;
+        kws::ensure_model(&model_dir, model)?;
+        let (encoder, decoder, joiner, tokens) =
+            kws::find_model_files(&model_dir, model.chunk_hint())?;
 
         let mut config = KeywordSpotterConfig::default();
         config.model_config.transducer.encoder = Some(encoder);
@@ -123,6 +133,7 @@ fn main() -> Result<()> {
             .context("Failed to create KeywordSpotter")?
     } else {
         kws::init_keyword_spotter(&kws::KwsConfig {
+            model,
             model_dir: model_dir.clone(),
             keywords: args.keywords.unwrap(),
             keywords_score: args.keywords_score,
