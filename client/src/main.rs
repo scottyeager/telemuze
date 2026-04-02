@@ -2753,6 +2753,7 @@ fn main() -> Result<()> {
                                                 debug!("Command transcription returned empty");
                                             }
                                         }
+                                        ctx.set_tray_status(TrayStatus::Listening);
                                         last_speech_time = Some(Instant::now());
                                         recording_hold_until = None;
                                         vad.drain();
