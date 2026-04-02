@@ -977,22 +977,30 @@ fn find_modified_key(lower: &str, from: usize, press_triggers: &[String], modifi
         let press_start = from + search_start + p;
         let after_press = press_start + matched_len;
 
-        // The word after "press" must be a modifier alias
-        if let Some((modifier_word, mod_word_end)) = next_word(lower, after_press) {
-            if let Some(canonical) = modifier_canonical(modifier_word, modifiers) {
-                // The word after the modifier must be a key name
-                if let Some((key_name, word_end)) = next_key_word(lower, mod_word_end) {
-                    let candidate = (
-                        press_start,
-                        word_end,
-                        VoiceAction::ModifiedKey {
-                            modifiers: vec![canonical.into()],
-                            key: key_name.into(),
-                        },
-                    );
-                    if best.as_ref().is_none_or(|b| press_start < b.0) {
-                        best = Some(candidate);
-                    }
+        // Collect consecutive modifier words after "press"
+        let mut mods = Vec::new();
+        let mut scan = after_press;
+        while let Some((word, word_end)) = next_word(lower, scan) {
+            if let Some(canonical) = modifier_canonical(word, modifiers) {
+                mods.push(canonical.to_owned());
+                scan = word_end;
+            } else {
+                break;
+            }
+        }
+        if !mods.is_empty() {
+            // The word after the modifiers must be a key name
+            if let Some((key_name, word_end)) = next_key_word(lower, scan) {
+                let candidate = (
+                    press_start,
+                    word_end,
+                    VoiceAction::ModifiedKey {
+                        modifiers: mods,
+                        key: key_name.into(),
+                    },
+                );
+                if best.as_ref().is_none_or(|b| press_start < b.0) {
+                    best = Some(candidate);
                 }
             }
         }
@@ -1340,12 +1348,22 @@ fn process_voice_commands<'a>(text: &'a str, ctx: &AppContext) -> Vec<TextAction
             // and "press enter control c" produces Enter then Ctrl+C.
             if matches!(action, VoiceAction::Key(_) | VoiceAction::ModifiedKey { .. }) {
                 loop {
-                    // Try modifier+key first (e.g. "control c")
-                    if let Some((mod_word, mod_end)) = next_word(&lower, cursor) {
-                        if let Some(canonical) = modifier_canonical(mod_word, &ctx.modifiers) {
-                            if let Some((kn, key_end)) = next_key_word(&lower, mod_end) {
+                    // Try modifier(s)+key first (e.g. "control c", "control shift v")
+                    {
+                        let mut mods = Vec::new();
+                        let mut scan = cursor;
+                        while let Some((mod_word, mod_end)) = next_word(&lower, scan) {
+                            if let Some(canonical) = modifier_canonical(mod_word, &ctx.modifiers) {
+                                mods.push(canonical.to_owned());
+                                scan = mod_end;
+                            } else {
+                                break;
+                            }
+                        }
+                        if !mods.is_empty() {
+                            if let Some((kn, key_end)) = next_key_word(&lower, scan) {
                                 actions.push(TextAction::Command(VoiceAction::ModifiedKey {
-                                    modifiers: vec![canonical.into()],
+                                    modifiers: mods,
                                     key: kn.into(),
                                 }));
                                 cursor = key_end;
@@ -2039,19 +2057,27 @@ fn execute_press_params(params: &[&str], ctx: &AppContext) -> usize {
     let mut i = 0;
     let mut first = true;
     while i < params.len() {
-        // Check for modifier+key
-        if let Some(canonical) = modifier_canonical(params[i], &ctx.modifiers) {
-            if i + 1 < params.len() {
-                if let Some(key) = key_name(params[i + 1]) {
-                    let action = VoiceAction::ModifiedKey {
-                        modifiers: vec![canonical.into()],
-                        key: key.into(),
-                    };
-                    execute_voice_action_with_delay(&action, ctx, !first);
-                    first = false;
-                    i += 2;
-                    continue;
-                }
+        // Collect consecutive modifiers, then expect a key
+        let mut modifiers = Vec::new();
+        let mut j = i;
+        while j < params.len() {
+            if let Some(canonical) = modifier_canonical(params[j], &ctx.modifiers) {
+                modifiers.push(canonical.into());
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if !modifiers.is_empty() && j < params.len() {
+            if let Some(key) = key_name(params[j]) {
+                let action = VoiceAction::ModifiedKey {
+                    modifiers,
+                    key: key.into(),
+                };
+                execute_voice_action_with_delay(&action, ctx, !first);
+                first = false;
+                i = j + 1;
+                continue;
             }
         }
         // Check for plain key name
