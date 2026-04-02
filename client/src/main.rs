@@ -1860,7 +1860,8 @@ fn transcribe_command_segment(samples: &[f32], ctx: &AppContext) -> Option<Strin
 /// Skips the trigger word(s) from the STT text and parses parameters.
 fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
     let lower = stt_text.to_lowercase();
-    let words: Vec<&str> = lower.split_whitespace().collect();
+    let stripped: String = lower.chars().filter(|c| !matches!(c, '.' | ',' | '!' | '?' | ';' | ':')).collect();
+    let words: Vec<&str> = stripped.split_whitespace().collect();
     debug!(keyword, text = stt_text, "Executing KWS command");
 
     // Determine how many trigger words to skip from the STT response
@@ -2675,6 +2676,17 @@ fn main() -> Result<()> {
                                 // so we can recover all audio if KWS times out.
                                 kws_buf_start = Some(vad_pos.saturating_sub(WINDOW_SIZE + prefill_samples));
                                 debug!("KWS classification window started");
+                                // Feed buffered audio from speech onset so KWS
+                                // doesn't miss the beginning of the keyword.
+                                if let Some((ref spotter, ref kws_stream)) = kws_state {
+                                    let start = kws_buf_start.unwrap_or(vad_pos);
+                                    if start < vad_pos {
+                                        kws_stream.accept_waveform(
+                                            SAMPLE_RATE as i32,
+                                            &audio_buf[start..vad_pos],
+                                        );
+                                    }
+                                }
                             }
                         }
                     } else if was_detected {
