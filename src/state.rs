@@ -60,7 +60,13 @@ impl AppState {
         };
 
         info!("Loading STT model from {:?}...", stt_path);
-        let stt_engine = SttEngine::new(&stt_path, config.hotwords_score, config.decode_timeout)?;
+        let stt_engine = SttEngine::new(
+            &stt_path,
+            config.hotwords_score,
+            config.decode_timeout,
+            config.max_active_paths,
+            config.blank_penalty,
+        )?;
         info!("STT model loaded.");
 
         // Initialize LLM engine:

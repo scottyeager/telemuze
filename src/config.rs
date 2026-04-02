@@ -80,8 +80,19 @@ pub struct Config {
     /// Maximum seconds to wait for a single STT decode call before aborting.
     /// Catches infinite beam search loops (e.g. from extreme hotword scores).
     /// Set to 0 to disable the timeout.
-    #[arg(long, env = "TELEMUZE_DECODE_TIMEOUT", default_value_t = 3)]
+    #[arg(long, env = "TELEMUZE_DECODE_TIMEOUT", default_value_t = 5)]
     pub decode_timeout: u64,
+
+    /// Maximum number of active beam search paths (beam width).
+    /// Lower values are faster but may reduce accuracy. Range: 1–10.
+    #[arg(long, env = "TELEMUZE_MAX_ACTIVE_PATHS", default_value_t = 4)]
+    pub max_active_paths: i32,
+
+    /// Penalty applied to the blank token during beam search decoding.
+    /// Positive values penalize blanks (slower frame advancement).
+    /// Negative values boost blanks (faster advancement, helps prevent loops).
+    #[arg(long, env = "TELEMUZE_BLANK_PENALTY", default_value_t = 0.0)]
+    pub blank_penalty: f32,
 
     /// Telegram API ID (from https://my.telegram.org)
     #[arg(long, env = "TELEGRAM_API_ID", default_value_t = 0)]
