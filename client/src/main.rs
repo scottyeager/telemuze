@@ -2154,6 +2154,14 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
         return;
     }
 
+    // Check for undo before the word-count filter — "undo" is a single word
+    // that would otherwise be dropped by min_dictation_words.
+    if is_undo_command(text, &ctx.aliases.undo) {
+        execute_undo(ctx);
+        finish_segment_ui(ctx, tray_mode);
+        return;
+    }
+
     let word_count = text.split_whitespace().count();
     if word_count < ctx.min_dictation_words {
         info!(word_count, min = ctx.min_dictation_words, text, "Dictation too short, dropping");
@@ -2596,6 +2604,7 @@ fn main() -> Result<()> {
                 audio_buf.extend_from_slice(&chunk);
 
                 // ── Feed KWS when classification window is active ────
+                let mut kws_consumed = false;
                 if kws_active_since.is_some() {
                     if let Some((ref spotter, ref kws_stream)) = kws_state {
                         kws_stream.accept_waveform(SAMPLE_RATE as i32, &chunk);
@@ -2612,6 +2621,11 @@ fn main() -> Result<()> {
                                         kws_active_since = None;
                                         kws_buf_start = None;
                                         pending_keyword = None;
+                                        vad.drain();
+                                        ctx.set_tray_status(TrayStatus::Listening);
+                                        was_detected = false;
+                                        kws_consumed = true;
+                                        break;
                                     } else {
                                         pending_keyword = Some(keyword);
                                         kws_active_since = None;
@@ -2653,6 +2667,9 @@ fn main() -> Result<()> {
                         was_detected = false;
                         continue; // Skip VAD processing for this chunk
                     }
+                }
+                if kws_consumed {
+                    continue; // Undo already handled; skip VAD to discard command audio
                 }
 
                 // ── Process frames through VAD ────────────────────────
