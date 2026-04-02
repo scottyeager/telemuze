@@ -1880,14 +1880,28 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
     let params: Vec<&str> = words.iter().skip(skip).copied().collect();
     let params_str = params.join(" ");
 
-    match keyword {
+    // Track how many params are consumed by the primary command so we can
+    // parse any trailing commands (e.g. "slash command clear, press enter").
+    let consumed = match keyword {
         "mouse" | "click" | "look" | "lick" => {
             // Try quadrant: "upper left", "upper right", "lower left", "lower right"
-            let (right, bottom) = match params_str.as_str() {
-                s if s.contains("upper") && s.contains("left") => (false, false),
-                s if s.contains("upper") && s.contains("right") => (true, false),
-                s if s.contains("lower") && s.contains("left") => (false, true),
-                s if s.contains("lower") && s.contains("right") => (true, true),
+            match params_str.as_str() {
+                s if s.contains("upper") && s.contains("left") => {
+                    if ctx.type_text { click_quadrant(false, false); }
+                    else { println!("[click upper left]"); }
+                }
+                s if s.contains("upper") && s.contains("right") => {
+                    if ctx.type_text { click_quadrant(true, false); }
+                    else { println!("[click upper right]"); }
+                }
+                s if s.contains("lower") && s.contains("left") => {
+                    if ctx.type_text { click_quadrant(false, true); }
+                    else { println!("[click lower left]"); }
+                }
+                s if s.contains("lower") && s.contains("right") => {
+                    if ctx.type_text { click_quadrant(true, true); }
+                    else { println!("[click lower right]"); }
+                }
                 _ => {
                     // Try coordinate: two numbers
                     if params.len() >= 2 {
@@ -1895,31 +1909,23 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
                             parse_spoken_number_simple(&params, 0),
                             parse_spoken_number_simple(&params, 1),
                         ) {
-                            if ctx.type_text {
-                                click_coordinate(x, y);
-                            } else {
-                                println!("[click {x} {y}]");
-                            }
-                            if ctx.sound {
-                                play_sound("message-new-instant");
-                            }
+                            if ctx.type_text { click_coordinate(x, y); }
+                            else { println!("[click {x} {y}]"); }
+                        } else {
+                            debug!(params = ?params, "Could not parse click parameters");
                             return;
                         }
+                    } else {
+                        debug!(params = ?params, "Could not parse click parameters");
+                        return;
                     }
-                    debug!(params = ?params, "Could not parse click parameters");
-                    return;
                 }
-            };
-            if ctx.type_text {
-                click_quadrant(right, bottom);
-            } else {
-                let h = if right { "right" } else { "left" };
-                let v = if bottom { "lower" } else { "upper" };
-                println!("[click {v} {h}]");
             }
             if ctx.sound {
                 play_sound("message-new-instant");
             }
+            // Click commands consume all params (quadrant words or coordinates)
+            params.len()
         }
         "press" => {
             // Parse key names and modifiers from params
@@ -1927,7 +1933,7 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
                 debug!("No key specified after 'press'");
                 return;
             }
-            execute_press_params(&params, ctx);
+            execute_press_params(&params, ctx)
         }
         "scroll" => {
             if params.is_empty() {
@@ -1936,26 +1942,31 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
             }
             let mut up: Option<bool> = None;
             let mut repeats: u32 = 0;
+            let mut consumed_scroll: usize = 0;
             for word in &params {
                 match *word {
                     "up" => {
                         if up == Some(false) { break; }
                         up = Some(true);
                         repeats += 1;
+                        consumed_scroll += 1;
                     }
                     "down" => {
                         if up == Some(true) { break; }
                         up = Some(false);
                         repeats += 1;
+                        consumed_scroll += 1;
                     }
                     "top" => {
                         up = Some(true);
                         repeats = 100;
+                        consumed_scroll += 1;
                         break;
                     }
                     "bottom" => {
                         up = Some(false);
                         repeats = 100;
+                        consumed_scroll += 1;
                         break;
                     }
                     _ => break,
@@ -1967,8 +1978,10 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
                 if ctx.sound {
                     play_sound("message-new-instant");
                 }
+                consumed_scroll
             } else {
                 debug!("Could not parse scroll direction from: {params_str}");
+                return;
             }
         }
         "slash_command" | "flash_command" | "splash_command" => {
@@ -1987,13 +2000,25 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
             if ctx.sound {
                 play_sound("message-new-instant");
             }
+            1 // consumed the command name
         }
         "undo" => {
             execute_undo(ctx);
+            0 // undo has no params
         }
         _ => {
             debug!(keyword, "Unknown KWS keyword label");
+            return;
         }
+    };
+
+    // If there are remaining words after the primary command, try to parse
+    // them as additional commands (e.g. "slash command clear, press enter").
+    let remaining: Vec<&str> = params.iter().skip(consumed).copied().collect();
+    if !remaining.is_empty() {
+        let remaining_text = remaining.join(" ");
+        debug!(remaining = %remaining_text, "Parsing remaining words as commands");
+        execute_commands(&remaining_text, ctx);
     }
 }
 
@@ -2009,7 +2034,8 @@ fn parse_spoken_number_simple(words: &[&str], idx: usize) -> Option<u32> {
 }
 
 /// Execute a "press" command with parsed parameter words.
-fn execute_press_params(params: &[&str], ctx: &AppContext) {
+/// Execute key press params and return how many words were consumed.
+fn execute_press_params(params: &[&str], ctx: &AppContext) -> usize {
     let mut i = 0;
     let mut first = true;
     while i < params.len() {
@@ -2044,6 +2070,7 @@ fn execute_press_params(params: &[&str], ctx: &AppContext) {
     } else if ctx.sound {
         play_sound("message-new-instant");
     }
+    i
 }
 
 /// Execute a single voice action (key press, click, scroll).
