@@ -17,3 +17,6 @@ Cargo.lock
 # Environment
 .env
 .env.local
+
+# Model weights (stored in ~/.local/share/telemuze/models/)
+/models/

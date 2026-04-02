@@ -6,8 +6,10 @@
 // export uses 1120ms (chunk_shift=112 frames at 10ms/frame).
 //
 // Usage:
-//   cargo run --bin streaming-test -- --model-dir ../models/nemotron-streaming
-//   cargo run --bin streaming-test -- --model-dir ../models/nemotron-streaming --no-int8
+//   cargo run --bin streaming-test
+//   cargo run --bin streaming-test -- --model-dir /path/to/model --no-int8
+//
+// Model dir defaults to ~/.local/share/telemuze/models/nemotron-speech-streaming-en-0.6b
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -26,9 +28,10 @@ const SAMPLE_RATE: u32 = 16000;
     about = "Test sherpa-onnx streaming recognition from live mic"
 )]
 struct Args {
-    /// Path to model directory containing encoder, decoder, joiner, tokens
+    /// Path to model directory containing encoder, decoder, joiner, tokens.
+    /// Defaults to ~/.local/share/telemuze/models/nemotron-speech-streaming-en-0.6b
     #[arg(long)]
-    model_dir: PathBuf,
+    model_dir: Option<PathBuf>,
 
     /// Use full-precision models instead of int8 quantized
     #[arg(long)]
@@ -96,7 +99,12 @@ fn main() -> Result<()> {
         .init();
 
     let int8 = !args.no_int8;
-    let (encoder, decoder, joiner, tokens) = find_model_files(&args.model_dir, int8)?;
+    let model_dir = args.model_dir.unwrap_or_else(|| {
+        dirs_next::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("telemuze/models/nemotron-speech-streaming-en-0.6b")
+    });
+    let (encoder, decoder, joiner, tokens) = find_model_files(&model_dir, int8)?;
     info!("Encoder: {encoder}");
     info!("Decoder: {decoder}");
     info!("Joiner:  {joiner}");
