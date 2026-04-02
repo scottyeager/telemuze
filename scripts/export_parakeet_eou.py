@@ -46,19 +46,25 @@ def add_meta_data(filename: str, meta_data: Dict[str, str]):
         meta.key = key
         meta.value = str(value)
 
-    external_filename = filename.split(".onnx")[0]
-    data_file = external_filename + ".data"
+    filepath = os.path.abspath(filename)
+    basename = os.path.splitext(os.path.basename(filepath))[0]
 
-    if os.path.exists(data_file):
-        os.remove(data_file)
+    # Check if any tensors use external data storage
+    has_external = any(t.data_location == 1 for t in model.graph.initializer)
 
-    onnx.save(
-        model,
-        filename,
-        save_as_external_data=True,
-        all_tensors_to_one_file=True,
-        location=external_filename + ".data",
-    )
+    if has_external:
+        data_file = os.path.join(os.path.dirname(filepath), basename + ".data")
+        if os.path.exists(data_file):
+            os.remove(data_file)
+        onnx.save(
+            model,
+            filepath,
+            save_as_external_data=True,
+            all_tensors_to_one_file=True,
+            location=basename + ".data",
+        )
+    else:
+        onnx.save(model, filepath)
     del model
     gc.collect()
 

@@ -22,6 +22,10 @@ path = "src/bin/keyword_test.rs"
 name = "streaming-test"
 path = "src/bin/streaming_test.rs"
 
+[[bin]]
+name = "eou-test"
+path = "src/bin/eou_test.rs"
+
 [dependencies]
 # Audio capture
 cpal = "0.15"

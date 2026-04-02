@@ -35,13 +35,15 @@ def add_meta_data(filename: str, meta_data: Dict[str, str]):
         meta.key = key
         meta.value = str(value)
 
-    external_filename = filename.split(".onnx")[0]
+    import os
+    filepath = os.path.abspath(filename)
+    basename = os.path.splitext(os.path.basename(filepath))[0]
     onnx.save(
         model,
-        filename,
+        filepath,
         save_as_external_data=True,
         all_tensors_to_one_file=True,
-        location=external_filename + ".data",
+        location=basename + ".data",
     )
     del model
     gc.collect()

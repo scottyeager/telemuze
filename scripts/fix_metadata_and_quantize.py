@@ -33,8 +33,9 @@ def add_meta_data(filename: str, meta_data: Dict[str, str]):
         meta.key = key
         meta.value = str(value)
 
-    external_filename = filename.split(".onnx")[0]
-    data_file = external_filename + ".data"
+    filepath = os.path.abspath(filename)
+    basename = os.path.splitext(os.path.basename(filepath))[0]
+    data_file = os.path.join(os.path.dirname(filepath), basename + ".data")
 
     # Remove existing external data file to avoid FileExistsError
     if os.path.exists(data_file):
@@ -44,10 +45,10 @@ def add_meta_data(filename: str, meta_data: Dict[str, str]):
     print(f"  Saving with consolidated external data -> {data_file}...")
     onnx.save(
         model,
-        filename,
+        filepath,
         save_as_external_data=True,
         all_tensors_to_one_file=True,
-        location=external_filename + ".data",
+        location=basename + ".data",
     )
     del model
     gc.collect()
