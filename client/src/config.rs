@@ -152,11 +152,11 @@ fn default_undo() -> Vec<String> {
 }
 
 fn default_wake() -> Vec<String> {
-    vec!["wake up".into()]
+    vec!["okay computer".into()]
 }
 
 fn default_sleep() -> Vec<String> {
-    vec!["sleep".into()]
+    vec!["goodbye computer".into()]
 }
 
 fn default_modifiers() -> Vec<(String, String)> {
@@ -411,6 +411,10 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("slash-command = {}", toml_string_list(&slash_phrases)));
     line("# Word(s) that trigger undo (erases last typed segment via backspace).");
     line(&format!("undo = {}", toml_string_list(&cfg.aliases.undo)));
+    line("# Phrase(s) that wake the client from sleep mode.");
+    line(&format!("wake = {}", toml_string_list(&cfg.aliases.wake)));
+    line("# Word(s) that put the client to sleep (stops listening until woken).");
+    line(&format!("sleep = {}", toml_string_list(&cfg.aliases.sleep)));
     line("");
 
     line("# ── Modifier key mappings ────────────────────────────────────────────────");

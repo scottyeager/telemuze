@@ -49,6 +49,7 @@ const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
 // ── KWS defaults ──────────────────────────────────────────────────────────
 
 const DEFAULT_KWS_THRESHOLD: f32 = 0.25;
+const DEFAULT_KWS_SLEEP_THRESHOLD: f32 = 0.5;
 const DEFAULT_KWS_SCORE: f32 = 1.0;
 const DEFAULT_KWS_THREADS: i32 = 2;
 const DEFAULT_KWS_TIMEOUT: f32 = 1.0;
@@ -213,6 +214,11 @@ struct Cli {
     /// Keyword detection threshold (0.0–1.0). Lower = more sensitive.
     #[arg(long, default_value_t = DEFAULT_KWS_THRESHOLD)]
     kws_threshold: f32,
+
+    /// Keyword detection threshold used in sleep mode for wake-word detection.
+    /// Higher than kws-threshold to reduce false wake-ups. (0.0–1.0)
+    #[arg(long, default_value_t = DEFAULT_KWS_SLEEP_THRESHOLD)]
+    kws_sleep_threshold: f32,
 
     /// Keyword boost score.
     #[arg(long, default_value_t = DEFAULT_KWS_SCORE)]
@@ -757,8 +763,8 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     all.join(",")
 }
 
-/// Build a comma-separated keywords string for the KeywordSpotter.
-/// Only trigger words are included — the KWS just identifies the command type.
+/// Build a comma-separated keywords string for the normal-mode KeywordSpotter.
+/// Includes all command triggers plus sleep keywords (but not wake — can't wake when awake).
 fn build_kws_keywords(aliases: &ResolvedAliases) -> String {
     let mut keywords: Vec<String> = Vec::new();
 
@@ -782,7 +788,20 @@ fn build_kws_keywords(aliases: &ResolvedAliases) -> String {
     for trigger in &aliases.slash_command {
         keywords.push(trigger.join(" "));
     }
+    // Sleep trigger aliases (puts client to sleep)
+    for alias in &aliases.sleep {
+        keywords.push(alias.clone());
+    }
 
+    keywords.sort();
+    keywords.dedup();
+    keywords.join(",")
+}
+
+/// Build a comma-separated keywords string for the sleep-mode KeywordSpotter.
+/// Only includes wake keywords — the only thing the client responds to while sleeping.
+fn build_wake_keywords(aliases: &ResolvedAliases) -> String {
+    let mut keywords: Vec<String> = aliases.wake.clone();
     keywords.sort();
     keywords.dedup();
     keywords.join(",")
@@ -2441,12 +2460,22 @@ fn main() -> Result<()> {
     let min_speech = cfg.min_speech;
     let max_speech = cfg.max_speech;
     let no_kws = cfg.no_kws;
+    let kws_model_dir = cfg.kws_model_dir.clone()
+        .unwrap_or_else(|| kws::default_model_dir_for(cfg.kws_model));
     let kws_cfg = kws::KwsConfig {
         model: cfg.kws_model,
-        model_dir: cfg.kws_model_dir.clone().unwrap_or_else(|| kws::default_model_dir_for(cfg.kws_model)),
+        model_dir: kws_model_dir.clone(),
         keywords: build_kws_keywords(&cfg.aliases),
         keywords_score: cfg.kws_score,
         keywords_threshold: cfg.kws_threshold,
+        num_threads: cfg.kws_threads,
+    };
+    let sleep_kws_cfg = kws::KwsConfig {
+        model: cfg.kws_model,
+        model_dir: kws_model_dir,
+        keywords: build_wake_keywords(&cfg.aliases),
+        keywords_score: cfg.kws_score,
+        keywords_threshold: cfg.kws_sleep_threshold,
         num_threads: cfg.kws_threads,
     };
     let kws_timeout_secs = cfg.kws_timeout;
@@ -2456,6 +2485,15 @@ fn main() -> Result<()> {
 
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Failed to bind socket: {}", socket_path))?;
+
+    // Pre-compute normalized labels for wake/sleep keyword matching
+    // (must happen before cfg is moved into AppContext).
+    let wake_labels: Vec<String> = cfg.aliases.wake.iter()
+        .map(|a| a.to_lowercase().replace(' ', "_"))
+        .collect();
+    let sleep_labels: Vec<String> = cfg.aliases.sleep.iter()
+        .map(|a| a.to_lowercase().replace(' ', "_"))
+        .collect();
 
     let mut ctx = AppContext::new(cfg);
 
@@ -2553,7 +2591,9 @@ fn main() -> Result<()> {
         )
         .context("Failed to build audio input stream")?;
 
-    // ── Keyword spotter (initialized after audio to avoid ALSA/onnxruntime interference) ──
+    // ── Keyword spotters (initialized after audio to avoid ALSA/onnxruntime interference) ──
+    // Normal spotter: all command keywords + sleep keywords (used when awake).
+    // Sleep spotter: wake keywords only with higher threshold (used when sleeping).
     let kws_state = if !no_kws {
         info!("Initializing keyword spotter");
         match kws::init_keyword_spotter(&kws_cfg) {
@@ -2569,6 +2609,22 @@ fn main() -> Result<()> {
         }
     } else {
         info!("Keyword spotting disabled (--no-kws)");
+        None
+    };
+    let sleep_kws_state = if !no_kws && kws_state.is_some() {
+        info!("Initializing sleep-mode keyword spotter (wake words only)");
+        match kws::init_keyword_spotter(&sleep_kws_cfg) {
+            Ok(spotter) => {
+                let kws_stream = spotter.create_stream();
+                info!("Sleep-mode keyword spotter ready");
+                Some((spotter, kws_stream))
+            }
+            Err(e) => {
+                warn!("Sleep-mode keyword spotter unavailable: {e}");
+                None
+            }
+        }
+    } else {
         None
     };
 
@@ -2604,6 +2660,7 @@ fn main() -> Result<()> {
     let mut pending_keyword: Option<String> = None;
     let mut kws_active_since: Option<Instant> = None;
     let mut kws_buf_start: Option<usize> = None; // audio_buf index at speech onset (with prefill)
+    let mut sleeping = false; // when true, only wake keywords are processed
 
     loop {
         match rx.recv() {
@@ -2659,17 +2716,69 @@ fn main() -> Result<()> {
                 // ── Feed KWS when classification window is active ────
                 let mut kws_consumed = false;
                 if kws_active_since.is_some() {
-                    if let Some((ref spotter, ref kws_stream)) = kws_state {
+                    // Select the active spotter based on sleep state.
+                    let active_kws = if sleeping { &sleep_kws_state } else { &kws_state };
+                    if let Some((ref spotter, ref kws_stream)) = *active_kws {
                         kws_stream.accept_waveform(SAMPLE_RATE as i32, &chunk);
                         while spotter.is_ready(kws_stream) {
                             spotter.decode(kws_stream);
                             if let Some(result) = spotter.get_result(kws_stream) {
                                 if !result.keyword.is_empty() {
                                     let keyword = result.keyword.to_lowercase();
-                                    debug!(keyword, "KWS detected keyword");
+                                    debug!(keyword, sleeping, "KWS detected keyword");
                                     spotter.reset(kws_stream);
 
-                                    if keyword == "undo" {
+                                    if wake_labels.contains(&keyword) {
+                                        // Wake up from sleep mode.
+                                        info!("Wake keyword detected — resuming");
+                                        sleeping = false;
+                                        kws_active_since = None;
+                                        kws_buf_start = None;
+                                        pending_keyword = None;
+                                        vad.drain();
+                                        ctx.set_tray_status(TrayStatus::Listening);
+                                        was_detected = false;
+                                        kws_consumed = true;
+                                        if ctx.sound {
+                                            play_sound("message-new-instant");
+                                        }
+                                        if ctx.notify {
+                                            let id = show_notification(
+                                                "Listening...",
+                                                "Woke up from sleep",
+                                                ctx.notify_id.get(),
+                                            );
+                                            ctx.notify_id.set(id);
+                                        }
+                                        break;
+                                    } else if sleep_labels.contains(&keyword) {
+                                        // Enter sleep mode.
+                                        info!("Sleep keyword detected — sleeping");
+                                        sleeping = true;
+                                        kws_active_since = None;
+                                        kws_buf_start = None;
+                                        pending_keyword = None;
+                                        vad.drain();
+                                        ctx.set_tray_status(TrayStatus::Idle);
+                                        was_detected = false;
+                                        kws_consumed = true;
+                                        if ctx.sound {
+                                            play_sound("message-new-instant");
+                                        }
+                                        if ctx.notify {
+                                            let id = show_notification(
+                                                "Sleeping...",
+                                                "Say wake-up phrase to resume",
+                                                ctx.notify_id.get(),
+                                            );
+                                            ctx.notify_id.set(id);
+                                        }
+                                        // Reset the sleep spotter stream for a clean start.
+                                        if let Some((ref s, ref st)) = sleep_kws_state {
+                                            s.reset(st);
+                                        }
+                                        break;
+                                    } else if keyword == "undo" {
                                         execute_undo(&ctx);
                                         kws_active_since = None;
                                         kws_buf_start = None;
@@ -2694,11 +2803,24 @@ fn main() -> Result<()> {
                     let timed_out = kws_active_since
                         .is_some_and(|t| t.elapsed() > Duration::from_secs_f32(kws_timeout_secs));
                     if timed_out {
-                        debug!("KWS timeout — no keyword detected, entering dictation");
                         kws_active_since = None;
-                        if let Some((ref spotter, ref kws_stream)) = kws_state {
+                        let active_kws = if sleeping { &sleep_kws_state } else { &kws_state };
+                        if let Some((ref spotter, ref kws_stream)) = *active_kws {
                             spotter.reset(kws_stream);
                         }
+
+                        if sleeping {
+                            // In sleep mode, just go back to idle — no dictation.
+                            debug!("KWS timeout in sleep mode — staying idle");
+                            kws_buf_start = None;
+                            while !vad.0.is_empty() {
+                                vad.0.pop();
+                            }
+                            was_detected = false;
+                            continue;
+                        }
+
+                        debug!("KWS timeout — no keyword detected, entering dictation");
 
                         // Discard any pending VAD segments (we'll use audio_buf
                         // directly to avoid losing speech before/between segments).
@@ -2722,7 +2844,7 @@ fn main() -> Result<()> {
                     }
                 }
                 if kws_consumed {
-                    continue; // Undo already handled; skip VAD to discard command audio
+                    continue; // Immediate command handled; skip VAD to discard audio
                 }
 
                 // ── Process frames through VAD ────────────────────────
@@ -2748,15 +2870,17 @@ fn main() -> Result<()> {
                                 ctx.notify_id.set(id);
                             }
                             // Start KWS classification window on speech onset in idle mode
-                            if mode == ListenMode::Idle && kws_state.is_some() && kws_active_since.is_none() {
+                            let has_kws = if sleeping { sleep_kws_state.is_some() } else { kws_state.is_some() };
+                            if mode == ListenMode::Idle && has_kws && kws_active_since.is_none() {
                                 kws_active_since = Some(Instant::now());
                                 // Record where in audio_buf speech started (with prefill)
                                 // so we can recover all audio if KWS times out.
                                 kws_buf_start = Some(vad_pos.saturating_sub(WINDOW_SIZE + prefill_samples));
-                                debug!("KWS classification window started");
+                                debug!(sleeping, "KWS classification window started");
                                 // Feed buffered audio from speech onset so KWS
                                 // doesn't miss the beginning of the keyword.
-                                if let Some((ref spotter, ref kws_stream)) = kws_state {
+                                let active_kws = if sleeping { &sleep_kws_state } else { &kws_state };
+                                if let Some((ref _spotter, ref kws_stream)) = *active_kws {
                                     let start = kws_buf_start.unwrap_or(vad_pos);
                                     if start < vad_pos {
                                         kws_stream.accept_waveform(
@@ -2817,7 +2941,14 @@ fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                if kws_state.is_some() {
+                                let has_kws = if sleeping { sleep_kws_state.is_some() } else { kws_state.is_some() };
+                                if sleeping {
+                                    // In sleep mode, discard segments — only wake
+                                    // keywords (handled above) matter.
+                                    if kws_active_since.is_none() {
+                                        kws_buf_start = None;
+                                    }
+                                } else if has_kws {
                                     // ── KWS-based classification ──────────
                                     if let Some(ref keyword) = pending_keyword.take() {
                                         // KWS identified a command → send to server for parameters.
@@ -2926,6 +3057,10 @@ fn main() -> Result<()> {
                     if let Some((ref spotter, ref kws_stream)) = kws_state {
                         spotter.reset(kws_stream);
                     }
+                    if let Some((ref spotter, ref kws_stream)) = sleep_kws_state {
+                        spotter.reset(kws_stream);
+                    }
+                    sleeping = false;
                     listening = false;
                     info!("Paused");
                     ctx.set_tray_status(TrayStatus::Idle);
