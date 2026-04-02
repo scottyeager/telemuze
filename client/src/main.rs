@@ -1866,6 +1866,9 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
     let lower = stt_text.to_lowercase();
     let stripped: String = lower.chars().filter(|c| !matches!(c, '.' | ',' | '!' | '?' | ';' | ':')).collect();
     let words: Vec<&str> = stripped.split_whitespace().collect();
+    // Normalize keyword case — the zh-en phone model produces uppercase labels.
+    let keyword = keyword.to_lowercase();
+    let keyword = keyword.as_str();
     debug!(keyword, text = stt_text, "Executing KWS command");
 
     // Determine how many trigger words to skip from the STT response
@@ -2600,7 +2603,7 @@ fn main() -> Result<()> {
                             spotter.decode(kws_stream);
                             if let Some(result) = spotter.get_result(kws_stream) {
                                 if !result.keyword.is_empty() {
-                                    let keyword = result.keyword.clone();
+                                    let keyword = result.keyword.to_lowercase();
                                     debug!(keyword, "KWS detected keyword");
                                     spotter.reset(kws_stream);
 
