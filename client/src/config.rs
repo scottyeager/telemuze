@@ -45,6 +45,7 @@ pub struct FileConfig {
     pub kws_model: Option<String>,
     pub kws_model_dir: Option<PathBuf>,
     pub kws_threshold: Option<f32>,
+    pub kws_sleep_threshold: Option<f32>,
     pub kws_score: Option<f32>,
     pub kws_threads: Option<i32>,
     pub kws_timeout: Option<f32>,
@@ -64,6 +65,8 @@ pub struct AliasConfig {
     pub scroll: Option<Vec<String>>,
     pub slash_command: Option<Vec<String>>,
     pub undo: Option<Vec<String>>,
+    pub wake: Option<Vec<String>>,
+    pub sleep: Option<Vec<String>>,
 }
 
 // ── Resolved (merged) config ─────────────────────────────────────────────
@@ -100,6 +103,7 @@ pub struct ResolvedConfig {
     pub kws_model: crate::kws::KwsModel,
     pub kws_model_dir: Option<PathBuf>,
     pub kws_threshold: f32,
+    pub kws_sleep_threshold: f32,
     pub kws_score: f32,
     pub kws_threads: i32,
     pub kws_timeout: f32,
@@ -115,6 +119,10 @@ pub struct ResolvedAliases {
     /// Each entry is a multi-word phrase split into individual words.
     pub slash_command: Vec<Vec<String>>,
     pub undo: Vec<String>,
+    /// Phrases that wake the client from sleep mode.
+    pub wake: Vec<String>,
+    /// Phrases that put the client to sleep (stop listening until woken).
+    pub sleep: Vec<String>,
 }
 
 // ── Default aliases (match the previously hardcoded consts) ──────────────
@@ -141,6 +149,14 @@ fn default_slash_command_phrases() -> Vec<String> {
 
 fn default_undo() -> Vec<String> {
     vec!["undo".into()]
+}
+
+fn default_wake() -> Vec<String> {
+    vec!["wake up".into()]
+}
+
+fn default_sleep() -> Vec<String> {
+    vec!["sleep".into()]
 }
 
 fn default_modifiers() -> Vec<(String, String)> {
@@ -363,6 +379,11 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("kws-threshold = {}", cfg.kws_threshold));
     line("");
 
+    line("# Keyword detection threshold used in sleep mode (for wake-word detection).");
+    line("# Higher than kws-threshold to reduce false wake-ups. Range: 0.0–1.0");
+    line(&format!("kws-sleep-threshold = {}", cfg.kws_sleep_threshold));
+    line("");
+
     line("# Keyword boost score.");
     line(&format!("kws-score = {}", cfg.kws_score));
     line("");
@@ -475,6 +496,8 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
             .map(|phrase| phrase.split_whitespace().map(String::from).collect())
             .collect(),
         undo: file.aliases.undo.unwrap_or_else(default_undo),
+        wake: file.aliases.wake.unwrap_or_else(default_wake),
+        sleep: file.aliases.sleep.unwrap_or_else(default_sleep),
     };
 
     // Resolve modifiers
@@ -521,6 +544,7 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         },
         kws_model_dir: r_opt!(kws_model_dir, "kws-model-dir"),
         kws_threshold: r!(kws_threshold, "kws-threshold"),
+        kws_sleep_threshold: r!(kws_sleep_threshold, "kws-sleep-threshold"),
         kws_score: r!(kws_score, "kws-score"),
         kws_threads: r!(kws_threads, "kws-threads"),
         kws_timeout: r!(kws_timeout, "kws-timeout"),
