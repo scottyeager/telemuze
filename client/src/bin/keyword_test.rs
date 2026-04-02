@@ -26,11 +26,8 @@ const RESET_INTERVAL_SECS: u32 = 60;
 #[derive(Parser)]
 #[command(name = "keyword-test", about = "Test sherpa-onnx keyword spotting from live mic")]
 struct Args {
-    /// Model variant: "gigaspeech" (English, BPE) or "zh-en" (Chinese+English, phone)
-    #[arg(long, default_value = "gigaspeech")]
-    model: String,
-
-    /// Path to model directory (auto-downloads the selected model if omitted)
+    /// Path to model directory (auto-downloads the default zh-en model if omitted).
+    /// Use a gigaspeech model dir for BPE-based English-only keyword spotting.
     #[arg(long)]
     model_dir: Option<PathBuf>,
 
@@ -74,10 +71,8 @@ fn main() -> Result<()> {
         bail!("Provide either --keywords or --keywords-file");
     }
 
-    let model: kws::KwsModel = args.model.parse()?;
-    let model_dir = args
-        .model_dir
-        .unwrap_or_else(|| kws::default_model_dir_for(model));
+    let model_dir = args.model_dir.unwrap_or_else(kws::default_model_dir);
+    let model = kws::detect_model(&model_dir).unwrap_or(kws::DEFAULT_MODEL);
 
     // Set up audio capture FIRST — before loading the model, because
     // onnxruntime initialization can interfere with ALSA thread setup.

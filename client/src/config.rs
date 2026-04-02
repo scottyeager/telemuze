@@ -42,6 +42,7 @@ pub struct FileConfig {
 
     // ── Keyword spotting ──────────────────────────────────────────────────
     pub no_kws: Option<bool>,
+    pub kws_model: Option<String>,
     pub kws_model_dir: Option<PathBuf>,
     pub kws_threshold: Option<f32>,
     pub kws_score: Option<f32>,
@@ -96,6 +97,7 @@ pub struct ResolvedConfig {
     pub scroll_ticks: u32,
     pub dump_audio: Option<PathBuf>,
     pub no_kws: bool,
+    pub kws_model: crate::kws::KwsModel,
     pub kws_model_dir: Option<PathBuf>,
     pub kws_threshold: f32,
     pub kws_score: f32,
@@ -344,6 +346,11 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("no-kws = {}", cfg.no_kws));
     line("");
 
+    line("# KWS model variant.");
+    line("# Options: \"gigaspeech\" (English, BPE) | \"zh-en\" (Chinese+English, phone)");
+    line(&format!("kws-model = \"{}\"", cfg.kws_model));
+    line("");
+
     line("# Path to KWS model directory. Auto-downloads if omitted.");
     match &cfg.kws_model_dir {
         Some(p) => line(&format!("kws-model-dir = \"{}\"", p.display())),
@@ -505,6 +512,13 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         scroll_ticks: r!(scroll_ticks, "scroll-ticks"),
         dump_audio: r_opt!(dump_audio, "dump-audio"),
         no_kws: r_bool!(no_kws, "no-kws"),
+        kws_model: if is_explicit(matches, "kws-model") {
+            cli.kws_model
+        } else if let Some(ref s) = file.kws_model {
+            s.parse().context("Invalid kws-model in config file")?
+        } else {
+            cli.kws_model
+        },
         kws_model_dir: r_opt!(kws_model_dir, "kws-model-dir"),
         kws_threshold: r!(kws_threshold, "kws-threshold"),
         kws_score: r!(kws_score, "kws-score"),

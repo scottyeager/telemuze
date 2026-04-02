@@ -202,6 +202,10 @@ struct Cli {
     #[arg(long)]
     no_kws: bool,
 
+    /// KWS model variant: "gigaspeech" (English, BPE) or "zh-en" (Chinese+English, phone).
+    #[arg(long, default_value_t = kws::DEFAULT_MODEL)]
+    kws_model: kws::KwsModel,
+
     /// Path to KWS model directory (auto-downloads if omitted).
     #[arg(long, env = "TELEMUZE_KWS_MODEL_DIR")]
     kws_model_dir: Option<PathBuf>,
@@ -2374,8 +2378,8 @@ fn main() -> Result<()> {
     let max_speech = cfg.max_speech;
     let no_kws = cfg.no_kws;
     let kws_cfg = kws::KwsConfig {
-        model: kws::DEFAULT_MODEL,
-        model_dir: cfg.kws_model_dir.clone().unwrap_or_else(kws::default_model_dir),
+        model: cfg.kws_model,
+        model_dir: cfg.kws_model_dir.clone().unwrap_or_else(|| kws::default_model_dir_for(cfg.kws_model)),
         keywords: build_kws_keywords(&cfg.aliases),
         keywords_score: cfg.kws_score,
         keywords_threshold: cfg.kws_threshold,

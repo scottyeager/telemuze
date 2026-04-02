@@ -74,7 +74,17 @@ impl std::str::FromStr for KwsModel {
 }
 
 /// The default model used when none is specified.
-pub const DEFAULT_MODEL: KwsModel = KwsModel::Gigaspeech;
+pub const DEFAULT_MODEL: KwsModel = KwsModel::ZhEn;
+
+/// Try to identify the model variant from a directory path by matching its
+/// name against the known model directory names.  Returns `None` if the
+/// directory name doesn't match any known model.
+pub fn detect_model(model_dir: &Path) -> Option<KwsModel> {
+    let name = model_dir.file_name()?.to_str()?;
+    [KwsModel::Gigaspeech, KwsModel::ZhEn]
+        .into_iter()
+        .find(|m| name == m.dir_name())
+}
 
 // ── BPE tokenizer ───────────────────────────────────────────────────────────
 
