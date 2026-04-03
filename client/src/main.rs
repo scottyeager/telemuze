@@ -3006,6 +3006,12 @@ fn main() -> Result<()> {
                                         vad.drain();
                                         was_detected = false;
                                         kws_consumed = true;
+                                        // Discard any in-progress dictation so the
+                                        // silence flush doesn't fire after sleeping.
+                                        mode = ListenMode::Idle;
+                                        utterance_audio.clear();
+                                        last_speech_time = None;
+                                        recording_hold_until = None;
                                         // Drain pending audio from the channel so the
                                         // tail of the sleep phrase isn't processed.
                                         while let Ok(Event::Audio(_)) = rx.try_recv() {}
