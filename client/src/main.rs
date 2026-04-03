@@ -2912,10 +2912,14 @@ fn main() -> Result<()> {
                 }
 
                 // ── Accumulate audio in dictation mode ────────────────
-                // Only append when we have an utterance in progress or
-                // speech is currently detected (to start a new one).
+                // Always append while in dictation and the silence timeout
+                // hasn't fired yet (last_speech_time is Some).  This
+                // prevents dropping chunks after an EOU flush clears
+                // utterance_audio while vad.detected() is stale-false.
                 if mode == ListenMode::Dictation
-                    && (!utterance_audio.is_empty() || vad.0.detected())
+                    && (!utterance_audio.is_empty()
+                        || vad.0.detected()
+                        || last_speech_time.is_some())
                 {
                     utterance_audio.extend_from_slice(&chunk);
                 }
