@@ -175,7 +175,7 @@ pub struct ResolvedAliases {
 // ── Default aliases (match the previously hardcoded consts) ──────────────
 
 fn default_click() -> Vec<String> {
-    vec!["mouse".into(), "click".into(), "look".into(), "lick".into()]
+    vec!["mouse".into()]
 }
 
 fn default_press() -> Vec<String> {
