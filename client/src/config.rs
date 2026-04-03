@@ -58,6 +58,7 @@ pub struct FileConfig {
     pub socket: Option<String>,
     pub verbose: Option<bool>,
     pub vad_threshold: Option<f32>,
+    pub vad_energy_gate: Option<f32>,
     pub idle_silence: Option<f32>,
     pub dictation_silence: Option<f32>,
     pub min_speech: Option<f32>,
@@ -126,6 +127,7 @@ pub struct ResolvedConfig {
     pub socket: String,
     pub verbose: bool,
     pub vad_threshold: f32,
+    pub vad_energy_gate: f32,
     pub idle_silence: f32,
     pub dictation_silence: f32,
     pub min_speech: f32,
@@ -330,6 +332,11 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line("# Speech detection threshold. Higher = harder to trigger.");
     line("# Range: 0.0–1.0");
     line(&format!("vad-threshold = {}", cfg.vad_threshold));
+    line("");
+
+    line("# Energy gate threshold (0.0–1.0). Frames quieter than this skip VAD inference,");
+    line("# reducing idle CPU usage. 0 disables the gate. Higher = more aggressive gating.");
+    line(&format!("vad-energy-gate = {}", cfg.vad_energy_gate));
     line("");
 
     line("# Silence duration (seconds) to end a segment in idle/command mode.");
@@ -597,6 +604,7 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         socket: r!(socket, "socket"),
         verbose: r_bool!(verbose, "verbose"),
         vad_threshold: r!(vad_threshold, "vad-threshold"),
+        vad_energy_gate: r!(vad_energy_gate, "vad-energy-gate"),
         idle_silence: r!(idle_silence, "idle-silence"),
         dictation_silence: r!(dictation_silence, "dictation-silence"),
         min_speech: r!(min_speech, "min-speech"),

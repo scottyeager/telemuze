@@ -44,6 +44,8 @@ const DEFAULT_DICTATION_MAX_SPEECH: f32 = 30.0;
 const DEFAULT_PREFILL_MS: u32 = 450;
 const DEFAULT_LOWERCASE_TIMEOUT: f32 = 5.0;
 
+const DEFAULT_VAD_ENERGY_GATE: f32 = 0.001;
+
 const DEFAULT_SCROLL_TICKS: u32 = 5;
 const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
 
@@ -136,6 +138,11 @@ struct Cli {
     /// VAD speech detection threshold (0.0–1.0). Higher = harder to trigger.
     #[arg(long, default_value_t = DEFAULT_VAD_THRESHOLD)]
     vad_threshold: f32,
+
+    /// Energy gate threshold (0.0–1.0). Audio frames quieter than this skip VAD
+    /// inference, reducing idle CPU. 0 disables the gate. Higher = more aggressive gating.
+    #[arg(long, default_value_t = DEFAULT_VAD_ENERGY_GATE)]
+    vad_energy_gate: f32,
 
     /// Silence duration (seconds) to end a segment in idle/command mode.
     #[arg(long, default_value_t = DEFAULT_IDLE_SILENCE)]
@@ -2625,6 +2632,9 @@ fn main() -> Result<()> {
     let tray_enabled = cfg.tray;
     let vad_model_path = cfg.vad_model_path.clone();
     let vad_threshold = cfg.vad_threshold;
+    // Pre-square the gate threshold so we can compare against mean-squared
+    // energy directly, avoiding a sqrt per frame.
+    let energy_gate_sq = cfg.vad_energy_gate * cfg.vad_energy_gate;
     let idle_silence = cfg.idle_silence;
     let min_speech = cfg.min_speech;
     let max_speech = cfg.max_speech;
@@ -3105,6 +3115,22 @@ fn main() -> Result<()> {
                 let mut switched_to_dictation = false;
                 while vad_pos + WINDOW_SIZE <= audio_buf.len() {
                     let frame = &audio_buf[vad_pos..vad_pos + WINDOW_SIZE];
+
+                    // Energy gate: skip VAD inference for silence frames when
+                    // no speech is active.  This avoids running the Silero
+                    // neural model ~31×/s during quiet periods.
+                    if energy_gate_sq > 0.0
+                        && !was_detected
+                        && kws_active_since.is_none()
+                        && mode == ListenMode::Idle
+                    {
+                        let sum_sq: f32 = frame.iter().map(|&s| s * s).sum();
+                        if sum_sq / WINDOW_SIZE as f32 <= energy_gate_sq {
+                            vad_pos += WINDOW_SIZE;
+                            continue;
+                        }
+                    }
+
                     vad.0.accept_waveform(frame);
                     vad_pos += WINDOW_SIZE;
 
