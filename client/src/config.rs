@@ -3,6 +3,40 @@
 use anyhow::{Context, Result};
 use clap::ArgMatches;
 use serde::Deserialize;
+
+/// Initial listening state when the client starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StartMode {
+    /// Actively listening for speech and commands.
+    #[default]
+    Active,
+    /// Sleeping — only wake keywords are processed (higher KWS threshold).
+    Sleeping,
+    /// Fully paused — audio capture is stopped, nothing is processed.
+    Paused,
+}
+
+impl std::fmt::Display for StartMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Active => write!(f, "active"),
+            Self::Sleeping => write!(f, "sleeping"),
+            Self::Paused => write!(f, "paused"),
+        }
+    }
+}
+
+impl std::str::FromStr for StartMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "active" => Ok(Self::Active),
+            "sleeping" | "sleep" => Ok(Self::Sleeping),
+            "paused" | "pause" => Ok(Self::Paused),
+            _ => anyhow::bail!("Unknown start-mode '{s}' — expected 'active', 'sleeping', or 'paused'"),
+        }
+    }
+}
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -37,6 +71,7 @@ pub struct FileConfig {
     pub lowercase_timeout: Option<f32>,
     pub min_dictation_words: Option<usize>,
     pub paused: Option<bool>,
+    pub start_mode: Option<String>,
     pub scroll_ticks: Option<u32>,
     pub dump_audio: Option<PathBuf>,
 
@@ -96,7 +131,7 @@ pub struct ResolvedConfig {
     pub continuation_lowercase: bool,
     pub lowercase_timeout: f32,
     pub min_dictation_words: usize,
-    pub paused: bool,
+    pub start_mode: StartMode,
     pub scroll_ticks: u32,
     pub dump_audio: Option<PathBuf>,
     pub no_kws: bool,
@@ -266,9 +301,9 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("verbose = {}", cfg.verbose));
     line("");
 
-    line("# Start in paused state (model loaded but not listening). Use `toggle` to begin.");
-    line("# Options: true | false");
-    line(&format!("paused = {}", cfg.paused));
+    line("# Initial state when starting up.");
+    line("# Options: \"active\" (listening), \"sleeping\" (wake words only), \"paused\" (fully off)");
+    line(&format!("start-mode = \"{}\"", cfg.start_mode));
     line("");
 
     line("# ── VAD tuning ────────────────────────────────────────────────────────────");
@@ -535,7 +570,15 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         continuation_lowercase: r_bool!(continuation_lowercase, "continuation-lowercase"),
         lowercase_timeout: r!(lowercase_timeout, "lowercase-timeout"),
         min_dictation_words: r!(min_dictation_words, "min-dictation-words"),
-        paused: r_bool!(paused, "paused"),
+        start_mode: if is_explicit(matches, "start-mode") {
+            cli.start_mode
+        } else if let Some(ref s) = file.start_mode {
+            s.parse().context("Invalid start-mode in config file")?
+        } else if file.paused == Some(true) {
+            StartMode::Paused
+        } else {
+            cli.start_mode
+        },
         scroll_ticks: r!(scroll_ticks, "scroll-ticks"),
         dump_audio: r_opt!(dump_audio, "dump-audio"),
         no_kws: r_bool!(no_kws, "no-kws"),

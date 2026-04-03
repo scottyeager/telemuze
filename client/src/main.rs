@@ -171,9 +171,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_LOWERCASE_TIMEOUT)]
     lowercase_timeout: f32,
 
-    /// Start in paused state (model loaded but not listening). Use `toggle` to begin.
-    #[arg(long)]
-    paused: bool,
+    /// Initial state: "active" (listening), "sleeping" (wake words only), "paused" (fully off).
+    #[arg(long, default_value_t = config::StartMode::Active)]
+    start_mode: config::StartMode,
 
     /// Lowercase the first letter of a segment in idle mode when the previous
     /// segment did not end with sentence-ending punctuation (. ! ?).
@@ -348,6 +348,12 @@ struct AppContext {
     aliases: ResolvedAliases,
     /// Modifier key mappings (spoken word → canonical name).
     modifiers: Vec<(String, String)>,
+    /// Sleep state — shared via Cell so command handlers can toggle it.
+    sleeping: Cell<bool>,
+    /// Normalized wake phrase labels (lowercased, spaces→underscores).
+    wake_labels: Vec<String>,
+    /// Normalized sleep phrase labels (lowercased, spaces→underscores).
+    sleep_labels: Vec<String>,
 }
 
 impl AppContext {
@@ -391,6 +397,13 @@ impl AppContext {
             min_dictation_words: cfg.min_dictation_words,
             dump_audio_dir: cfg.dump_audio,
             dump_audio_counter: AtomicU32::new(0),
+            sleeping: Cell::new(false),
+            wake_labels: cfg.aliases.wake.iter()
+                .map(|a| a.to_lowercase().replace(' ', "_"))
+                .collect(),
+            sleep_labels: cfg.aliases.sleep.iter()
+                .map(|a| a.to_lowercase().replace(' ', "_"))
+                .collect(),
             aliases: cfg.aliases,
             modifiers: cfg.modifiers,
         }
@@ -411,6 +424,39 @@ impl AppContext {
     fn set_tray_status(&self, status: TrayStatus) {
         if let Some(handle) = &self.tray_handle {
             handle.update(status);
+        }
+    }
+
+    /// Apply a wake/sleep transition detected from transcribed text.
+    /// Returns `true` if the state actually changed.
+    fn apply_wake_sleep(&self, wake: bool) -> bool {
+        let was_sleeping = self.sleeping.get();
+        if wake && was_sleeping {
+            info!("Wake phrase transcribed — resuming");
+            self.sleeping.set(false);
+            self.set_tray_status(TrayStatus::Listening);
+            if self.sound {
+                play_sound("message-new-instant");
+            }
+            if self.notify {
+                let id = show_notification("Listening...", "Woke up from sleep", self.notify_id.get());
+                self.notify_id.set(id);
+            }
+            true
+        } else if !wake && !was_sleeping {
+            info!("Sleep phrase transcribed — sleeping");
+            self.sleeping.set(true);
+            self.set_tray_status(TrayStatus::Sleeping);
+            if self.sound {
+                play_sound("message-new-instant");
+            }
+            if self.notify {
+                let id = show_notification("Sleeping...", "Say wake-up phrase to resume", self.notify_id.get());
+                self.notify_id.set(id);
+            }
+            true
+        } else {
+            false
         }
     }
 
@@ -747,6 +793,19 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     // Add alias phrases for slash command triggers
     for trigger in &aliases.slash_command {
         phrases.push(trigger.join(" "));
+    }
+    // Wake/sleep trigger phrases
+    for phrase in &aliases.wake {
+        phrases.push(phrase.clone());
+        for word in phrase.split_whitespace() {
+            words.push(word.to_string());
+        }
+    }
+    for phrase in &aliases.sleep {
+        phrases.push(phrase.clone());
+        for word in phrase.split_whitespace() {
+            words.push(word.to_string());
+        }
     }
     // Add alias phrases for click quadrant commands
     for trigger in &aliases.click {
@@ -1263,6 +1322,34 @@ fn is_undo_command(text: &str, undo_triggers: &[String]) -> bool {
     undo_triggers.iter().any(|t| stripped.eq_ignore_ascii_case(t))
 }
 
+/// Check if text starts with a wake or sleep phrase.
+/// Returns `Some(true)` to wake, `Some(false)` to sleep, or `None`.
+fn check_wake_sleep(text: &str, ctx: &AppContext) -> Option<bool> {
+    // Strip punctuation and normalize whitespace for matching.
+    let stripped: String = text
+        .chars()
+        .map(|c| if matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | '-' | '\'' | '"') { ' ' } else { c })
+        .collect();
+    let words: Vec<&str> = stripped.split_whitespace().collect();
+    let lower_joined = words.join(" ").to_lowercase();
+
+    // Check wake phrases
+    for phrase in &ctx.aliases.wake {
+        let p = phrase.to_lowercase();
+        if lower_joined == p || lower_joined.starts_with(&format!("{p} ")) {
+            return Some(true);
+        }
+    }
+    // Check sleep phrases
+    for phrase in &ctx.aliases.sleep {
+        let p = phrase.to_lowercase();
+        if lower_joined == p || lower_joined.starts_with(&format!("{p} ")) {
+            return Some(false);
+        }
+    }
+    None
+}
+
 /// Scan `text` for voice command phrases (case-insensitive, tolerant of
 /// punctuation between words) and split into text segments and command actions.
 fn process_voice_commands<'a>(text: &'a str, ctx: &AppContext) -> Vec<TextAction<'a>> {
@@ -1745,6 +1832,11 @@ fn classify_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Clas
         return ClassifyResult::Command(text);
     }
 
+    // Wake/sleep phrases are commands.
+    if check_wake_sleep(&text, ctx).is_some() {
+        return ClassifyResult::Command(text);
+    }
+
     // Check if the text starts with a command keyword.
     let actions = process_voice_commands(&text, ctx);
     let has_text = actions.iter().any(|a| matches!(a, TextAction::Text(_) | TextAction::OwnedText(_)));
@@ -1758,6 +1850,12 @@ fn classify_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Clas
 
 /// Execute voice commands from a transcription (used in idle mode).
 fn execute_commands(text: &str, ctx: &AppContext) {
+    // Check for wake/sleep phrases before other commands.
+    if let Some(wake) = check_wake_sleep(text, ctx) {
+        ctx.apply_wake_sleep(wake);
+        return;
+    }
+
     if is_undo_command(text, &ctx.aliases.undo) {
         let n = ctx.last_typed_chars.get();
         if n > 0 && ctx.type_text {
@@ -2226,8 +2324,12 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
         return;
     }
 
-    // Check for undo before the word-count filter — "undo" is a single word
-    // that would otherwise be dropped by min_dictation_words.
+    // Check for wake/sleep and undo before the word-count filter.
+    if let Some(wake) = check_wake_sleep(text, ctx) {
+        ctx.apply_wake_sleep(wake);
+        finish_segment_ui(ctx, tray_mode);
+        return;
+    }
     if is_undo_command(text, &ctx.aliases.undo) {
         execute_undo(ctx);
         finish_segment_ui(ctx, tray_mode);
@@ -2346,6 +2448,11 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
 }
 
 fn finish_segment_ui(ctx: &AppContext, mode: ListenMode) {
+    if ctx.sleeping.get() {
+        ctx.set_tray_status(TrayStatus::Sleeping);
+        // Notification already set by apply_wake_sleep.
+        return;
+    }
     ctx.set_tray_status(match mode {
         ListenMode::Idle => TrayStatus::Listening,
         ListenMode::Dictation => TrayStatus::Dictating,
@@ -2452,7 +2559,7 @@ fn main() -> Result<()> {
     // ── Start the daemon ───────────────────────────────────────────────
 
     let socket_path = cfg.socket.clone();
-    let paused = cfg.paused;
+    let start_mode = cfg.start_mode;
     let tray_enabled = cfg.tray;
     let vad_model_path = cfg.vad_model_path.clone();
     let vad_threshold = cfg.vad_threshold;
@@ -2486,15 +2593,6 @@ fn main() -> Result<()> {
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("Failed to bind socket: {}", socket_path))?;
 
-    // Pre-compute normalized labels for wake/sleep keyword matching
-    // (must happen before cfg is moved into AppContext).
-    let wake_labels: Vec<String> = cfg.aliases.wake.iter()
-        .map(|a| a.to_lowercase().replace(' ', "_"))
-        .collect();
-    let sleep_labels: Vec<String> = cfg.aliases.sleep.iter()
-        .map(|a| a.to_lowercase().replace(' ', "_"))
-        .collect();
-
     let mut ctx = AppContext::new(cfg);
 
     if let Some(dir) = &ctx.dump_audio_dir {
@@ -2508,10 +2606,10 @@ fn main() -> Result<()> {
 
     // Spawn system tray if requested
     if tray_enabled {
-        let initial = if paused {
-            TrayStatus::Idle
-        } else {
-            TrayStatus::Listening
+        let initial = match start_mode {
+            config::StartMode::Active => TrayStatus::Listening,
+            config::StartMode::Sleeping => TrayStatus::Sleeping,
+            config::StartMode::Paused => TrayStatus::Idle,
         };
         match tray::spawn_tray(tx.clone(), initial) {
             Ok(handle) => ctx.tray_handle = Some(handle),
@@ -2628,20 +2726,31 @@ fn main() -> Result<()> {
         None
     };
 
-    let mut listening = !paused;
+    let mut listening = start_mode != config::StartMode::Paused;
+    let mut sleeping = start_mode == config::StartMode::Sleeping;
+    ctx.sleeping.set(sleeping);
     if listening {
         stream.play().context("Failed to start audio stream")?;
     }
 
-    if ctx.notify && listening {
+    if ctx.notify && listening && !sleeping {
         let id = show_notification("Listening...", "Telemuze is active", 0);
+        ctx.notify_id.set(id);
+    } else if ctx.notify && sleeping {
+        let id = show_notification("Sleeping...", "Say wake-up phrase to resume", 0);
         ctx.notify_id.set(id);
     }
 
-    if listening {
-        info!("Listening (use `telemuze-listen stop` to shut down)");
-    } else {
-        info!("Ready (paused), use `telemuze-listen toggle` to start listening");
+    match start_mode {
+        config::StartMode::Active => {
+            info!("Listening (use `telemuze-listen stop` to shut down)");
+        }
+        config::StartMode::Sleeping => {
+            info!("Sleeping (say wake phrase to begin, or `telemuze-listen toggle`)");
+        }
+        config::StartMode::Paused => {
+            info!("Ready (paused), use `telemuze-listen toggle` to start listening");
+        }
     }
     info!(endpoint = %ctx.endpoint_url, "Server endpoint");
 
@@ -2660,7 +2769,6 @@ fn main() -> Result<()> {
     let mut pending_keyword: Option<String> = None;
     let mut kws_active_since: Option<Instant> = None;
     let mut kws_buf_start: Option<usize> = None; // audio_buf index at speech onset (with prefill)
-    let mut sleeping = false; // when true, only wake keywords are processed
 
     loop {
         match rx.recv() {
@@ -2683,6 +2791,7 @@ fn main() -> Result<()> {
                         debug!(silence, "Dictation silence, flushing and returning to idle");
                         ctx.set_tray_status(TrayStatus::Processing);
                         flush_utterance(&mut utterance_audio, &ctx, ListenMode::Idle);
+                        sleeping = ctx.sleeping.get();
                         mode = ListenMode::Idle;
                         vad.drain();
                         was_detected = false;
@@ -2696,6 +2805,7 @@ fn main() -> Result<()> {
                         debug!(duration = secs, "Dictation max speech, force-flushing");
                         ctx.set_tray_status(TrayStatus::RecordingProcessing);
                         flush_utterance(&mut utterance_audio, &ctx, ListenMode::Dictation);
+                        sleeping = ctx.sleeping.get();
                         // Reset so the next speech frame properly re-enters Recording.
                         was_detected = false;
                         recording_hold_until = None;
@@ -2728,51 +2838,27 @@ fn main() -> Result<()> {
                                     debug!(keyword, sleeping, "KWS detected keyword");
                                     spotter.reset(kws_stream);
 
-                                    if wake_labels.contains(&keyword) {
+                                    if ctx.wake_labels.contains(&keyword) {
                                         // Wake up from sleep mode.
-                                        info!("Wake keyword detected — resuming");
-                                        sleeping = false;
+                                        ctx.apply_wake_sleep(true);
+                                        sleeping = ctx.sleeping.get();
                                         kws_active_since = None;
                                         kws_buf_start = None;
                                         pending_keyword = None;
                                         vad.drain();
-                                        ctx.set_tray_status(TrayStatus::Listening);
                                         was_detected = false;
                                         kws_consumed = true;
-                                        if ctx.sound {
-                                            play_sound("message-new-instant");
-                                        }
-                                        if ctx.notify {
-                                            let id = show_notification(
-                                                "Listening...",
-                                                "Woke up from sleep",
-                                                ctx.notify_id.get(),
-                                            );
-                                            ctx.notify_id.set(id);
-                                        }
                                         break;
-                                    } else if sleep_labels.contains(&keyword) {
+                                    } else if ctx.sleep_labels.contains(&keyword) {
                                         // Enter sleep mode.
-                                        info!("Sleep keyword detected — sleeping");
-                                        sleeping = true;
+                                        ctx.apply_wake_sleep(false);
+                                        sleeping = ctx.sleeping.get();
                                         kws_active_since = None;
                                         kws_buf_start = None;
                                         pending_keyword = None;
                                         vad.drain();
-                                        ctx.set_tray_status(TrayStatus::Idle);
                                         was_detected = false;
                                         kws_consumed = true;
-                                        if ctx.sound {
-                                            play_sound("message-new-instant");
-                                        }
-                                        if ctx.notify {
-                                            let id = show_notification(
-                                                "Sleeping...",
-                                                "Say wake-up phrase to resume",
-                                                ctx.notify_id.get(),
-                                            );
-                                            ctx.notify_id.set(id);
-                                        }
                                         // Reset the sleep spotter stream for a clean start.
                                         if let Some((ref s, ref st)) = sleep_kws_state {
                                             s.reset(st);
@@ -2860,14 +2946,16 @@ fn main() -> Result<()> {
                         last_speech_time = Some(Instant::now());
                         recording_hold_until = None; // cancel pending transition
                         if !was_detected {
-                            ctx.set_tray_status(TrayStatus::Recording);
-                            if ctx.notify {
-                                let id = show_notification(
-                                    "Recording...",
-                                    "Speech detected",
-                                    ctx.notify_id.get(),
-                                );
-                                ctx.notify_id.set(id);
+                            if !sleeping {
+                                ctx.set_tray_status(TrayStatus::Recording);
+                                if ctx.notify {
+                                    let id = show_notification(
+                                        "Recording...",
+                                        "Speech detected",
+                                        ctx.notify_id.get(),
+                                    );
+                                    ctx.notify_id.set(id);
+                                }
                             }
                             // Start KWS classification window on speech onset in idle mode
                             let has_kws = if sleeping { sleep_kws_state.is_some() } else { kws_state.is_some() };
@@ -2899,9 +2987,13 @@ fn main() -> Result<()> {
                     if let Some(deadline) = recording_hold_until {
                         if !now_detected && Instant::now() >= deadline {
                             recording_hold_until = None;
-                            let status = match mode {
-                                ListenMode::Idle => TrayStatus::Listening,
-                                ListenMode::Dictation => TrayStatus::Dictating,
+                            let status = if sleeping {
+                                TrayStatus::Sleeping
+                            } else {
+                                match mode {
+                                    ListenMode::Idle => TrayStatus::Listening,
+                                    ListenMode::Dictation => TrayStatus::Dictating,
+                                }
                             };
                             ctx.set_tray_status(status);
                         }
@@ -2957,6 +3049,7 @@ fn main() -> Result<()> {
                                         match transcribe_command_segment(&samples, &ctx) {
                                             Some(text) => {
                                                 execute_kws_command(keyword, &text, &ctx);
+                                                sleeping = ctx.sleeping.get();
                                             }
                                             None => {
                                                 debug!("Command transcription returned empty");
@@ -2988,6 +3081,7 @@ fn main() -> Result<()> {
                                     match classify_segment(&samples, &ctx, ListenMode::Idle) {
                                         ClassifyResult::Command(text) => {
                                             execute_commands(&text, &ctx);
+                                            sleeping = ctx.sleeping.get();
                                             last_speech_time = Some(Instant::now());
                                             recording_hold_until = None;
                                             vad.drain();
@@ -3061,6 +3155,7 @@ fn main() -> Result<()> {
                         spotter.reset(kws_stream);
                     }
                     sleeping = false;
+                    ctx.sleeping.set(false);
                     listening = false;
                     info!("Paused");
                     ctx.set_tray_status(TrayStatus::Idle);
@@ -3087,6 +3182,7 @@ fn main() -> Result<()> {
 
             Ok(Event::Ipc(IpcCommand::Flush)) => {
                 drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
+                sleeping = ctx.sleeping.get();
                 was_detected = false;
                 recording_hold_until = None;
                 kws_active_since = None;
