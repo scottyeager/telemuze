@@ -2377,8 +2377,29 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
 
     info!("Dictation transcribed successfully");
 
-    // Apply continuation lowercasing for dictation.
-    let text = if ctx.should_lowercase_continuation(ListenMode::Dictation) {
+    // Check if the server's raw text starts lowercase (model's continuation signal).
+    let raw_starts_lowercase = text.chars().next().map(|c| c.is_lowercase()).unwrap_or(false);
+
+    // If raw text is lowercase AND previous segment ended with terminal punctuation,
+    // delete that punctuation — the model is signaling a continuation regardless of timing.
+    let should_delete_trailing_punct =
+        raw_starts_lowercase && ctx.last_ended_with_punctuation.get();
+
+    if should_delete_trailing_punct && ctx.type_text {
+        // type_into_window appends a space, so previous output was e.g. "good performance. "
+        // Cursor is after the space — delete space, delete punct, retype space.
+        send_key("BackSpace", &ctx.display_server);
+        send_key("BackSpace", &ctx.display_server);
+        send_key("space", &ctx.display_server);
+        // Net effect: removed 1 char (the punct). Adjust for undo.
+        let prev = ctx.last_typed_chars.get();
+        ctx.last_typed_chars.set(prev.saturating_sub(1));
+    }
+
+    // Apply continuation lowercasing.
+    // If we just deleted trailing punct, text is already lowercase from server — keep it.
+    // Otherwise use the existing continuation logic.
+    let text = if should_delete_trailing_punct || ctx.should_lowercase_continuation(ListenMode::Dictation) {
         lowercase_first_letter(text)
     } else {
         text.to_string()
