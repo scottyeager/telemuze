@@ -2988,6 +2988,9 @@ fn main() -> Result<()> {
                                         vad_pos = 0;
                                         was_detected = false;
                                         kws_consumed = true;
+                                        // Drain pending audio from the channel so the
+                                        // tail of the keyword phrase isn't processed.
+                                        while let Ok(Event::Audio(_)) = rx.try_recv() {}
                                         // Reset the normal spotter stream for a clean start.
                                         if let Some((ref s, ref st)) = kws_state {
                                             s.reset(st);
@@ -3007,6 +3010,9 @@ fn main() -> Result<()> {
                                         vad.drain();
                                         was_detected = false;
                                         kws_consumed = true;
+                                        // Drain pending audio from the channel so the
+                                        // tail of the sleep phrase isn't processed.
+                                        while let Ok(Event::Audio(_)) = rx.try_recv() {}
                                         // Reset the sleep spotter stream for a clean start.
                                         if let Some((ref s, ref st)) = sleep_kws_state {
                                             s.reset(st);
