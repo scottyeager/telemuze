@@ -32,6 +32,7 @@ async fn handle_transcription(
     mut multipart: Multipart,
 ) -> impl IntoResponse {
     let mut file_data: Option<Vec<u8>> = None;
+    let mut file_is_raw_pcm = false;
     let mut raw_hotwords: Option<String> = None;
     let mut hotwords_score: Option<f32> = None;
 
@@ -40,17 +41,20 @@ async fn handle_transcription(
         let name = field.name().unwrap_or("").to_string();
 
         match name.as_str() {
-            "file" => match field.bytes().await {
-                Ok(bytes) => file_data = Some(bytes.to_vec()),
-                Err(e) => {
-                    error!("Failed to read file field: {e}");
-                    return (
-                        StatusCode::BAD_REQUEST,
-                        Json(serde_json::json!({"error": "Failed to read uploaded file"})),
-                    )
-                        .into_response();
+            "file" => {
+                file_is_raw_pcm = field.content_type() == Some("audio/pcm");
+                match field.bytes().await {
+                    Ok(bytes) => file_data = Some(bytes.to_vec()),
+                    Err(e) => {
+                        error!("Failed to read file field: {e}");
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": "Failed to read uploaded file"})),
+                        )
+                            .into_response();
+                    }
                 }
-            },
+            }
             "hotwords" => {
                 if let Ok(text) = field.text().await {
                     raw_hotwords = Some(text);
@@ -78,18 +82,31 @@ async fn handle_transcription(
         }
     };
 
-    info!("Transcription request: {} bytes", file_data.len());
+    info!("Transcription request: {} bytes ({})", file_data.len(), if file_is_raw_pcm { "raw pcm" } else { "file" });
 
-    // Decode audio through the pure-Rust pipeline
-    let pcm = match audio::decode_to_pcm(&file_data) {
-        Ok(p) => p,
-        Err(e) => {
-            error!("Audio decode failed: {e}");
-            return (
-                StatusCode::UNPROCESSABLE_ENTITY,
-                Json(serde_json::json!({"error": format!("Audio decode failed: {e}")})),
-            )
-                .into_response();
+    let pcm = if file_is_raw_pcm {
+        match audio::decode_raw_f32le(&file_data) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("PCM decode failed: {e}");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": format!("PCM decode failed: {e}")})),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        match audio::decode_to_pcm(&file_data) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("Audio decode failed: {e}");
+                return (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": format!("Audio decode failed: {e}")})),
+                )
+                    .into_response();
+            }
         }
     };
 

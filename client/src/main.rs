@@ -439,11 +439,11 @@ impl AppContext {
     }
 
     /// If `--dump-audio` is set, write the WAV data to a sequentially numbered file.
-    fn maybe_dump_wav(&self, wav: &[u8], label: &str) {
+    fn maybe_dump_wav(&self, samples: &[f32], label: &str) {
         if let Some(dir) = &self.dump_audio_dir {
             let n = self.dump_audio_counter.fetch_add(1, Ordering::Relaxed);
             let path = dir.join(format!("{n:04}_{label}.wav"));
-            match std::fs::write(&path, wav) {
+            match encode_wav(samples).and_then(|wav| std::fs::write(&path, wav).map_err(Into::into)) {
                 Ok(()) => info!(?path, "Dumped audio segment"),
                 Err(e) => warn!(?path, "Failed to dump audio: {e}"),
             }
@@ -765,7 +765,7 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     let mut words: Vec<String> = Vec::new();
 
     // Command trigger keywords (canonical + aliases)
-    words.extend(["press", "click", "scroll", "slash", "command", "undo"].iter().map(|s| s.to_string()));
+    words.extend(["press", "mouse", "scroll", "slash", "command", "undo"].iter().map(|s| s.to_string()));
     words.extend(aliases.click.iter().cloned());
     words.extend(aliases.press.iter().cloned());
     words.extend(aliases.scroll.iter().cloned());
@@ -799,10 +799,10 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     // recognition than individual words alone.
     let mut phrases: Vec<String> = vec![
         "slash command".into(),
-        "click upper left".into(),
-        "click upper right".into(),
-        "click lower left".into(),
-        "click lower right".into(),
+        "mouse upper left".into(),
+        "mouse upper right".into(),
+        "mouse lower left".into(),
+        "mouse lower right".into(),
         "scroll up".into(),
         "scroll down".into(),
         "scroll top".into(),
@@ -1671,14 +1671,15 @@ fn encode_wav(samples: &[f32]) -> Result<Vec<u8>> {
 fn send_to_server(
     client: &reqwest::blocking::Client,
     url: &str,
-    wav_data: Vec<u8>,
+    samples: &[f32],
     smart: bool,
     hotwords: Option<&str>,
     hotwords_score: f32,
 ) -> Result<String> {
-    let part = reqwest::blocking::multipart::Part::bytes(wav_data)
-        .file_name("audio.wav")
-        .mime_str("audio/wav")?;
+    let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let part = reqwest::blocking::multipart::Part::bytes(pcm_bytes)
+        .file_name("audio.pcm")
+        .mime_str("audio/pcm")?;
     let mut form = reqwest::blocking::multipart::Form::new().part("file", part);
     if let Some(hw) = hotwords {
         form = form.text("hotwords", hw.to_string());
@@ -1824,17 +1825,9 @@ fn classify_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Clas
         ctx.notify_id.set(id);
     }
 
-    let wav = match encode_wav(samples) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("WAV encode failed: {e}");
-            finish_segment_ui(ctx, mode);
-            return ClassifyResult::Error;
-        }
-    };
-    ctx.maybe_dump_wav(&wav, "idle");
+    ctx.maybe_dump_wav(samples, "idle");
 
-    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart, Some(&ctx.command_hotwords), ctx.command_hotwords_score) {
+    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, samples, ctx.smart, Some(&ctx.command_hotwords), ctx.command_hotwords_score) {
         Ok(t) => t,
         Err(e) => {
             error!("Classification request failed: {e}");
@@ -1987,19 +1980,12 @@ fn transcribe_command_segment(samples: &[f32], ctx: &AppContext) -> Option<Strin
 
     ctx.set_tray_status(TrayStatus::Processing);
 
-    let wav = match encode_wav(samples) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("WAV encode failed: {e}");
-            return None;
-        }
-    };
-    ctx.maybe_dump_wav(&wav, "kws_cmd");
+    ctx.maybe_dump_wav(samples, "kws_cmd");
 
     let text = match send_to_server(
         &ctx.http_client,
         &ctx.endpoint_url,
-        wav,
+        samples,
         ctx.smart,
         Some(&ctx.command_hotwords),
         ctx.command_hotwords_score,
@@ -2331,18 +2317,9 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
         ctx.notify_id.set(id);
     }
 
-    let wav = match encode_wav(utterance_audio) {
-        Ok(w) => w,
-        Err(e) => {
-            error!("WAV encode failed: {e}");
-            utterance_audio.clear();
-            finish_segment_ui(ctx, tray_mode);
-            return;
-        }
-    };
-    ctx.maybe_dump_wav(&wav, "dictation");
+    ctx.maybe_dump_wav(utterance_audio, "dictation");
 
-    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, wav, ctx.smart, ctx.dictation_hotwords.as_deref(), ctx.dictation_hotwords_score) {
+    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, utterance_audio, ctx.smart, ctx.dictation_hotwords.as_deref(), ctx.dictation_hotwords_score) {
         Ok(t) => t,
         Err(e) => {
             error!("Dictation request failed: {e}");

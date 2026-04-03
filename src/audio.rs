@@ -1,7 +1,8 @@
-//! Audio/video decoding via FFmpeg.
+//! Audio decoding utilities.
 //!
-//! Shells out to `ffmpeg` to decode any audio or video file into
-//! mono 16kHz f32 PCM suitable for speech-to-text models.
+//! `decode_to_pcm` shells out to `ffmpeg` to decode arbitrary audio/video
+//! files into mono 16kHz f32 PCM.  `decode_raw_f32le` is a zero-copy fast
+//! path for clients that already produce 16kHz mono f32le PCM directly.
 
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -59,4 +60,20 @@ pub fn decode_to_pcm(data: &[u8]) -> Result<Vec<f32>> {
         .collect();
 
     Ok(samples)
+}
+
+/// Interpret raw f32le bytes as mono 16kHz PCM.
+///
+/// Used for audio sent directly by the telemuze client, which already produces
+/// 16kHz mono f32le samples — no FFmpeg subprocess needed.
+pub fn decode_raw_f32le(data: &[u8]) -> Result<Vec<f32>> {
+    anyhow::ensure!(
+        data.len() % 4 == 0,
+        "PCM byte length {} is not a multiple of 4",
+        data.len()
+    );
+    Ok(data
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
 }
