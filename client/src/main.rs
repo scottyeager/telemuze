@@ -20,7 +20,7 @@ use sherpa_onnx::{SileroVadModelConfig, VadModelConfig, VoiceActivityDetector};
 use std::cell::Cell;
 use std::io::{self, BufRead, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -84,9 +84,15 @@ struct Cli {
     config: Option<PathBuf>,
 
     /// Print the full resolved configuration as TOML (with comments) and exit.
-    /// Reads the current config file, fills in any missing options with defaults.
+    /// Optionally accepts an output file path; if omitted, prints to stdout.
+    /// Using a file path avoids shell-redirect truncation of the config file.
+    #[arg(long, num_args = 0..=1, value_name = "FILE")]
+    dump_config: Option<Option<PathBuf>>,
+
+    /// Update the config file in place with the full resolved configuration and exit.
+    /// Writes back to the file specified by --config (or the default location).
     #[arg(long)]
-    dump_config: bool,
+    update_config: bool,
 
     /// Telemuze server URL
     #[arg(long, env = "TELEMUZE_URL", default_value = "http://127.0.0.1:7313")]
@@ -2533,8 +2539,45 @@ fn main() -> Result<()> {
     // Merge config file + CLI args
     let (cfg, config_path) = config::resolve(&cli, &matches)?;
 
-    if cli.dump_config {
-        print!("{}", config::dump(&cfg));
+    if let Some(maybe_path) = &cli.dump_config {
+        let content = config::dump(&cfg);
+        match maybe_path {
+            None => print!("{content}"),
+            Some(path) => {
+                let parent = path.parent().unwrap_or_else(|| Path::new("."));
+                std::fs::create_dir_all(parent)?;
+                let tmp = parent.join(format!(
+                    ".{}.tmp",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "dump-config".into())
+                ));
+                std::fs::write(&tmp, &content)?;
+                std::fs::rename(&tmp, path)?;
+                eprintln!("Config written to {}", path.display());
+            }
+        }
+        return Ok(());
+    }
+
+    if cli.update_config {
+        let content = config::dump(&cfg);
+        let path = config_path.unwrap_or_else(|| {
+            dirs_next::config_dir()
+                .unwrap_or_else(|| PathBuf::from("."))
+                .join("telemuze/listen.toml")
+        });
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let tmp = parent.join(format!(
+            ".{}.tmp",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "listen.toml".into())
+        ));
+        std::fs::write(&tmp, &content)?;
+        std::fs::rename(&tmp, &path)?;
+        eprintln!("Config updated: {}", path.display());
         return Ok(());
     }
 
