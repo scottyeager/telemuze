@@ -2042,6 +2042,8 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
     };
 
     let params: Vec<&str> = words.iter().skip(skip).copied().collect();
+    // Fallback params with no skip — used when STT drops the trigger keyword.
+    let params_fallback: Vec<&str> = if skip > 0 { words.to_vec() } else { vec![] };
     let params_str = params.join(" ");
 
     // Track how many params are consumed by the primary command so we can
@@ -2067,18 +2069,35 @@ fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
                     else { println!("[click lower right]"); }
                 }
                 _ => {
-                    // Try coordinate: two numbers
-                    if params.len() >= 2 {
-                        if let (Some(x), Some(y)) = (
-                            parse_spoken_number_simple(&params, 0),
-                            parse_spoken_number_simple(&params, 1),
-                        ) {
-                            if ctx.type_text { click_coordinate(x, y); }
-                            else { println!("[click {x} {y}]"); }
-                        } else {
-                            debug!(params = ?params, "Could not parse click parameters");
-                            return;
+                    // Try to parse a coordinate pair from a slice of words.
+                    // Handles two separate tokens ("fifty fifty") and one hyphenated token ("50-50").
+                    let try_coords = |p: &[&str]| -> Option<(u32, u32)> {
+                        if p.len() >= 2 {
+                            if let (Some(x), Some(y)) = (
+                                parse_spoken_number_simple(p, 0),
+                                parse_spoken_number_simple(p, 1),
+                            ) {
+                                return Some((x, y));
+                            }
                         }
+                        if let Some(first) = p.first() {
+                            if let Some((left, right)) = first.split_once('-') {
+                                if let (Ok(x), Ok(y)) = (left.parse::<u32>(), right.parse::<u32>()) {
+                                    return Some((x, y));
+                                }
+                            }
+                        }
+                        None
+                    };
+
+                    // Try with skipped params first (normal: keyword was transcribed).
+                    // If that fails, retry with all words in case STT dropped the keyword.
+                    let coords = try_coords(&params)
+                        .or_else(|| if !params_fallback.is_empty() { try_coords(&params_fallback) } else { None });
+
+                    if let Some((x, y)) = coords {
+                        if ctx.type_text { click_coordinate(x, y); }
+                        else { println!("[click {x} {y}]"); }
                     } else {
                         debug!(params = ?params, "Could not parse click parameters");
                         return;
