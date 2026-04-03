@@ -9,6 +9,7 @@
 //! and `stop` to shut down.
 
 mod config;
+mod eou;
 mod kws;
 mod tray;
 
@@ -238,6 +239,28 @@ struct Cli {
     /// falling through to dictation mode.
     #[arg(long, default_value_t = DEFAULT_KWS_TIMEOUT)]
     kws_timeout: f32,
+
+    // ── End-of-utterance model ──────────────────────────────────────────
+
+    /// Disable the streaming EOU model (semantic segmentation of dictation).
+    #[arg(long)]
+    no_eou: bool,
+
+    /// Path to EOU model directory (default: auto-detect).
+    #[arg(long, env = "TELEMUZE_EOU_MODEL_DIR")]
+    eou_model_dir: Option<PathBuf>,
+
+    /// Number of threads for the EOU model.
+    #[arg(long, default_value_t = eou::DEFAULT_EOU_THREADS)]
+    eou_threads: i32,
+
+    /// Blank token penalty for EOU model (0.0 = default, positive = more token emissions).
+    #[arg(long, default_value_t = eou::DEFAULT_EOU_BLANK_PENALTY)]
+    eou_blank_penalty: f32,
+
+    /// Use full-precision EOU models instead of int8 quantized.
+    #[arg(long)]
+    eou_no_int8: bool,
 }
 
 #[derive(Subcommand)]
@@ -2629,6 +2652,14 @@ fn main() -> Result<()> {
         num_threads: cfg.kws_threads,
     };
     let kws_timeout_secs = cfg.kws_timeout;
+    let no_eou = cfg.no_eou;
+    let eou_model_dir = cfg.eou_model_dir.clone();
+    let eou_cfg = eou::EouConfig {
+        model_dir: eou_model_dir.unwrap_or_else(eou::default_model_dir),
+        num_threads: cfg.eou_threads,
+        blank_penalty: cfg.eou_blank_penalty,
+        use_int8: !cfg.eou_no_int8,
+    };
 
     // Clean up stale socket
     let _ = std::fs::remove_file(&socket_path);
@@ -2769,6 +2800,24 @@ fn main() -> Result<()> {
         None
     };
 
+    // ── EOU recognizer (initialized after audio to avoid ALSA/onnxruntime interference) ──
+    let eou_state = if !no_eou {
+        info!("Initializing EOU recognizer");
+        match eou::init_eou(&eou_cfg) {
+            Ok((recognizer, eou_stream)) => {
+                info!("EOU recognizer ready");
+                Some((recognizer, eou_stream))
+            }
+            Err(e) => {
+                warn!("EOU recognizer unavailable: {e}");
+                None
+            }
+        }
+    } else {
+        info!("EOU model disabled (--no-eou)");
+        None
+    };
+
     let mut listening = start_mode != config::StartMode::Paused;
     let mut sleeping = start_mode == config::StartMode::Sleeping;
     ctx.sleeping.set(sleeping);
@@ -2813,6 +2862,9 @@ fn main() -> Result<()> {
     let mut kws_active_since: Option<Instant> = None;
     let mut kws_buf_start: Option<usize> = None; // audio_buf index at speech onset (with prefill)
 
+    // EOU state
+    let mut eou_active = false;
+
     loop {
         match rx.recv() {
             Ok(Event::Audio(chunk)) => {
@@ -2840,6 +2892,10 @@ fn main() -> Result<()> {
                         was_detected = false;
                         last_speech_time = None;
                         recording_hold_until = None;
+                        if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                            recognizer.reset(eou_stream);
+                        }
+                        eou_active = false;
                     }
 
                     // Force-flush if utterance is too long.
@@ -2852,6 +2908,10 @@ fn main() -> Result<()> {
                         // Reset so the next speech frame properly re-enters Recording.
                         was_detected = false;
                         recording_hold_until = None;
+                        if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                            recognizer.reset(eou_stream);
+                        }
+                        // Stay eou_active since we're still in dictation
                     }
                 }
 
@@ -2862,6 +2922,39 @@ fn main() -> Result<()> {
                     && (!utterance_audio.is_empty() || vad.0.detected())
                 {
                     utterance_audio.extend_from_slice(&chunk);
+                }
+
+                // ── Feed EOU when in dictation mode ─────────────────
+                if mode == ListenMode::Dictation && !utterance_audio.is_empty() {
+                    if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                        if !eou_active {
+                            // Starting a new EOU session — feed backlog audio
+                            // so the model catches up with audio accumulated
+                            // before it was activated (idle→dictation transition).
+                            recognizer.reset(eou_stream);
+                            let backlog_end = utterance_audio.len().saturating_sub(chunk.len());
+                            if backlog_end > 0 {
+                                eou_stream.accept_waveform(
+                                    SAMPLE_RATE as i32,
+                                    &utterance_audio[..backlog_end],
+                                );
+                            }
+                            eou_active = true;
+                        }
+                        eou_stream.accept_waveform(SAMPLE_RATE as i32, &chunk);
+
+                        if let Some(event) = eou::decode_all(recognizer, eou_stream) {
+                            match event {
+                                eou::EouEvent::Eou(ref text) => {
+                                    debug!(text, "EOU boundary — flushing dictation");
+                                    ctx.set_tray_status(TrayStatus::RecordingProcessing);
+                                    flush_utterance(&mut utterance_audio, &ctx, ListenMode::Dictation);
+                                    recognizer.reset(eou_stream);
+                                }
+                                eou::EouEvent::Partial(_) => {}
+                            }
+                        }
+                    }
                 }
 
                 audio_buf.extend_from_slice(&chunk);
@@ -2899,6 +2992,10 @@ fn main() -> Result<()> {
                                         if let Some((ref s, ref st)) = kws_state {
                                             s.reset(st);
                                         }
+                                        if let Some((ref r, ref s)) = eou_state {
+                                            r.reset(s);
+                                        }
+                                        eou_active = false;
                                         break;
                                     } else if ctx.sleep_labels.contains(&keyword) {
                                         // Enter sleep mode.
@@ -2914,6 +3011,10 @@ fn main() -> Result<()> {
                                         if let Some((ref s, ref st)) = sleep_kws_state {
                                             s.reset(st);
                                         }
+                                        if let Some((ref r, ref s)) = eou_state {
+                                            r.reset(s);
+                                        }
+                                        eou_active = false;
                                         break;
                                     } else if keyword == "undo" {
                                         execute_undo(&ctx);
@@ -2924,6 +3025,10 @@ fn main() -> Result<()> {
                                         ctx.set_tray_status(TrayStatus::Listening);
                                         was_detected = false;
                                         kws_consumed = true;
+                                        if let Some((ref r, ref s)) = eou_state {
+                                            r.reset(s);
+                                        }
+                                        eou_active = false;
                                         break;
                                     } else {
                                         pending_keyword = Some(keyword);
@@ -3205,6 +3310,10 @@ fn main() -> Result<()> {
                     if let Some((ref spotter, ref kws_stream)) = sleep_kws_state {
                         spotter.reset(kws_stream);
                     }
+                    if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                        recognizer.reset(eou_stream);
+                    }
+                    eou_active = false;
                     sleeping = false;
                     ctx.sleeping.set(false);
                     listening = false;
@@ -3242,6 +3351,10 @@ fn main() -> Result<()> {
                 if let Some((ref spotter, ref kws_stream)) = kws_state {
                     spotter.reset(kws_stream);
                 }
+                if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                    recognizer.reset(eou_stream);
+                }
+                eou_active = false;
             }
 
             Ok(Event::Ipc(IpcCommand::Stop)) => {

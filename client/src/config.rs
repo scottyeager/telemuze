@@ -85,6 +85,13 @@ pub struct FileConfig {
     pub kws_threads: Option<i32>,
     pub kws_timeout: Option<f32>,
 
+    // ── End-of-utterance model ───────────────────────────────────────────
+    pub no_eou: Option<bool>,
+    pub eou_model_dir: Option<PathBuf>,
+    pub eou_threads: Option<i32>,
+    pub eou_blank_penalty: Option<f32>,
+    pub eou_no_int8: Option<bool>,
+
     #[serde(default)]
     pub aliases: AliasConfig,
 
@@ -142,6 +149,11 @@ pub struct ResolvedConfig {
     pub kws_score: f32,
     pub kws_threads: i32,
     pub kws_timeout: f32,
+    pub no_eou: bool,
+    pub eou_model_dir: Option<PathBuf>,
+    pub eou_threads: i32,
+    pub eou_blank_penalty: f32,
+    pub eou_no_int8: bool,
     pub aliases: ResolvedAliases,
     pub modifiers: Vec<(String, String)>,
 }
@@ -432,6 +444,33 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("kws-timeout = {}", cfg.kws_timeout));
     line("");
 
+    line("# ── End-of-utterance model ─────────────────────────────────────────────");
+    line("# Disable the streaming EOU model (semantic segmentation of dictation).");
+    line("# Options: true | false");
+    line(&format!("no-eou = {}", cfg.no_eou));
+    line("");
+
+    line("# Path to EOU model directory. Model must be pre-installed (not auto-downloaded).");
+    match &cfg.eou_model_dir {
+        Some(p) => line(&format!("eou-model-dir = \"{}\"", p.display())),
+        None => line("# eou-model-dir = \"/path/to/parakeet-realtime-eou-120m-v1\""),
+    }
+    line("");
+
+    line("# Number of threads for the EOU model.");
+    line(&format!("eou-threads = {}", cfg.eou_threads));
+    line("");
+
+    line("# Blank token penalty (positive = fewer blanks = more token emissions).");
+    line("# Range: 0.0–5.0");
+    line(&format!("eou-blank-penalty = {}", cfg.eou_blank_penalty));
+    line("");
+
+    line("# Use full-precision EOU models instead of int8 quantized.");
+    line("# Options: true | false");
+    line(&format!("eou-no-int8 = {}", cfg.eou_no_int8));
+    line("");
+
     line("# ── Voice command trigger aliases ────────────────────────────────────────");
     line("# Each key maps a command type to alternate spoken words that trigger it.");
     line("# The STT model sometimes mishears these words, so add common misrecognitions.");
@@ -595,6 +634,11 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         kws_score: r!(kws_score, "kws-score"),
         kws_threads: r!(kws_threads, "kws-threads"),
         kws_timeout: r!(kws_timeout, "kws-timeout"),
+        no_eou: r_bool!(no_eou, "no-eou"),
+        eou_model_dir: r_opt!(eou_model_dir, "eou-model-dir"),
+        eou_threads: r!(eou_threads, "eou-threads"),
+        eou_blank_penalty: r!(eou_blank_penalty, "eou-blank-penalty"),
+        eou_no_int8: r_bool!(eou_no_int8, "eou-no-int8"),
         aliases,
         modifiers,
     }, config_path))
