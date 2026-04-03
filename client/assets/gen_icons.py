@@ -44,7 +44,7 @@ def bullseye(dist, s):
 if __name__ == "__main__":
     print(f"Generating {SIZE}x{SIZE} tray icons...")
     gen_icon("idle.rgba",                 ring,     0x88, 0x88, 0x88)
-    gen_icon("sleeping.rgba",            bullseye, 0x88, 0x88, 0x88)
+    gen_icon("sleeping.rgba",            filled,   0x88, 0x88, 0x88)
     gen_icon("listening.rgba",            ring,     0x4C, 0xAF, 0x50)
     gen_icon("dictating.rgba",            filled,   0x4C, 0xAF, 0x50)
     gen_icon("recording.rgba",            filled_lg, 0xF4, 0x43, 0x36)
