@@ -2839,15 +2839,23 @@ fn main() -> Result<()> {
                                     spotter.reset(kws_stream);
 
                                     if ctx.wake_labels.contains(&keyword) {
-                                        // Wake up from sleep mode.
+                                        // Wake up from sleep mode — clean transition
+                                        // to idle. Discard all buffered audio so the
+                                        // wake phrase doesn't bleed into dictation.
                                         ctx.apply_wake_sleep(true);
                                         sleeping = ctx.sleeping.get();
                                         kws_active_since = None;
                                         kws_buf_start = None;
                                         pending_keyword = None;
                                         vad.drain();
+                                        audio_buf.clear();
+                                        vad_pos = 0;
                                         was_detected = false;
                                         kws_consumed = true;
+                                        // Reset the normal spotter stream for a clean start.
+                                        if let Some((ref s, ref st)) = kws_state {
+                                            s.reset(st);
+                                        }
                                         break;
                                     } else if ctx.sleep_labels.contains(&keyword) {
                                         // Enter sleep mode.
