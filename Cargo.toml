@@ -18,7 +18,7 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 # Audio pipeline — uses ffmpeg subprocess (must be installed on host)
 
 # STT + VAD engine (sherpa-onnx: Parakeet TDT + Silero VAD)
-sherpa-onnx = { version = "1.12", default-features = false, features = ["shared"] }
+sherpa-onnx = { version = "1.12", default-features = false }
 
 # Phonetic dictionary pipeline
 rphonetic = "3"
@@ -48,3 +48,18 @@ bytes = "1"
 # Telegram bot (MTProto)
 grammers-client = "0.9"
 grammers-session = "0.9"
+
+# Audio capture (for examples)
+cpal = { version = "0.16", optional = true }
+ctrlc = { version = "3.4", optional = true }
+libc = "0.2"
+
+[features]
+default = ["shared"]
+shared = ["sherpa-onnx/shared"]
+static = ["sherpa-onnx/static"]
+mic = ["cpal", "ctrlc"]
+
+[[example]]
+name = "speculative_decode"
+required-features = ["mic"]
