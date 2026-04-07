@@ -8,9 +8,9 @@
 //! Use `toggle` to pause/resume, `flush` to force a segment boundary,
 //! and `stop` to shut down.
 
+mod cmd;
 mod config;
 mod eou;
-mod kws;
 mod tray;
 
 use anyhow::{Context, Result};
@@ -36,8 +36,9 @@ const WINDOW_SIZE: usize = 512; // sherpa-onnx Silero VAD frame size
 // ── VAD defaults ───────────────────────────────────────────────────────────
 
 const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
-const DEFAULT_IDLE_SILENCE: f32 = 0.4;
-const DEFAULT_DICTATION_SILENCE: f32 = 1.5;
+const DEFAULT_FAST_SILENCE: f32 = 0.4;
+const DEFAULT_SLOW_SILENCE: f32 = 1.5;
+const DEFAULT_FINAL_SILENCE: f32 = 3.0;
 const DEFAULT_MIN_SPEECH: f32 = 0.1;
 const DEFAULT_MAX_SPEECH: f32 = 15.0;
 const DEFAULT_DICTATION_MAX_SPEECH: f32 = 30.0;
@@ -49,13 +50,6 @@ const DEFAULT_VAD_ENERGY_GATE: f32 = 0.001;
 const DEFAULT_SCROLL_TICKS: u32 = 5;
 const DEFAULT_SOCKET: &str = "/tmp/telemuze-listen.sock";
 
-// ── KWS defaults ──────────────────────────────────────────────────────────
-
-const DEFAULT_KWS_THRESHOLD: f32 = 0.25;
-const DEFAULT_KWS_SLEEP_THRESHOLD: f32 = 0.5;
-const DEFAULT_KWS_SCORE: f32 = 1.0;
-const DEFAULT_KWS_THREADS: i32 = 2;
-const DEFAULT_KWS_TIMEOUT: f32 = 1.0;
 
 // ── Event types ────────────────────────────────────────────────────────────
 
@@ -144,13 +138,24 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_VAD_ENERGY_GATE)]
     vad_energy_gate: f32,
 
-    /// Silence duration (seconds) to end a segment in idle/command mode.
-    #[arg(long, default_value_t = DEFAULT_IDLE_SILENCE)]
-    idle_silence: f32,
+    /// Fast silence threshold (seconds). Idle mode: VAD min silence.
+    /// Speculative mode: triggers decode.
+    #[arg(long, default_value_t = DEFAULT_FAST_SILENCE)]
+    fast_silence: f32,
 
-    /// Silence duration (seconds) to end a segment in dictation mode.
-    #[arg(long, default_value_t = DEFAULT_DICTATION_SILENCE)]
-    dictation_silence: f32,
+    /// Slow silence threshold (seconds). VAD mode: flushes dictation.
+    /// Speculative mode: emits text if it ends with sentence punctuation.
+    #[arg(long, default_value_t = DEFAULT_SLOW_SILENCE)]
+    slow_silence: f32,
+
+    /// Final silence threshold (seconds). Speculative mode: emits text unconditionally.
+    #[arg(long, default_value_t = DEFAULT_FINAL_SILENCE)]
+    final_silence: f32,
+
+    /// Dictation segmenting mode: "vad" (silence-based flush) or "speculative"
+    /// (server-side decode with punctuation-gated output).
+    #[arg(long, default_value_t = config::SegmentingMode::Vad)]
+    segmenting: config::SegmentingMode,
 
     /// Minimum speech duration (seconds) before a segment is valid.
     #[arg(long, default_value_t = DEFAULT_MIN_SPEECH)]
@@ -171,10 +176,6 @@ struct Cli {
     /// Comma-separated list of words to boost during dictation (hotwords).
     #[arg(long, env = "TELEMUZE_HOTWORDS")]
     hotwords: Option<String>,
-
-    /// Score boost for command hotwords in idle mode (0.0 = disabled). Range: 1.0–4.0.
-    #[arg(long, env = "TELEMUZE_COMMAND_HOTWORDS_SCORE", default_value_t = 1.5)]
-    command_hotwords_score: f32,
 
     /// Score boost for user-provided dictation hotwords (0.0 = disabled). Range: 1.0–4.0.
     #[arg(long, env = "TELEMUZE_DICTATION_HOTWORDS_SCORE", default_value_t = 1.5)]
@@ -211,41 +212,31 @@ struct Cli {
     #[arg(long, short, env = "TELEMUZE_VERBOSE")]
     verbose: bool,
 
-    // ── Keyword spotting ──────────────────────────────────────────────────
+    // ── Local command detection (110m transducer) ─────────────────────────
 
-    /// Disable keyword spotting (fall back to server-side classification).
+    /// Disable local command detection (fall back to server-side only).
     #[arg(long)]
-    no_kws: bool,
+    no_cmd: bool,
 
-    /// KWS model variant: "gigaspeech" (English, BPE) or "zh-en" (Chinese+English, phone).
-    #[arg(long, default_value_t = kws::DEFAULT_MODEL)]
-    kws_model: kws::KwsModel,
+    /// Path to Parakeet-TDT 110m model directory (auto-downloads if omitted).
+    #[arg(long, env = "TELEMUZE_CMD_MODEL_DIR")]
+    cmd_model_dir: Option<PathBuf>,
 
-    /// Path to KWS model directory (auto-downloads if omitted).
-    #[arg(long, env = "TELEMUZE_KWS_MODEL_DIR")]
-    kws_model_dir: Option<PathBuf>,
+    /// Hotword boost score for command vocabulary (1.0–5.0).
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST)]
+    cmd_boost: f32,
 
-    /// Keyword detection threshold (0.0–1.0). Lower = more sensitive.
-    #[arg(long, default_value_t = DEFAULT_KWS_THRESHOLD)]
-    kws_threshold: f32,
+    /// Silence duration (ms) after speech ends to trigger command decode.
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_SILENCE_MS)]
+    cmd_silence_ms: u32,
 
-    /// Keyword detection threshold used in sleep mode for wake-word detection.
-    /// Higher than kws-threshold to reduce false wake-ups. (0.0–1.0)
-    #[arg(long, default_value_t = DEFAULT_KWS_SLEEP_THRESHOLD)]
-    kws_sleep_threshold: f32,
+    /// Number of threads for the command recognizer.
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_THREADS)]
+    cmd_threads: i32,
 
-    /// Keyword boost score.
-    #[arg(long, default_value_t = DEFAULT_KWS_SCORE)]
-    kws_score: f32,
-
-    /// Number of threads for the KWS model.
-    #[arg(long, default_value_t = DEFAULT_KWS_THREADS)]
-    kws_threads: i32,
-
-    /// Seconds to wait for keyword detection after VAD speech onset before
-    /// falling through to dictation mode.
-    #[arg(long, default_value_t = DEFAULT_KWS_TIMEOUT)]
-    kws_timeout: f32,
+    /// Beam search width (max_active_paths) for command recognizer.
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BEAM_WIDTH)]
+    cmd_beam_width: i32,
 
     // ── End-of-utterance model ──────────────────────────────────────────
 
@@ -361,7 +352,10 @@ struct AppContext {
     continuation_lowercase: bool,
     scroll_ticks: u32,
     prefill_samples: usize,
-    dictation_silence_secs: f32,
+    fast_silence_secs: f32,
+    slow_silence_secs: f32,
+    final_silence_secs: f32,
+    segmenting: config::SegmentingMode,
     lowercase_timeout_secs: f32,
     dictation_max_speech_samples: usize,
     last_ended_with_punctuation: Cell<bool>,
@@ -371,9 +365,8 @@ struct AppContext {
     display_server: String,
     notify_id: Cell<u32>,
     tray_handle: Option<tray::TrayHandle>,
-    /// Hotwords derived from command vocabulary, used in idle mode.
+    /// Hotwords derived from command vocabulary, used by local command recognizer.
     command_hotwords: String,
-    command_hotwords_score: f32,
     /// User-provided hotwords from --hotwords flag, used in dictation mode.
     dictation_hotwords: Option<String>,
     dictation_hotwords_score: f32,
@@ -386,10 +379,6 @@ struct AppContext {
     modifiers: Vec<(String, String)>,
     /// Sleep state — shared via Cell so command handlers can toggle it.
     sleeping: Cell<bool>,
-    /// Normalized wake phrase labels (lowercased, spaces→underscores).
-    wake_labels: Vec<String>,
-    /// Normalized sleep phrase labels (lowercased, spaces→underscores).
-    sleep_labels: Vec<String>,
 }
 
 impl AppContext {
@@ -417,7 +406,10 @@ impl AppContext {
             continuation_lowercase: cfg.continuation_lowercase,
             scroll_ticks: cfg.scroll_ticks,
             prefill_samples: (cfg.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
-            dictation_silence_secs: cfg.dictation_silence,
+            fast_silence_secs: cfg.fast_silence,
+            slow_silence_secs: cfg.slow_silence,
+            final_silence_secs: cfg.final_silence,
+            segmenting: cfg.segmenting,
             lowercase_timeout_secs: cfg.lowercase_timeout,
             dictation_max_speech_samples: (cfg.dictation_max_speech * SAMPLE_RATE as f32) as usize,
             last_ended_with_punctuation: Cell::new(true),
@@ -427,19 +419,12 @@ impl AppContext {
             notify_id: Cell::new(0),
             tray_handle: None,
             command_hotwords,
-            command_hotwords_score: cfg.command_hotwords_score,
             dictation_hotwords: cfg.hotwords,
             dictation_hotwords_score: cfg.dictation_hotwords_score,
             min_dictation_words: cfg.min_dictation_words,
             dump_audio_dir: cfg.dump_audio,
             dump_audio_counter: AtomicU32::new(0),
             sleeping: Cell::new(false),
-            wake_labels: cfg.aliases.wake.iter()
-                .map(|a| a.to_lowercase().replace(' ', "_"))
-                .collect(),
-            sleep_labels: cfg.aliases.sleep.iter()
-                .map(|a| a.to_lowercase().replace(' ', "_"))
-                .collect(),
             aliases: cfg.aliases,
             modifiers: cfg.modifiers,
         }
@@ -772,7 +757,7 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     let mut words: Vec<String> = Vec::new();
 
     // Command trigger keywords (canonical + aliases)
-    words.extend(["press", "mouse", "scroll", "slash", "command", "undo"].iter().map(|s| s.to_string()));
+    words.extend(["press", "click", "scroll", "slash", "command", "undo"].iter().map(|s| s.to_string()));
     words.extend(aliases.click.iter().cloned());
     words.extend(aliases.press.iter().cloned());
     words.extend(aliases.scroll.iter().cloned());
@@ -806,10 +791,10 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     // recognition than individual words alone.
     let mut phrases: Vec<String> = vec![
         "slash command".into(),
-        "mouse upper left".into(),
-        "mouse upper right".into(),
-        "mouse lower left".into(),
-        "mouse lower right".into(),
+        "click upper left".into(),
+        "click upper right".into(),
+        "click lower left".into(),
+        "click lower right".into(),
         "scroll up".into(),
         "scroll down".into(),
         "scroll top".into(),
@@ -856,50 +841,6 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
     let mut all = words;
     all.extend(phrases);
     all.join(",")
-}
-
-/// Build a comma-separated keywords string for the normal-mode KeywordSpotter.
-/// Includes all command triggers plus sleep keywords (but not wake — can't wake when awake).
-fn build_kws_keywords(aliases: &ResolvedAliases) -> String {
-    let mut keywords: Vec<String> = Vec::new();
-
-    // Click/mouse trigger aliases
-    for alias in &aliases.click {
-        keywords.push(alias.clone());
-    }
-    // Press trigger aliases
-    for alias in &aliases.press {
-        keywords.push(alias.clone());
-    }
-    // Scroll trigger aliases
-    for alias in &aliases.scroll {
-        keywords.push(alias.clone());
-    }
-    // Undo trigger aliases
-    for alias in &aliases.undo {
-        keywords.push(alias.clone());
-    }
-    // Slash command trigger phrases
-    for trigger in &aliases.slash_command {
-        keywords.push(trigger.join(" "));
-    }
-    // Sleep trigger aliases (puts client to sleep)
-    for alias in &aliases.sleep {
-        keywords.push(alias.clone());
-    }
-
-    keywords.sort();
-    keywords.dedup();
-    keywords.join(",")
-}
-
-/// Build a comma-separated keywords string for the sleep-mode KeywordSpotter.
-/// Only includes wake keywords — the only thing the client responds to while sleeping.
-fn build_wake_keywords(aliases: &ResolvedAliases) -> String {
-    let mut keywords: Vec<String> = aliases.wake.clone();
-    keywords.sort();
-    keywords.dedup();
-    keywords.join(",")
 }
 
 /// Returns true if `s` contains at least one alphanumeric character (i.e. is
@@ -1806,6 +1747,20 @@ fn ends_with_sentence_punctuation(s: &str) -> bool {
     s.trim_end().ends_with(['.', '!', '?'])
 }
 
+/// Check if text ends with sentence-ending punctuation (`.` `?` `!`), excluding
+/// ellipsis (`...`). Used by speculative mode to decide whether to commit text.
+fn ends_with_sentence_punct(text: &str) -> bool {
+    let trimmed = text.trim_end();
+    if trimmed.ends_with('?') || trimmed.ends_with('!') {
+        return true;
+    }
+    if trimmed.ends_with('.') {
+        // Exclude ellipsis "..."
+        return !trimmed.ends_with("...");
+    }
+    false
+}
+
 // ── Segment flushing ───────────────────────────────────────────────────────
 
 /// Result of classifying a speech segment (without outputting).
@@ -1834,7 +1789,7 @@ fn classify_segment(samples: &[f32], ctx: &AppContext, mode: ListenMode) -> Clas
 
     ctx.maybe_dump_wav(samples, "idle");
 
-    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, samples, ctx.smart, Some(&ctx.command_hotwords), ctx.command_hotwords_score) {
+    let text = match send_to_server(&ctx.http_client, &ctx.endpoint_url, samples, ctx.smart, None, 0.0) {
         Ok(t) => t,
         Err(e) => {
             error!("Classification request failed: {e}");
@@ -1955,8 +1910,20 @@ fn execute_commands(text: &str, ctx: &AppContext) {
                 }
                 just_typed = false;
             }
-            // Commands shouldn't have text actions, but handle gracefully
-            TextAction::Text(_) | TextAction::OwnedText(_) => {}
+            TextAction::OwnedText(ref s) => {
+                if ctx.type_text {
+                    if just_typed {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                    }
+                    type_into_window(s, &ctx.display_server);
+                    // +1 for the trailing space appended by type_into_window
+                    ctx.last_typed_chars.set(s.len() + 1);
+                } else {
+                    println!("{s}");
+                }
+                just_typed = true;
+            }
+            TextAction::Text(_) => {}
         }
     }
 
@@ -1979,343 +1946,10 @@ fn execute_undo(ctx: &AppContext) {
     }
 }
 
-/// Send a command segment to the server for STT and return the text.
-/// Used after KWS has identified the segment as a command.
-fn transcribe_command_segment(samples: &[f32], ctx: &AppContext) -> Option<String> {
-    let duration_secs = samples.len() as f64 / SAMPLE_RATE as f64;
-    info!(duration_secs, "Transcribing command segment");
-
-    ctx.set_tray_status(TrayStatus::Processing);
-
-    ctx.maybe_dump_wav(samples, "kws_cmd");
-
-    let text = match send_to_server(
-        &ctx.http_client,
-        &ctx.endpoint_url,
-        samples,
-        ctx.smart,
-        Some(&ctx.command_hotwords),
-        ctx.command_hotwords_score,
-    ) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("Command transcription failed: {e}");
-            if ctx.sound {
-                play_sound("dialog-error");
-            }
-            return None;
-        }
-    };
-
-    let text = text.trim().to_string();
-    if text.is_empty() {
-        info!("Command transcription returned empty");
-        return None;
-    }
-
-    info!(text = %text, "Command transcription result");
-    Some(text)
-}
-
-/// Execute a command identified by KWS keyword label + STT transcription text.
-/// Skips the trigger word(s) from the STT text and parses parameters.
-fn execute_kws_command(keyword: &str, stt_text: &str, ctx: &AppContext) {
-    let lower = stt_text.to_lowercase();
-    let stripped: String = lower.chars().filter(|c| !matches!(c, '.' | ',' | '!' | '?' | ';' | ':')).collect();
-    let words: Vec<&str> = stripped.split_whitespace().collect();
-    // Normalize keyword case — the zh-en phone model produces uppercase labels.
-    let keyword = keyword.to_lowercase();
-    let keyword = keyword.as_str();
-    debug!(keyword, text = stt_text, "Executing KWS command");
-
-    // Determine how many trigger words to skip from the STT response
-    let skip = match keyword {
-        "slash_command" | "flash_command" | "splash_command" => 2,
-        _ => 1, // mouse, press, scroll, undo
-    };
-
-    let params: Vec<&str> = words.iter().skip(skip).copied().collect();
-    // Fallback params with no skip — used when STT drops the trigger keyword.
-    let params_fallback: Vec<&str> = if skip > 0 { words.to_vec() } else { vec![] };
-    let params_str = params.join(" ");
-
-    // Track how many params are consumed by the primary command so we can
-    // parse any trailing commands (e.g. "slash command clear, press enter").
-    let consumed = match keyword {
-        "mouse" | "click" | "look" | "lick" => {
-            // Try quadrant: "upper left", "upper right", "lower left", "lower right"
-            match params_str.as_str() {
-                s if s.contains("upper") && s.contains("left") => {
-                    if ctx.type_text { click_quadrant(false, false); }
-                    else { println!("[click upper left]"); }
-                }
-                s if s.contains("upper") && s.contains("right") => {
-                    if ctx.type_text { click_quadrant(true, false); }
-                    else { println!("[click upper right]"); }
-                }
-                s if s.contains("lower") && s.contains("left") => {
-                    if ctx.type_text { click_quadrant(false, true); }
-                    else { println!("[click lower left]"); }
-                }
-                s if s.contains("lower") && s.contains("right") => {
-                    if ctx.type_text { click_quadrant(true, true); }
-                    else { println!("[click lower right]"); }
-                }
-                _ => {
-                    // Try to parse a coordinate pair from a slice of words.
-                    // Handles two separate tokens ("fifty fifty") and one hyphenated token ("50-50").
-                    let try_coords = |p: &[&str]| -> Option<(u32, u32)> {
-                        if p.len() >= 2 {
-                            if let (Some(x), Some(y)) = (
-                                parse_spoken_number_simple(p, 0),
-                                parse_spoken_number_simple(p, 1),
-                            ) {
-                                return Some((x, y));
-                            }
-                        }
-                        if let Some(first) = p.first() {
-                            if let Some((left, right)) = first.split_once('-') {
-                                if let (Ok(x), Ok(y)) = (left.parse::<u32>(), right.parse::<u32>()) {
-                                    return Some((x, y));
-                                }
-                            }
-                        }
-                        None
-                    };
-
-                    // Try with skipped params first (normal: keyword was transcribed).
-                    // If that fails, retry with all words in case STT dropped the keyword.
-                    let coords = try_coords(&params)
-                        .or_else(|| if !params_fallback.is_empty() { try_coords(&params_fallback) } else { None });
-
-                    if let Some((x, y)) = coords {
-                        if ctx.type_text { click_coordinate(x, y); }
-                        else { println!("[click {x} {y}]"); }
-                    } else {
-                        debug!(params = ?params, "Could not parse click parameters");
-                        return;
-                    }
-                }
-            }
-            if ctx.sound {
-                play_sound("message-new-instant");
-            }
-            // Click commands consume all params (quadrant words or coordinates)
-            params.len()
-        }
-        "press" => {
-            // Parse key names and modifiers from params
-            if params.is_empty() {
-                debug!("No key specified after 'press'");
-                return;
-            }
-            execute_press_params(&params, ctx)
-        }
-        "scroll" => {
-            if params.is_empty() {
-                debug!("No direction specified after 'scroll'");
-                return;
-            }
-            let mut up: Option<bool> = None;
-            let mut repeats: u32 = 0;
-            let mut consumed_scroll: usize = 0;
-            for word in &params {
-                match *word {
-                    "up" => {
-                        if up == Some(false) { break; }
-                        up = Some(true);
-                        repeats += 1;
-                        consumed_scroll += 1;
-                    }
-                    "down" => {
-                        if up == Some(true) { break; }
-                        up = Some(false);
-                        repeats += 1;
-                        consumed_scroll += 1;
-                    }
-                    "top" => {
-                        up = Some(true);
-                        repeats = 100;
-                        consumed_scroll += 1;
-                        break;
-                    }
-                    "bottom" => {
-                        up = Some(false);
-                        repeats = 100;
-                        consumed_scroll += 1;
-                        break;
-                    }
-                    _ => break,
-                }
-            }
-            if let Some(is_up) = up {
-                let action = VoiceAction::Scroll { up: is_up, repeats };
-                execute_voice_action(&action, ctx);
-                if ctx.sound {
-                    play_sound("message-new-instant");
-                }
-                consumed_scroll
-            } else {
-                debug!("Could not parse scroll direction from: {params_str}");
-                return;
-            }
-        }
-        "slash_command" | "flash_command" | "splash_command" => {
-            if params.is_empty() {
-                debug!("No command name after 'slash command'");
-                return;
-            }
-            let cmd_name = params[0];
-            let slash_text = format!("/{cmd_name}");
-            if ctx.type_text {
-                type_into_window(&slash_text, &ctx.display_server);
-                ctx.last_typed_chars.set(slash_text.len());
-            } else {
-                println!("{slash_text}");
-            }
-            if ctx.sound {
-                play_sound("message-new-instant");
-            }
-            1 // consumed the command name
-        }
-        "undo" => {
-            execute_undo(ctx);
-            0 // undo has no params
-        }
-        _ => {
-            debug!(keyword, "Unknown KWS keyword label");
-            return;
-        }
-    };
-
-    // If there are remaining words after the primary command, try to parse
-    // them as additional commands (e.g. "slash command clear, press enter").
-    let remaining: Vec<&str> = params.iter().skip(consumed).copied().collect();
-    if !remaining.is_empty() {
-        let remaining_text = remaining.join(" ");
-        debug!(remaining = %remaining_text, "Parsing remaining words as commands");
-        execute_commands(&remaining_text, ctx);
-    }
-}
-
-/// Parse a simple number from a word (digit string or spoken word).
-fn parse_spoken_number_simple(words: &[&str], idx: usize) -> Option<u32> {
-    let word = words.get(idx)?;
-    // Try direct digit parse first
-    if let Ok(n) = word.parse::<u32>() {
-        return Some(n);
-    }
-    // Fall back to spoken number words
-    parse_number_word(word)
-}
-
-/// Execute a "press" command with parsed parameter words.
-/// Execute key press params and return how many words were consumed.
-fn execute_press_params(params: &[&str], ctx: &AppContext) -> usize {
-    let mut i = 0;
-    let mut first = true;
-    while i < params.len() {
-        // Collect consecutive modifiers, then expect a key
-        let mut modifiers = Vec::new();
-        let mut j = i;
-        while j < params.len() {
-            if let Some(canonical) = modifier_canonical(params[j], &ctx.modifiers) {
-                modifiers.push(canonical.into());
-                j += 1;
-            } else {
-                break;
-            }
-        }
-        if !modifiers.is_empty() && j < params.len() {
-            if let Some(key) = key_name(params[j]) {
-                let action = VoiceAction::ModifiedKey {
-                    modifiers,
-                    key: key.into(),
-                };
-                execute_voice_action_with_delay(&action, ctx, !first);
-                first = false;
-                i = j + 1;
-                continue;
-            }
-        }
-        // Check for plain key name
-        if let Some(key) = key_name(params[i]) {
-            let action = VoiceAction::Key(key.into());
-            execute_voice_action_with_delay(&action, ctx, !first);
-            first = false;
-            i += 1;
-            continue;
-        }
-        // Unrecognized word — stop parsing
-        break;
-    }
-    if first {
-        debug!(params = ?params, "Could not parse any key names from press params");
-    } else if ctx.sound {
-        play_sound("message-new-instant");
-    }
-    i
-}
-
-/// Execute a single voice action (key press, click, scroll).
-fn execute_voice_action(action: &VoiceAction, ctx: &AppContext) {
-    match action {
-        VoiceAction::Key(ref key) => {
-            if ctx.type_text {
-                send_key(key, &ctx.display_server);
-            } else {
-                println!();
-            }
-        }
-        VoiceAction::ModifiedKey { ref modifiers, ref key } => {
-            if ctx.type_text {
-                let mod_refs: Vec<&str> = modifiers.iter().map(|s| s.as_str()).collect();
-                send_modified_key(&mod_refs, key, &ctx.display_server);
-            } else {
-                println!();
-            }
-        }
-        VoiceAction::ClickQuadrant { right, bottom } => {
-            if ctx.type_text {
-                click_quadrant(*right, *bottom);
-            } else {
-                let h = if *right { "right" } else { "left" };
-                let v = if *bottom { "lower" } else { "upper" };
-                println!("[click {v} {h}]");
-            }
-        }
-        VoiceAction::ClickCoordinate { x, y } => {
-            if ctx.type_text {
-                click_coordinate(*x, *y);
-            } else {
-                println!("[click {x} {y}]");
-            }
-        }
-        VoiceAction::Scroll { up, repeats } => {
-            if ctx.type_text {
-                scroll(*up, *repeats * ctx.scroll_ticks);
-            } else {
-                let dir = if *up { "up" } else { "down" };
-                println!("[scroll {dir} x{repeats}]");
-            }
-        }
-    }
-}
-
-/// Execute a voice action with an optional delay (for chained key presses).
-fn execute_voice_action_with_delay(action: &VoiceAction, ctx: &AppContext, delay: bool) {
-    if delay && ctx.type_text {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    execute_voice_action(action, ctx);
-}
-
-/// Send accumulated dictation audio to the server, output the transcription.
-fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: ListenMode) {
-    if utterance_audio.is_empty() {
-        return;
-    }
-
+/// Send dictation audio to the server and return the trimmed transcription text.
+/// Handles error reporting, notifications, and audio dump. On error returns None
+/// and clears the audio buffer.
+fn send_and_decode(utterance_audio: &[f32], ctx: &AppContext, tray_mode: ListenMode) -> Option<String> {
     let duration_secs = utterance_audio.len() as f64 / SAMPLE_RATE as f64;
     info!(duration_secs, "Transcribing dictation segment");
 
@@ -2330,7 +1964,6 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
         Ok(t) => t,
         Err(e) => {
             error!("Dictation request failed: {e}");
-            utterance_audio.clear();
             finish_segment_ui(ctx, tray_mode);
             if ctx.notify {
                 let id = show_notification(
@@ -2343,19 +1976,23 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
             if ctx.sound {
                 play_sound("dialog-error");
             }
-            return;
+            return None;
         }
     };
 
-    utterance_audio.clear();
-
-    let text = text.trim();
+    let text = text.trim().to_string();
     if text.is_empty() {
         info!("Dictation returned empty");
         finish_segment_ui(ctx, tray_mode);
-        return;
+        return None;
     }
 
+    Some(text)
+}
+
+/// Process transcribed dictation text: wake/sleep, undo, word-count filter,
+/// continuation lowercasing, command parsing, and output.
+fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
     // Check for wake/sleep and undo before the word-count filter.
     if let Some(wake) = check_wake_sleep(text, ctx) {
         ctx.apply_wake_sleep(wake);
@@ -2498,6 +2135,18 @@ fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: 
     }
 
     finish_segment_ui(ctx, tray_mode);
+}
+
+/// Send accumulated dictation audio to the server, output the transcription.
+fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: ListenMode) {
+    if utterance_audio.is_empty() {
+        return;
+    }
+
+    if let Some(text) = send_and_decode(utterance_audio, ctx, tray_mode) {
+        process_dictation_text(&text, ctx, tray_mode);
+    }
+    utterance_audio.clear();
 }
 
 fn finish_segment_ui(ctx: &AppContext, mode: ListenMode) {
@@ -2656,29 +2305,19 @@ fn main() -> Result<()> {
     // Pre-square the gate threshold so we can compare against mean-squared
     // energy directly, avoiding a sqrt per frame.
     let energy_gate_sq = cfg.vad_energy_gate * cfg.vad_energy_gate;
-    let idle_silence = cfg.idle_silence;
+    let fast_silence = cfg.fast_silence;
     let min_speech = cfg.min_speech;
     let max_speech = cfg.max_speech;
-    let no_kws = cfg.no_kws;
-    let kws_model_dir = cfg.kws_model_dir.clone()
-        .unwrap_or_else(|| kws::default_model_dir_for(cfg.kws_model));
-    let kws_cfg = kws::KwsConfig {
-        model: cfg.kws_model,
-        model_dir: kws_model_dir.clone(),
-        keywords: build_kws_keywords(&cfg.aliases),
-        keywords_score: cfg.kws_score,
-        keywords_threshold: cfg.kws_threshold,
-        num_threads: cfg.kws_threads,
+    let no_cmd = cfg.no_cmd;
+    let cmd_cfg = cmd::CmdConfig {
+        model_dir: cfg.cmd_model_dir.clone()
+            .unwrap_or_else(cmd::default_model_dir),
+        boost: cfg.cmd_boost,
+        num_threads: cfg.cmd_threads,
+        beam_width: cfg.cmd_beam_width,
     };
-    let sleep_kws_cfg = kws::KwsConfig {
-        model: cfg.kws_model,
-        model_dir: kws_model_dir,
-        keywords: build_wake_keywords(&cfg.aliases),
-        keywords_score: cfg.kws_score,
-        keywords_threshold: cfg.kws_sleep_threshold,
-        num_threads: cfg.kws_threads,
-    };
-    let kws_timeout_secs = cfg.kws_timeout;
+    let cmd_silence_ms = cfg.cmd_silence_ms;
+    let cmd_boost = cfg.cmd_boost;
     let no_eou = cfg.no_eou;
     let eou_model_dir = cfg.eou_model_dir.clone();
     let eou_cfg = eou::EouConfig {
@@ -2753,7 +2392,7 @@ fn main() -> Result<()> {
     let vad_config = make_vad_config(
         &vad_path_str,
         vad_threshold,
-        idle_silence,
+        fast_silence,
         min_speech,
         max_speech,
     );
@@ -2790,40 +2429,21 @@ fn main() -> Result<()> {
         )
         .context("Failed to build audio input stream")?;
 
-    // ── Keyword spotters (initialized after audio to avoid ALSA/onnxruntime interference) ──
-    // Normal spotter: all command keywords + sleep keywords (used when awake).
-    // Sleep spotter: wake keywords only with higher threshold (used when sleeping).
-    let kws_state = if !no_kws {
-        info!("Initializing keyword spotter");
-        match kws::init_keyword_spotter(&kws_cfg) {
-            Ok(spotter) => {
-                let kws_stream = spotter.create_stream();
-                info!("Keyword spotter ready");
-                Some((spotter, kws_stream))
+    // ── Command recognizer (initialized after audio to avoid ALSA/onnxruntime interference) ──
+    let cmd_state = if !no_cmd {
+        info!("Initializing command recognizer (Parakeet-TDT 110m)");
+        match cmd::init_recognizer(&cmd_cfg) {
+            Ok(recognizer) => {
+                info!("Command recognizer ready");
+                Some(recognizer)
             }
             Err(e) => {
-                warn!("Keyword spotter unavailable, falling back to server classification: {e}");
+                warn!("Command recognizer unavailable, falling back to server classification: {e}");
                 None
             }
         }
     } else {
-        info!("Keyword spotting disabled (--no-kws)");
-        None
-    };
-    let sleep_kws_state = if !no_kws && kws_state.is_some() {
-        info!("Initializing sleep-mode keyword spotter (wake words only)");
-        match kws::init_keyword_spotter(&sleep_kws_cfg) {
-            Ok(spotter) => {
-                let kws_stream = spotter.create_stream();
-                info!("Sleep-mode keyword spotter ready");
-                Some((spotter, kws_stream))
-            }
-            Err(e) => {
-                warn!("Sleep-mode keyword spotter unavailable: {e}");
-                None
-            }
-        }
-    } else {
+        info!("Local command detection disabled (--no-cmd)");
         None
     };
 
@@ -2884,13 +2504,21 @@ fn main() -> Result<()> {
     let mut recording_hold_until: Option<Instant> = None;
     let prefill_samples = ctx.prefill_samples;
 
-    // KWS state
-    let mut pending_keyword: Option<String> = None;
-    let mut kws_active_since: Option<Instant> = None;
-    let mut kws_buf_start: Option<usize> = None; // audio_buf index at speech onset (with prefill)
+    // Command detection state
+    let mut cmd_listening = false; // true while buffering speech for command decode
+    let mut cmd_buf: Vec<f32> = Vec::new(); // audio buffered for command decode
+    let mut cmd_silence_start: Option<Instant> = None; // when speech ended
+    let cmd_hotwords = cmd_state.as_ref().map(|_| {
+        cmd::build_hotwords(&ctx.command_hotwords, cmd_boost)
+    });
 
     // EOU state
     let mut eou_active = false;
+
+    // Speculative mode state
+    let mut spec_cached_text = String::new();
+    let mut spec_fast_fired = false;
+    let mut spec_slow_fired = false;
 
     loop {
         match rx.recv() {
@@ -2905,9 +2533,87 @@ fn main() -> Result<()> {
                         .map(|t| t.elapsed().as_secs_f32())
                         .unwrap_or(f32::MAX);
 
-                    if silence > ctx.dictation_silence_secs
+                    if ctx.segmenting == config::SegmentingMode::Speculative
                         && !utterance_audio.is_empty()
                     {
+                        // ── Speculative mode silence triggers ────────
+                        // FAST: send audio for decode, cache result
+                        if !spec_fast_fired
+                            && silence >= ctx.fast_silence_secs
+                        {
+                            spec_fast_fired = true;
+                            ctx.set_tray_status(TrayStatus::Processing);
+                            if let Some(text) = send_and_decode(&utterance_audio, &ctx, ListenMode::Dictation) {
+                                debug!(text = %text, "[decode]");
+                                spec_cached_text = text;
+                            }
+                            ctx.set_tray_status(TrayStatus::Dictating);
+                        }
+
+                        // SLOW: emit if cached text ends with sentence punct
+                        if !spec_slow_fired
+                            && spec_fast_fired
+                            && silence >= ctx.slow_silence_secs
+                        {
+                            spec_slow_fired = true;
+                            if !spec_cached_text.is_empty()
+                                && ends_with_sentence_punct(&spec_cached_text)
+                            {
+                                debug!(text = %spec_cached_text, "[emit]");
+                                ctx.set_tray_status(TrayStatus::Processing);
+                                process_dictation_text(&spec_cached_text, &ctx, ListenMode::Idle);
+                                sleeping = ctx.sleeping.get();
+                                utterance_audio.clear();
+                                spec_cached_text.clear();
+                                spec_fast_fired = false;
+                                spec_slow_fired = false;
+                                mode = ListenMode::Idle;
+                                vad.drain();
+                                was_detected = false;
+                                last_speech_time = None;
+                                recording_hold_until = None;
+                                if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                                    recognizer.reset(eou_stream);
+                                }
+                                eou_active = false;
+                            } else if !spec_cached_text.is_empty() {
+                                debug!(text = %spec_cached_text, "[skip] no sentence ending");
+                            }
+                        }
+
+                        // FINAL: emit unconditionally
+                        if spec_slow_fired
+                            && !spec_cached_text.is_empty()
+                            && silence >= ctx.final_silence_secs
+                        {
+                            // Re-decode in case more audio arrived since fast trigger
+                            if let Some(text) = send_and_decode(&utterance_audio, &ctx, ListenMode::Idle) {
+                                spec_cached_text = text;
+                            }
+                            if !spec_cached_text.is_empty() {
+                                debug!(text = %spec_cached_text, "[timeout]");
+                                ctx.set_tray_status(TrayStatus::Processing);
+                                process_dictation_text(&spec_cached_text, &ctx, ListenMode::Idle);
+                                sleeping = ctx.sleeping.get();
+                            }
+                            utterance_audio.clear();
+                            spec_cached_text.clear();
+                            spec_fast_fired = false;
+                            spec_slow_fired = false;
+                            mode = ListenMode::Idle;
+                            vad.drain();
+                            was_detected = false;
+                            last_speech_time = None;
+                            recording_hold_until = None;
+                            if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                                recognizer.reset(eou_stream);
+                            }
+                            eou_active = false;
+                        }
+                    } else if silence > ctx.slow_silence_secs
+                        && !utterance_audio.is_empty()
+                    {
+                        // ── VAD mode: flush on silence ───────────────
                         // Speech ended → flush and return to idle so
                         // commands are accepted immediately.
                         debug!(silence, "Dictation silence, flushing and returning to idle");
@@ -2935,6 +2641,9 @@ fn main() -> Result<()> {
                         // Reset so the next speech frame properly re-enters Recording.
                         was_detected = false;
                         recording_hold_until = None;
+                        spec_cached_text.clear();
+                        spec_fast_fired = false;
+                        spec_slow_fired = false;
                         if let Some((ref recognizer, ref eou_stream)) = eou_state {
                             recognizer.reset(eou_stream);
                         }
@@ -2990,146 +2699,123 @@ fn main() -> Result<()> {
 
                 audio_buf.extend_from_slice(&chunk);
 
-                // ── Feed KWS when classification window is active ────
-                let mut kws_consumed = false;
-                if kws_active_since.is_some() {
-                    // Select the active spotter based on sleep state.
-                    let active_kws = if sleeping { &sleep_kws_state } else { &kws_state };
-                    if let Some((ref spotter, ref kws_stream)) = *active_kws {
-                        kws_stream.accept_waveform(SAMPLE_RATE as i32, &chunk);
-                        while spotter.is_ready(kws_stream) {
-                            spotter.decode(kws_stream);
-                            if let Some(result) = spotter.get_result(kws_stream) {
-                                if !result.keyword.is_empty() {
-                                    let keyword = result.keyword.to_lowercase();
-                                    debug!(keyword, sleeping, "KWS detected keyword");
-                                    spotter.reset(kws_stream);
+                // ── Check command decode silence trigger ──────────────
+                // If we're buffering speech for command detection and
+                // silence has exceeded the threshold, decode now.
+                let mut cmd_consumed = false;
+                if cmd_listening {
+                    if let Some(silence_start) = cmd_silence_start {
+                        if silence_start.elapsed() >= Duration::from_millis(cmd_silence_ms as u64)
+                            && !cmd_buf.is_empty()
+                        {
+                            // Decode the buffered audio with the command recognizer
+                            if let Some(ref recognizer) = cmd_state {
+                                let hotwords_str = cmd_hotwords.as_deref().unwrap_or("");
+                                let s = recognizer.create_stream_with_hotwords(hotwords_str);
+                                s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
+                                recognizer.decode(&s);
 
-                                    if ctx.wake_labels.contains(&keyword) {
-                                        // Wake up from sleep mode — clean transition
-                                        // to idle. Discard all buffered audio so the
-                                        // wake phrase doesn't bleed into dictation.
-                                        ctx.apply_wake_sleep(true);
+                                let text = s.get_result()
+                                    .map(|r| cmd::normalize(&r.text))
+                                    .unwrap_or_default();
+
+                                if !text.is_empty() {
+                                    debug!(text = %text, "Command decode result");
+
+                                    // Check wake/sleep first
+                                    if let Some(wake) = check_wake_sleep(&text, &ctx) {
+                                        ctx.apply_wake_sleep(wake);
                                         sleeping = ctx.sleeping.get();
-                                        kws_active_since = None;
-                                        kws_buf_start = None;
-                                        pending_keyword = None;
+                                        cmd_listening = false;
+                                        cmd_buf.clear();
+                                        cmd_silence_start = None;
+                                        cmd_consumed = true;
                                         vad.drain();
                                         audio_buf.clear();
                                         vad_pos = 0;
                                         was_detected = false;
-                                        kws_consumed = true;
-                                        // Drain pending audio from the channel so the
-                                        // tail of the keyword phrase isn't processed.
                                         while let Ok(Event::Audio(_)) = rx.try_recv() {}
-                                        // Reset the normal spotter stream for a clean start.
-                                        if let Some((ref s, ref st)) = kws_state {
-                                            s.reset(st);
-                                        }
                                         if let Some((ref r, ref s)) = eou_state {
                                             r.reset(s);
                                         }
                                         eou_active = false;
-                                        break;
-                                    } else if ctx.sleep_labels.contains(&keyword) {
-                                        // Enter sleep mode.
-                                        ctx.apply_wake_sleep(false);
-                                        sleeping = ctx.sleeping.get();
-                                        kws_active_since = None;
-                                        kws_buf_start = None;
-                                        pending_keyword = None;
-                                        vad.drain();
-                                        was_detected = false;
-                                        kws_consumed = true;
-                                        // Discard any in-progress dictation so the
-                                        // silence flush doesn't fire after sleeping.
-                                        mode = ListenMode::Idle;
-                                        utterance_audio.clear();
-                                        last_speech_time = None;
-                                        recording_hold_until = None;
-                                        // Drain pending audio from the channel so the
-                                        // tail of the sleep phrase isn't processed.
-                                        while let Ok(Event::Audio(_)) = rx.try_recv() {}
-                                        // Reset the sleep spotter stream for a clean start.
-                                        if let Some((ref s, ref st)) = sleep_kws_state {
-                                            s.reset(st);
-                                        }
-                                        if let Some((ref r, ref s)) = eou_state {
-                                            r.reset(s);
-                                        }
-                                        eou_active = false;
-                                        break;
-                                    } else if keyword == "undo" {
+                                    } else if is_undo_command(&text, &ctx.aliases.undo) {
                                         execute_undo(&ctx);
-                                        kws_active_since = None;
-                                        kws_buf_start = None;
-                                        pending_keyword = None;
+                                        cmd_listening = false;
+                                        cmd_buf.clear();
+                                        cmd_silence_start = None;
+                                        cmd_consumed = true;
                                         vad.drain();
-                                        ctx.set_tray_status(TrayStatus::Listening);
                                         was_detected = false;
-                                        kws_consumed = true;
+                                        ctx.set_tray_status(TrayStatus::Listening);
                                         if let Some((ref r, ref s)) = eou_state {
                                             r.reset(s);
                                         }
                                         eou_active = false;
-                                        break;
                                     } else {
-                                        pending_keyword = Some(keyword);
-                                        kws_active_since = None;
-                                        kws_buf_start = None;
+                                        // Try to parse as a voice command
+                                        let actions = process_voice_commands(&text, &ctx);
+                                        let has_command = actions.iter().any(|a| matches!(a, TextAction::Command(_)));
+                                        // Slash commands produce OwnedText("/cmd"), not Command
+                                        let has_slash = actions.iter().any(|a| matches!(a, TextAction::OwnedText(s) if s.starts_with('/')));
+                                        let has_text = actions.iter().any(|a| matches!(a, TextAction::Text(_)));
+
+                                        if (has_command || has_slash) && !has_text {
+                                            debug!("Command recognized locally");
+                                            execute_commands(&text, &ctx);
+                                            sleeping = ctx.sleeping.get();
+                                            cmd_listening = false;
+                                            cmd_buf.clear();
+                                            cmd_silence_start = None;
+                                            cmd_consumed = true;
+                                            vad.drain();
+                                            was_detected = false;
+                                            ctx.set_tray_status(TrayStatus::Listening);
+                                            if let Some((ref r, ref s)) = eou_state {
+                                                r.reset(s);
+                                            }
+                                            eou_active = false;
+                                        } else if sleeping {
+                                            // In sleep mode, discard non-wake speech
+                                            debug!("Sleep mode — ignoring non-wake speech");
+                                            cmd_listening = false;
+                                            cmd_buf.clear();
+                                            cmd_silence_start = None;
+                                            cmd_consumed = true;
+                                            vad.drain();
+                                            was_detected = false;
+                                        } else {
+                                            // Not a command → enter dictation with buffered audio
+                                            debug!("Not a command — entering dictation");
+                                            utterance_audio = std::mem::take(&mut cmd_buf);
+                                            cmd_listening = false;
+                                            cmd_silence_start = None;
+                                            mode = ListenMode::Dictation;
+                                            last_speech_time = Some(Instant::now());
+                                            recording_hold_until = None;
+                                            ctx.set_tray_status(TrayStatus::Dictating);
+                                            was_detected = false;
+                                        }
                                     }
-                                    break;
+                                } else {
+                                    // Empty decode — discard
+                                    cmd_listening = false;
+                                    cmd_buf.clear();
+                                    cmd_silence_start = None;
+                                    vad.drain();
+                                    was_detected = false;
                                 }
                             }
                         }
                     }
-
-                    // Check classification timeout
-                    let timed_out = kws_active_since
-                        .is_some_and(|t| t.elapsed() > Duration::from_secs_f32(kws_timeout_secs));
-                    if timed_out {
-                        kws_active_since = None;
-                        let active_kws = if sleeping { &sleep_kws_state } else { &kws_state };
-                        if let Some((ref spotter, ref kws_stream)) = *active_kws {
-                            spotter.reset(kws_stream);
-                        }
-
-                        if sleeping {
-                            // In sleep mode, just go back to idle — no dictation.
-                            debug!("KWS timeout in sleep mode — staying idle");
-                            kws_buf_start = None;
-                            while !vad.0.is_empty() {
-                                vad.0.pop();
-                            }
-                            was_detected = false;
-                            continue;
-                        }
-
-                        debug!("KWS timeout — no keyword detected, entering dictation");
-
-                        // Discard any pending VAD segments (we'll use audio_buf
-                        // directly to avoid losing speech before/between segments).
-                        while !vad.0.is_empty() {
-                            vad.0.pop();
-                        }
-
-                        // Recover all audio from speech onset (with prefill) through
-                        // the current chunk.  Compaction was suppressed while KWS was
-                        // active, so the data is still in audio_buf.
-                        let start = kws_buf_start.unwrap_or(0).min(audio_buf.len());
-                        utterance_audio = audio_buf[start..].to_vec();
-                        kws_buf_start = None;
-
-                        mode = ListenMode::Dictation;
-                        last_speech_time = Some(Instant::now());
-                        recording_hold_until = None;
-                        ctx.set_tray_status(TrayStatus::Dictating);
-                        was_detected = false;
-                        continue; // Skip VAD processing for this chunk
-                    }
                 }
-                if kws_consumed {
-                    continue; // Immediate command handled; skip VAD to discard audio
+                if cmd_consumed {
+                    continue;
+                }
+
+                // ── Buffer audio for command detection ────────────────
+                if cmd_listening {
+                    cmd_buf.extend_from_slice(&chunk);
                 }
 
                 // ── Process frames through VAD ────────────────────────
@@ -3142,7 +2828,7 @@ fn main() -> Result<()> {
                     // neural model ~31×/s during quiet periods.
                     if energy_gate_sq > 0.0
                         && !was_detected
-                        && kws_active_since.is_none()
+                        && !cmd_listening
                         && mode == ListenMode::Idle
                     {
                         let sum_sq: f32 = frame.iter().map(|&s| s * s).sum();
@@ -3160,6 +2846,14 @@ fn main() -> Result<()> {
                     if now_detected {
                         last_speech_time = Some(Instant::now());
                         recording_hold_until = None; // cancel pending transition
+                        cmd_silence_start = None; // speech resumed, cancel silence timer
+                        // Reset speculative flags when speech resumes
+                        if mode == ListenMode::Dictation
+                            && (spec_fast_fired || spec_slow_fired)
+                        {
+                            spec_fast_fired = false;
+                            spec_slow_fired = false;
+                        }
                         if !was_detected {
                             if !sleeping {
                                 ctx.set_tray_status(TrayStatus::Recording);
@@ -3172,29 +2866,22 @@ fn main() -> Result<()> {
                                     ctx.notify_id.set(id);
                                 }
                             }
-                            // Start KWS classification window on speech onset in idle mode
-                            let has_kws = if sleeping { sleep_kws_state.is_some() } else { kws_state.is_some() };
-                            if mode == ListenMode::Idle && has_kws && kws_active_since.is_none() {
-                                kws_active_since = Some(Instant::now());
-                                // Record where in audio_buf speech started (with prefill)
-                                // so we can recover all audio if KWS times out.
-                                kws_buf_start = Some(vad_pos.saturating_sub(WINDOW_SIZE + prefill_samples));
-                                debug!(sleeping, "KWS classification window started");
-                                // Feed buffered audio from speech onset so KWS
-                                // doesn't miss the beginning of the keyword.
-                                let active_kws = if sleeping { &sleep_kws_state } else { &kws_state };
-                                if let Some((ref _spotter, ref kws_stream)) = *active_kws {
-                                    let start = kws_buf_start.unwrap_or(vad_pos);
-                                    if start < vad_pos {
-                                        kws_stream.accept_waveform(
-                                            SAMPLE_RATE as i32,
-                                            &audio_buf[start..vad_pos],
-                                        );
-                                    }
-                                }
+                            // Start command listening on speech onset in idle mode
+                            if mode == ListenMode::Idle && cmd_state.is_some() && !cmd_listening {
+                                cmd_listening = true;
+                                cmd_silence_start = None;
+                                // Include prefill audio from before speech onset
+                                let prefill_start = vad_pos.saturating_sub(WINDOW_SIZE + prefill_samples);
+                                let start = prefill_start.min(audio_buf.len());
+                                cmd_buf = audio_buf[start..vad_pos].to_vec();
+                                debug!(sleeping, "Command listening started");
                             }
                         }
                     } else if was_detected {
+                        // Speech just ended — start silence timer for command decode
+                        if cmd_listening && cmd_silence_start.is_none() {
+                            cmd_silence_start = Some(Instant::now());
+                        }
                         // Start debounce hold instead of immediately transitioning.
                         recording_hold_until = Some(Instant::now() + Duration::from_millis(300));
                     }
@@ -3248,49 +2935,11 @@ fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                let has_kws = if sleeping { sleep_kws_state.is_some() } else { kws_state.is_some() };
-                                if sleeping {
-                                    // In sleep mode, discard segments — only wake
-                                    // keywords (handled above) matter.
-                                    if kws_active_since.is_none() {
-                                        kws_buf_start = None;
-                                    }
-                                } else if has_kws {
-                                    // ── KWS-based classification ──────────
-                                    if let Some(ref keyword) = pending_keyword.take() {
-                                        // KWS identified a command → send to server for parameters.
-                                        kws_active_since = None;
-                                        kws_buf_start = None;
-                                        match transcribe_command_segment(&samples, &ctx) {
-                                            Some(text) => {
-                                                execute_kws_command(keyword, &text, &ctx);
-                                                sleeping = ctx.sleeping.get();
-                                            }
-                                            None => {
-                                                debug!("Command transcription returned empty");
-                                            }
-                                        }
-                                        ctx.set_tray_status(TrayStatus::Listening);
-                                        last_speech_time = Some(Instant::now());
-                                        recording_hold_until = None;
-                                        vad.drain();
-                                        if let Some((ref spotter, ref kws_stream)) = kws_state {
-                                            spotter.reset(kws_stream);
-                                        }
-                                    } else if kws_active_since.is_none() {
-                                        // KWS timed out → enter dictation mode.
-                                        debug!("Switching to dictation mode (KWS timeout)");
-                                        kws_buf_start = None;
-                                        utterance_audio = samples;
-                                        mode = ListenMode::Dictation;
-                                        last_speech_time = Some(Instant::now());
-                                        recording_hold_until = None;
-                                        ctx.set_tray_status(TrayStatus::Dictating);
-                                        was_detected = false;
-                                        switched_to_dictation = true;
-                                        break;
-                                    }
-                                    // else: KWS still active (waiting for detection or timeout)
+                                if cmd_listening {
+                                    // Command recognizer is handling this segment —
+                                    // it will be decoded when silence triggers.
+                                } else if sleeping {
+                                    // In sleep mode without cmd recognizer, discard.
                                 } else {
                                     // ── Fallback: server-side classification ──
                                     match classify_segment(&samples, &ctx, ListenMode::Idle) {
@@ -3335,16 +2984,11 @@ fn main() -> Result<()> {
                 // Compact audio_buf: keep only the prefill window before the
                 // current position plus any unprocessed tail.  This prevents
                 // unbounded growth while preserving data for segment prefill.
-                // Suppress compaction while KWS is active so we can recover
-                // the full speech audio if KWS times out (~1s, ~64KB).
-                if kws_active_since.is_none() {
+                // Suppress compaction while command listening is active so we
+                // preserve the speech audio for decode.
+                if !cmd_listening {
                     let keep_from = vad_pos.saturating_sub(prefill_samples);
                     if keep_from > 0 {
-                        // Adjust kws_buf_start if it survived (shouldn't happen
-                        // when kws_active_since is None, but be safe).
-                        if let Some(ref mut start) = kws_buf_start {
-                            *start = start.saturating_sub(keep_from);
-                        }
                         audio_buf.drain(..keep_from);
                         vad_pos -= keep_from;
                     }
@@ -3360,15 +3004,12 @@ fn main() -> Result<()> {
                     mode = ListenMode::Idle;
                     last_speech_time = None;
                     recording_hold_until = None;
-                    kws_active_since = None;
-                    kws_buf_start = None;
-                    pending_keyword = None;
-                    if let Some((ref spotter, ref kws_stream)) = kws_state {
-                        spotter.reset(kws_stream);
-                    }
-                    if let Some((ref spotter, ref kws_stream)) = sleep_kws_state {
-                        spotter.reset(kws_stream);
-                    }
+                    cmd_listening = false;
+                    cmd_buf.clear();
+                    cmd_silence_start = None;
+                    spec_cached_text.clear();
+                    spec_fast_fired = false;
+                    spec_slow_fired = false;
                     if let Some((ref recognizer, ref eou_stream)) = eou_state {
                         recognizer.reset(eou_stream);
                     }
@@ -3404,12 +3045,12 @@ fn main() -> Result<()> {
                 sleeping = ctx.sleeping.get();
                 was_detected = false;
                 recording_hold_until = None;
-                kws_active_since = None;
-                kws_buf_start = None;
-                pending_keyword = None;
-                if let Some((ref spotter, ref kws_stream)) = kws_state {
-                    spotter.reset(kws_stream);
-                }
+                cmd_listening = false;
+                cmd_buf.clear();
+                cmd_silence_start = None;
+                spec_cached_text.clear();
+                spec_fast_fired = false;
+                spec_slow_fired = false;
                 if let Some((ref recognizer, ref eou_stream)) = eou_state {
                     recognizer.reset(eou_stream);
                 }

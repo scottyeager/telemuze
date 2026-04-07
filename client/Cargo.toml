@@ -15,10 +15,6 @@ name = "telemuze-listen"
 path = "src/main.rs"
 
 [[bin]]
-name = "keyword-test"
-path = "src/bin/keyword_test.rs"
-
-[[bin]]
 name = "streaming-test"
 path = "src/bin/streaming_test.rs"
 
@@ -56,9 +52,6 @@ x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# BPE tokenization for keyword spotting (pure Rust protobuf parser, no C++ linking)
-sentencepiece-model = "0.1"
 
 # Model archive extraction
 tar = "0.4"

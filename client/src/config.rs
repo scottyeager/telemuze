@@ -4,13 +4,43 @@ use anyhow::{Context, Result};
 use clap::ArgMatches;
 use serde::Deserialize;
 
+/// Dictation segmenting mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SegmentingMode {
+    /// Silence-based flush (current behavior).
+    #[default]
+    Vad,
+    /// Server-side decode with punctuation-gated output.
+    Speculative,
+}
+
+impl std::fmt::Display for SegmentingMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Vad => write!(f, "vad"),
+            Self::Speculative => write!(f, "speculative"),
+        }
+    }
+}
+
+impl std::str::FromStr for SegmentingMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "vad" => Ok(Self::Vad),
+            "speculative" | "spec" => Ok(Self::Speculative),
+            _ => anyhow::bail!("Unknown segmenting mode '{s}' — expected 'vad' or 'speculative'"),
+        }
+    }
+}
+
 /// Initial listening state when the client starts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartMode {
     /// Actively listening for speech and commands.
     #[default]
     Active,
-    /// Sleeping — only wake keywords are processed (higher KWS threshold).
+    /// Sleeping — only wake phrases are processed.
     Sleeping,
     /// Fully paused — audio capture is stopped, nothing is processed.
     Paused,
@@ -59,14 +89,15 @@ pub struct FileConfig {
     pub verbose: Option<bool>,
     pub vad_threshold: Option<f32>,
     pub vad_energy_gate: Option<f32>,
-    pub idle_silence: Option<f32>,
-    pub dictation_silence: Option<f32>,
+    pub fast_silence: Option<f32>,
+    pub slow_silence: Option<f32>,
+    pub final_silence: Option<f32>,
+    pub segmenting: Option<String>,
     pub min_speech: Option<f32>,
     pub max_speech: Option<f32>,
     pub dictation_max_speech: Option<f32>,
     pub prefill_ms: Option<u32>,
     pub hotwords: Option<String>,
-    pub command_hotwords_score: Option<f32>,
     pub dictation_hotwords_score: Option<f32>,
     pub continuation_lowercase: Option<bool>,
     pub lowercase_timeout: Option<f32>,
@@ -76,15 +107,13 @@ pub struct FileConfig {
     pub scroll_ticks: Option<u32>,
     pub dump_audio: Option<PathBuf>,
 
-    // ── Keyword spotting ──────────────────────────────────────────────────
-    pub no_kws: Option<bool>,
-    pub kws_model: Option<String>,
-    pub kws_model_dir: Option<PathBuf>,
-    pub kws_threshold: Option<f32>,
-    pub kws_sleep_threshold: Option<f32>,
-    pub kws_score: Option<f32>,
-    pub kws_threads: Option<i32>,
-    pub kws_timeout: Option<f32>,
+    // ── Local command detection (110m transducer) ─────────────────────────
+    pub no_cmd: Option<bool>,
+    pub cmd_model_dir: Option<PathBuf>,
+    pub cmd_boost: Option<f32>,
+    pub cmd_silence_ms: Option<u32>,
+    pub cmd_threads: Option<i32>,
+    pub cmd_beam_width: Option<i32>,
 
     // ── End-of-utterance model ───────────────────────────────────────────
     pub no_eou: Option<bool>,
@@ -128,14 +157,15 @@ pub struct ResolvedConfig {
     pub verbose: bool,
     pub vad_threshold: f32,
     pub vad_energy_gate: f32,
-    pub idle_silence: f32,
-    pub dictation_silence: f32,
+    pub fast_silence: f32,
+    pub slow_silence: f32,
+    pub final_silence: f32,
+    pub segmenting: SegmentingMode,
     pub min_speech: f32,
     pub max_speech: f32,
     pub dictation_max_speech: f32,
     pub prefill_ms: u32,
     pub hotwords: Option<String>,
-    pub command_hotwords_score: f32,
     pub dictation_hotwords_score: f32,
     pub continuation_lowercase: bool,
     pub lowercase_timeout: f32,
@@ -143,14 +173,12 @@ pub struct ResolvedConfig {
     pub start_mode: StartMode,
     pub scroll_ticks: u32,
     pub dump_audio: Option<PathBuf>,
-    pub no_kws: bool,
-    pub kws_model: crate::kws::KwsModel,
-    pub kws_model_dir: Option<PathBuf>,
-    pub kws_threshold: f32,
-    pub kws_sleep_threshold: f32,
-    pub kws_score: f32,
-    pub kws_threads: i32,
-    pub kws_timeout: f32,
+    pub no_cmd: bool,
+    pub cmd_model_dir: Option<PathBuf>,
+    pub cmd_boost: f32,
+    pub cmd_silence_ms: u32,
+    pub cmd_threads: i32,
+    pub cmd_beam_width: i32,
     pub no_eou: bool,
     pub eou_model_dir: Option<PathBuf>,
     pub eou_threads: i32,
@@ -177,7 +205,7 @@ pub struct ResolvedAliases {
 // ── Default aliases (match the previously hardcoded consts) ──────────────
 
 fn default_click() -> Vec<String> {
-    vec!["mouse".into()]
+    vec!["click".into()]
 }
 
 fn default_press() -> Vec<String> {
@@ -339,12 +367,23 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("vad-energy-gate = {}", cfg.vad_energy_gate));
     line("");
 
-    line("# Silence duration (seconds) to end a segment in idle/command mode.");
-    line(&format!("idle-silence = {}", cfg.idle_silence));
+    line("# Fast silence threshold (seconds). In idle mode: VAD min silence duration.");
+    line("# In speculative mode: triggers a speculative decode.");
+    line(&format!("fast-silence = {}", cfg.fast_silence));
     line("");
 
-    line("# Silence duration (seconds) to end a segment in dictation mode.");
-    line(&format!("dictation-silence = {}", cfg.dictation_silence));
+    line("# Slow silence threshold (seconds). In vad mode: flushes dictation.");
+    line("# In speculative mode: emits text if it ends with sentence punctuation.");
+    line(&format!("slow-silence = {}", cfg.slow_silence));
+    line("");
+
+    line("# Final silence threshold (seconds). In speculative mode: emits text unconditionally.");
+    line(&format!("final-silence = {}", cfg.final_silence));
+    line("");
+
+    line("# Dictation segmenting mode.");
+    line("# Options: \"vad\" (silence-based flush) | \"speculative\" (server-side decode with punct-gated output)");
+    line(&format!("segmenting = \"{}\"", cfg.segmenting));
     line("");
 
     line("# Minimum speech duration (seconds) before a segment is considered valid.");
@@ -369,11 +408,6 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
         Some(hw) => line(&format!("hotwords = \"{hw}\"")),
         None => line("# hotwords = \"custom,words\""),
     }
-    line("");
-
-    line("# Score boost for built-in command hotwords in idle mode. Set 0.0 to disable.");
-    line("# Range: 0.0 | 1.0–4.0");
-    line(&format!("command-hotwords-score = {}", cfg.command_hotwords_score));
     line("");
 
     line("# Score boost for user-provided dictation hotwords. Set 0.0 to disable.");
@@ -410,45 +444,34 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     }
     line("");
 
-    line("# ── Keyword spotting ─────────────────────────────────────────────────────");
-    line("# Disable keyword spotting and fall back to server-side command classification.");
+    line("# ── Local command detection (110m transducer) ────────────────────────────");
+    line("# Disable local command detection (fall back to server-side only).");
     line("# Options: true | false");
-    line(&format!("no-kws = {}", cfg.no_kws));
+    line(&format!("no-cmd = {}", cfg.no_cmd));
     line("");
 
-    line("# KWS model variant.");
-    line("# Options: \"gigaspeech\" (English, BPE) | \"zh-en\" (Chinese+English, phone)");
-    line(&format!("kws-model = \"{}\"", cfg.kws_model));
-    line("");
-
-    line("# Path to KWS model directory. Auto-downloads if omitted.");
-    match &cfg.kws_model_dir {
-        Some(p) => line(&format!("kws-model-dir = \"{}\"", p.display())),
-        None => line("# kws-model-dir = \"/path/to/kws-model\""),
+    line("# Path to Parakeet-TDT 110m model directory. Auto-downloads if omitted.");
+    match &cfg.cmd_model_dir {
+        Some(p) => line(&format!("cmd-model-dir = \"{}\"", p.display())),
+        None => line("# cmd-model-dir = \"/path/to/parakeet-tdt-110m\""),
     }
     line("");
 
-    line("# Keyword detection threshold (lower = more sensitive, higher = fewer false positives).");
-    line("# Range: 0.0–1.0");
-    line(&format!("kws-threshold = {}", cfg.kws_threshold));
+    line("# Hotword boost score for command vocabulary (higher = stronger bias).");
+    line("# Range: 1.0–5.0");
+    line(&format!("cmd-boost = {}", cfg.cmd_boost));
     line("");
 
-    line("# Keyword detection threshold used in sleep mode (for wake-word detection).");
-    line("# Higher than kws-threshold to reduce false wake-ups. Range: 0.0–1.0");
-    line(&format!("kws-sleep-threshold = {}", cfg.kws_sleep_threshold));
+    line("# Silence duration (ms) after speech ends to trigger command decode.");
+    line(&format!("cmd-silence-ms = {}", cfg.cmd_silence_ms));
     line("");
 
-    line("# Keyword boost score.");
-    line(&format!("kws-score = {}", cfg.kws_score));
+    line("# Number of threads for the command recognizer.");
+    line(&format!("cmd-threads = {}", cfg.cmd_threads));
     line("");
 
-    line("# Number of threads for the KWS model.");
-    line(&format!("kws-threads = {}", cfg.kws_threads));
-    line("");
-
-    line("# Seconds to wait for keyword detection after VAD speech onset");
-    line("# before falling through to dictation mode.");
-    line(&format!("kws-timeout = {}", cfg.kws_timeout));
+    line("# Beam search width (max_active_paths). Higher = more accurate but slower.");
+    line(&format!("cmd-beam-width = {}", cfg.cmd_beam_width));
     line("");
 
     line("# ── End-of-utterance model ─────────────────────────────────────────────");
@@ -605,14 +628,21 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         verbose: r_bool!(verbose, "verbose"),
         vad_threshold: r!(vad_threshold, "vad-threshold"),
         vad_energy_gate: r!(vad_energy_gate, "vad-energy-gate"),
-        idle_silence: r!(idle_silence, "idle-silence"),
-        dictation_silence: r!(dictation_silence, "dictation-silence"),
+        fast_silence: r!(fast_silence, "fast-silence"),
+        slow_silence: r!(slow_silence, "slow-silence"),
+        final_silence: r!(final_silence, "final-silence"),
+        segmenting: if is_explicit(matches, "segmenting") {
+            cli.segmenting
+        } else if let Some(ref s) = file.segmenting {
+            s.parse().context("Invalid segmenting mode in config file")?
+        } else {
+            cli.segmenting
+        },
         min_speech: r!(min_speech, "min-speech"),
         max_speech: r!(max_speech, "max-speech"),
         dictation_max_speech: r!(dictation_max_speech, "dictation-max-speech"),
         prefill_ms: r!(prefill_ms, "prefill-ms"),
         hotwords: r_opt!(hotwords, "hotwords"),
-        command_hotwords_score: r!(command_hotwords_score, "command-hotwords-score"),
         dictation_hotwords_score: r!(dictation_hotwords_score, "dictation-hotwords-score"),
         continuation_lowercase: r_bool!(continuation_lowercase, "continuation-lowercase"),
         lowercase_timeout: r!(lowercase_timeout, "lowercase-timeout"),
@@ -628,20 +658,12 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         },
         scroll_ticks: r!(scroll_ticks, "scroll-ticks"),
         dump_audio: r_opt!(dump_audio, "dump-audio"),
-        no_kws: r_bool!(no_kws, "no-kws"),
-        kws_model: if is_explicit(matches, "kws-model") {
-            cli.kws_model
-        } else if let Some(ref s) = file.kws_model {
-            s.parse().context("Invalid kws-model in config file")?
-        } else {
-            cli.kws_model
-        },
-        kws_model_dir: r_opt!(kws_model_dir, "kws-model-dir"),
-        kws_threshold: r!(kws_threshold, "kws-threshold"),
-        kws_sleep_threshold: r!(kws_sleep_threshold, "kws-sleep-threshold"),
-        kws_score: r!(kws_score, "kws-score"),
-        kws_threads: r!(kws_threads, "kws-threads"),
-        kws_timeout: r!(kws_timeout, "kws-timeout"),
+        no_cmd: r_bool!(no_cmd, "no-cmd"),
+        cmd_model_dir: r_opt!(cmd_model_dir, "cmd-model-dir"),
+        cmd_boost: r!(cmd_boost, "cmd-boost"),
+        cmd_silence_ms: r!(cmd_silence_ms, "cmd-silence-ms"),
+        cmd_threads: r!(cmd_threads, "cmd-threads"),
+        cmd_beam_width: r!(cmd_beam_width, "cmd-beam-width"),
         no_eou: r_bool!(no_eou, "no-eou"),
         eou_model_dir: r_opt!(eou_model_dir, "eou-model-dir"),
         eou_threads: r!(eou_threads, "eou-threads"),
