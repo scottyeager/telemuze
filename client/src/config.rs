@@ -67,6 +67,70 @@ impl std::str::FromStr for StartMode {
         }
     }
 }
+/// How transcribed text reaches the target window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputMethod {
+    /// Simulate keystrokes (xdotool type / wtype).
+    #[default]
+    Type,
+    /// Paste via Ctrl+V.
+    Paste,
+    /// Paste via Ctrl+Shift+V (e.g. terminals).
+    PasteShift,
+}
+
+impl std::fmt::Display for OutputMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Type => write!(f, "type"),
+            Self::Paste => write!(f, "paste"),
+            Self::PasteShift => write!(f, "paste-shift"),
+        }
+    }
+}
+
+impl std::str::FromStr for OutputMethod {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "type" => Ok(Self::Type),
+            "paste" => Ok(Self::Paste),
+            "paste-shift" | "paste_shift" => Ok(Self::PasteShift),
+            _ => anyhow::bail!("Unknown output-method '{s}' — expected 'type', 'paste', or 'paste-shift'"),
+        }
+    }
+}
+
+/// Which X11/Wayland selection buffer to use for paste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PasteSelection {
+    /// CLIPBOARD selection (Ctrl+C / Ctrl+V).
+    #[default]
+    Clipboard,
+    /// PRIMARY selection (select / middle-click).
+    Primary,
+}
+
+impl std::fmt::Display for PasteSelection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Clipboard => write!(f, "clipboard"),
+            Self::Primary => write!(f, "primary"),
+        }
+    }
+}
+
+impl std::str::FromStr for PasteSelection {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "clipboard" => Ok(Self::Clipboard),
+            "primary" => Ok(Self::Primary),
+            _ => anyhow::bail!("Unknown paste-selection '{s}' — expected 'clipboard' or 'primary'"),
+        }
+    }
+}
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -106,6 +170,11 @@ pub struct FileConfig {
     pub start_mode: Option<String>,
     pub scroll_ticks: Option<u32>,
     pub dump_audio: Option<PathBuf>,
+
+    // ── Text output method ──────────────────────────────────────────────
+    pub output_method: Option<String>,
+    pub paste_selection: Option<String>,
+    pub paste_restore: Option<bool>,
 
     // ── Local command detection (110m transducer) ─────────────────────────
     pub no_cmd: Option<bool>,
@@ -173,6 +242,9 @@ pub struct ResolvedConfig {
     pub start_mode: StartMode,
     pub scroll_ticks: u32,
     pub dump_audio: Option<PathBuf>,
+    pub output_method: OutputMethod,
+    pub paste_selection: PasteSelection,
+    pub paste_restore: bool,
     pub no_cmd: bool,
     pub cmd_model_dir: Option<PathBuf>,
     pub cmd_boost: f32,
@@ -309,6 +381,23 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line("# Type transcribed text into the focused window instead of printing to stdout.");
     line("# Options: true | false");
     line(&format!("type-text = {}", cfg.type_text));
+    line("");
+
+    line("# How text reaches the target window.");
+    line("# Options: \"type\" (keystrokes) | \"paste\" (Ctrl+V) | \"paste-shift\" (Ctrl+Shift+V)");
+    line(&format!("output-method = \"{}\"", cfg.output_method));
+    line("");
+
+    line("# Which selection buffer to use for paste (ignored when output-method = \"type\").");
+    line("# \"clipboard\" pastes via Ctrl+V/Ctrl+Shift+V. \"primary\" pastes via middle-click.");
+    line("# Options: \"clipboard\" | \"primary\"");
+    line(&format!("paste-selection = \"{}\"", cfg.paste_selection));
+    line("");
+
+    line("# Restore the original clipboard/selection content after pasting.");
+    line("# When false, the dictation text remains in the buffer for easy re-paste.");
+    line("# Options: true | false");
+    line(&format!("paste-restore = {}", cfg.paste_restore));
     line("");
 
     line("# Show a system tray icon indicating recording/processing state (X11 only).");
@@ -658,6 +747,21 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         },
         scroll_ticks: r!(scroll_ticks, "scroll-ticks"),
         dump_audio: r_opt!(dump_audio, "dump-audio"),
+        output_method: if is_explicit(matches, "output-method") {
+            cli.output_method
+        } else if let Some(ref s) = file.output_method {
+            s.parse().context("Invalid output-method in config file")?
+        } else {
+            cli.output_method
+        },
+        paste_selection: if is_explicit(matches, "paste-selection") {
+            cli.paste_selection
+        } else if let Some(ref s) = file.paste_selection {
+            s.parse().context("Invalid paste-selection in config file")?
+        } else {
+            cli.paste_selection
+        },
+        paste_restore: r_bool!(paste_restore, "paste-restore"),
         no_cmd: r_bool!(no_cmd, "no-cmd"),
         cmd_model_dir: r_opt!(cmd_model_dir, "cmd-model-dir"),
         cmd_boost: r!(cmd_boost, "cmd-boost"),
