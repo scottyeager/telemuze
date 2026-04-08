@@ -180,6 +180,8 @@ pub struct FileConfig {
     pub no_cmd: Option<bool>,
     pub cmd_model_dir: Option<PathBuf>,
     pub cmd_boost: Option<f32>,
+    pub cmd_boost_phrase: Option<f32>,
+    pub cmd_boost_vocab: Option<f32>,
     pub cmd_silence_ms: Option<u32>,
     pub cmd_threads: Option<i32>,
     pub cmd_beam_width: Option<i32>,
@@ -248,6 +250,8 @@ pub struct ResolvedConfig {
     pub no_cmd: bool,
     pub cmd_model_dir: Option<PathBuf>,
     pub cmd_boost: f32,
+    pub cmd_boost_phrase: f32,
+    pub cmd_boost_vocab: f32,
     pub cmd_silence_ms: u32,
     pub cmd_threads: i32,
     pub cmd_beam_width: i32,
@@ -546,9 +550,17 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     }
     line("");
 
-    line("# Hotword boost score for command vocabulary (higher = stronger bias).");
+    line("# Hotword boost score for command trigger words (higher = stronger bias).");
     line("# Range: 1.0–5.0");
     line(&format!("cmd-boost = {}", cfg.cmd_boost));
+    line("");
+
+    line("# Boost score for multi-word command phrases (e.g. \"press control\", \"scroll up\").");
+    line(&format!("cmd-boost-phrase = {}", cfg.cmd_boost_phrase));
+    line("");
+
+    line("# Boost score for supporting vocabulary (key names, modifiers, directions).");
+    line(&format!("cmd-boost-vocab = {}", cfg.cmd_boost_vocab));
     line("");
 
     line("# Silence duration (ms) after speech ends to trigger command decode.");
@@ -765,6 +777,8 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         no_cmd: r_bool!(no_cmd, "no-cmd"),
         cmd_model_dir: r_opt!(cmd_model_dir, "cmd-model-dir"),
         cmd_boost: r!(cmd_boost, "cmd-boost"),
+        cmd_boost_phrase: r!(cmd_boost_phrase, "cmd-boost-phrase"),
+        cmd_boost_vocab: r!(cmd_boost_vocab, "cmd-boost-vocab"),
         cmd_silence_ms: r!(cmd_silence_ms, "cmd-silence-ms"),
         cmd_threads: r!(cmd_threads, "cmd-threads"),
         cmd_beam_width: r!(cmd_beam_width, "cmd-beam-width"),

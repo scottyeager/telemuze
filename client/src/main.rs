@@ -223,9 +223,17 @@ struct Cli {
     #[arg(long, env = "TELEMUZE_CMD_MODEL_DIR")]
     cmd_model_dir: Option<PathBuf>,
 
-    /// Hotword boost score for command vocabulary (1.0–5.0).
+    /// Hotword boost score for command trigger words (1.0–5.0).
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST)]
     cmd_boost: f32,
+
+    /// Hotword boost score for multi-word command phrases.
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_PHRASE)]
+    cmd_boost_phrase: f32,
+
+    /// Hotword boost score for supporting vocabulary (key names, modifiers).
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_VOCAB)]
+    cmd_boost_vocab: f32,
 
     /// Silence duration (ms) after speech ends to trigger command decode.
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_SILENCE_MS)]
@@ -416,7 +424,10 @@ impl AppContext {
             .display_server
             .unwrap_or_else(detect_display_server);
 
-        let command_hotwords = build_command_hotwords(&cfg.aliases, &cfg.modifiers);
+        let command_hotwords = build_command_hotwords(
+            &cfg.aliases, &cfg.modifiers,
+            cfg.cmd_boost, cfg.cmd_boost_phrase, cfg.cmd_boost_vocab,
+        );
 
         Self {
             http_client: reqwest::blocking::Client::new(),
@@ -896,46 +907,57 @@ enum TextAction<'a> {
     Command(VoiceAction),
 }
 
-/// Build a comma-separated hotwords string from the command vocabulary.
-/// These are all words that might appear in voice commands, used to boost
-/// recognition accuracy when we don't yet know if an utterance is a command.
-fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, String)]) -> String {
-    let mut words: Vec<String> = Vec::new();
-
-    // Command trigger keywords (canonical + aliases)
-    words.extend(["press", "click", "scroll", "slash", "command", "undo"].iter().map(|s| s.to_string()));
-    words.extend(aliases.click.iter().cloned());
-    words.extend(aliases.press.iter().cloned());
-    words.extend(aliases.scroll.iter().cloned());
-    words.extend(aliases.undo.iter().cloned());
+/// Build a sherpa-onnx hotwords string with tiered boost scores.
+///
+/// - `boost` (high): command trigger words (press, click, scroll, ...)
+/// - `boost_phrase` (mid): multi-word phrases (press control, scroll up, ...)
+/// - `boost_vocab` (low): supporting vocabulary (key names, modifiers, directions)
+fn build_command_hotwords(
+    aliases: &ResolvedAliases,
+    modifiers: &[(String, String)],
+    boost: f32,
+    boost_phrase: f32,
+    boost_vocab: f32,
+) -> String {
+    // ── High tier: command trigger words ──────────────────────────────────
+    let mut high: Vec<String> = Vec::new();
+    high.extend(["press", "click", "scroll", "slash", "undo"].iter().map(|s| s.to_string()));
+    high.extend(aliases.click.iter().cloned());
+    high.extend(aliases.press.iter().cloned());
+    high.extend(aliases.scroll.iter().cloned());
+    high.extend(aliases.undo.iter().cloned());
     for trigger in &aliases.slash_command {
-        words.extend(trigger.iter().cloned());
+        high.extend(trigger.iter().cloned());
     }
+    high.push("press enter".into());
+    high.sort_unstable();
+    high.dedup();
 
-    // Click quadrant words
-    words.extend(["upper", "lower", "left", "right"].iter().map(|s| s.to_string()));
+    // ── Low tier: supporting vocabulary ───────────────────────────────────
+    let mut low: Vec<String> = Vec::new();
 
-    // Scroll directions
-    words.extend(["up", "down", "top", "bottom"].iter().map(|s| s.to_string()));
-
-    // Key names (named keys only; single letters are too ambiguous)
-    words.extend([
+    // Key names
+    low.extend([
         "enter", "return", "tab", "space", "backspace", "delete",
         "escape", "home", "end",
     ].iter().map(|s| s.to_string()));
 
     // Modifier keys
     for (alias, _) in modifiers {
-        words.push(alias.clone());
+        low.push(alias.clone());
     }
 
-    // Deduplicate (some words appear in multiple roles, e.g. "left", "right", "up", "down")
-    words.sort_unstable();
-    words.dedup();
+    // Direction / quadrant words
+    low.extend([
+        "up", "down", "top", "bottom", "upper", "lower", "left", "right",
+        "command",
+    ].iter().map(|s| s.to_string()));
 
-    // Multi-word command phrases — boosting these as phrases gives stronger
-    // recognition than individual words alone.
-    let mut phrases: Vec<String> = vec![
+    low.sort_unstable();
+    low.dedup();
+
+    // ── Mid tier: multi-word phrases ─────────────────────────────────────
+    let mut mid: Vec<String> = vec![
         "slash command".into(),
         "click upper left".into(),
         "click upper right".into(),
@@ -945,7 +967,6 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
         "scroll down".into(),
         "scroll top".into(),
         "scroll bottom".into(),
-        "press enter".into(),
         "press tab".into(),
         "press space".into(),
         "press backspace".into(),
@@ -957,36 +978,50 @@ fn build_command_hotwords(aliases: &ResolvedAliases, modifiers: &[(String, Strin
         "press super".into(),
     ];
 
-    // Add alias phrases for slash command triggers
+    // Alias phrases for slash command triggers
     for trigger in &aliases.slash_command {
-        phrases.push(trigger.join(" "));
+        mid.push(trigger.join(" "));
     }
-    // Wake/sleep trigger phrases
+    // Wake/sleep trigger phrases (individual words go to low tier)
     for phrase in &aliases.wake {
-        phrases.push(phrase.clone());
+        mid.push(phrase.clone());
         for word in phrase.split_whitespace() {
-            words.push(word.to_string());
+            low.push(word.to_string());
         }
     }
     for phrase in &aliases.sleep {
-        phrases.push(phrase.clone());
+        mid.push(phrase.clone());
         for word in phrase.split_whitespace() {
-            words.push(word.to_string());
+            low.push(word.to_string());
         }
     }
-    // Add alias phrases for click quadrant commands
+    // Alias phrases for click quadrant commands
     for trigger in &aliases.click {
         for dir in &["upper left", "upper right", "lower left", "lower right"] {
-            phrases.push(format!("{trigger} {dir}"));
+            mid.push(format!("{trigger} {dir}"));
         }
     }
 
-    phrases.sort();
-    phrases.dedup();
+    mid.sort();
+    mid.dedup();
 
-    let mut all = words;
-    all.extend(phrases);
-    all.join(",")
+    // Re-dedup low after wake/sleep words were added
+    low.sort_unstable();
+    low.dedup();
+
+    // ── Format as sherpa-onnx hotwords string ────────────────────────────
+    let mut out = String::new();
+    for w in &high {
+        out.push_str(&format!("{w} :{boost}\n"));
+    }
+    for w in &mid {
+        out.push_str(&format!("{w} :{boost_phrase}\n"));
+    }
+    for w in &low {
+        out.push_str(&format!("{w} :{boost_vocab}\n"));
+    }
+    out.truncate(out.trim_end().len());
+    out
 }
 
 /// Returns true if `s` contains at least one alphanumeric character (i.e. is
@@ -2466,7 +2501,6 @@ fn main() -> Result<()> {
         beam_width: cfg.cmd_beam_width,
     };
     let cmd_silence_ms = cfg.cmd_silence_ms;
-    let cmd_boost = cfg.cmd_boost;
     let no_eou = cfg.no_eou;
     let eou_model_dir = cfg.eou_model_dir.clone();
     let eou_cfg = eou::EouConfig {
@@ -2658,7 +2692,7 @@ fn main() -> Result<()> {
     let mut cmd_buf: Vec<f32> = Vec::new(); // audio buffered for command decode
     let mut cmd_silence_start: Option<Instant> = None; // when speech ended
     let cmd_hotwords = cmd_state.as_ref().map(|_| {
-        cmd::build_hotwords(&ctx.command_hotwords, cmd_boost)
+        ctx.command_hotwords.clone()
     });
 
     // EOU state

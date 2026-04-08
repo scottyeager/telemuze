@@ -28,6 +28,8 @@ const MODEL_BPE_VOCAB: &str = "bpe.vocab";
 // ── Defaults ───────────────────────────────────────────────────────────────
 
 pub const DEFAULT_CMD_BOOST: f32 = 3.0;
+pub const DEFAULT_CMD_BOOST_PHRASE: f32 = 2.0;
+pub const DEFAULT_CMD_BOOST_VOCAB: f32 = 1.0;
 pub const DEFAULT_CMD_SILENCE_MS: u32 = 500;
 pub const DEFAULT_CMD_THREADS: i32 = 4;
 pub const DEFAULT_CMD_BEAM_WIDTH: i32 = 4;
@@ -200,16 +202,6 @@ pub fn init_recognizer(cfg: &CmdConfig) -> Result<OfflineRecognizer> {
         .context("Failed to create command recognizer — check model paths")
 }
 
-/// Build a hotwords string for the OfflineRecognizer from command vocabulary.
-/// Format: one hotword per line, each with " :<boost_score>" suffix.
-pub fn build_hotwords(command_hotwords_csv: &str, boost: f32) -> String {
-    command_hotwords_csv
-        .split(',')
-        .filter(|s| !s.trim().is_empty())
-        .map(|hw| format!("{} :{boost}", hw.trim()))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
 
 /// Normalize text for command matching: lowercase, strip punctuation, collapse whitespace.
 pub fn normalize(text: &str) -> String {
