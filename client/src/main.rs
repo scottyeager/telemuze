@@ -1845,6 +1845,54 @@ fn send_to_server(
     hotwords: Option<&str>,
     hotwords_score: f32,
 ) -> Result<String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
+    let mut last_err = None;
+    for attempt in 1..=MAX_ATTEMPTS {
+        match send_to_server_once(client, url, samples, smart, hotwords, hotwords_score) {
+            Ok(text) => {
+                if attempt > 1 {
+                    info!(attempt, "Request succeeded after retry");
+                }
+                return Ok(text);
+            }
+            Err(e) => {
+                let retryable = is_retryable(&e);
+                if attempt < MAX_ATTEMPTS && retryable {
+                    warn!(attempt, error = %e, "Retryable error, will retry after {:?}", RETRY_DELAY);
+                    std::thread::sleep(RETRY_DELAY);
+                    last_err = Some(e);
+                } else {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap())
+}
+
+fn is_retryable(err: &anyhow::Error) -> bool {
+    let msg = format!("{err:#}");
+    // Network-level failures (connection refused, timeout, reset, etc.)
+    if msg.contains("Failed to send audio to server") {
+        return true;
+    }
+    // Server errors or server-side multipart parse failures
+    if msg.contains("retryable:") {
+        return true;
+    }
+    false
+}
+
+fn send_to_server_once(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    samples: &[f32],
+    smart: bool,
+    hotwords: Option<&str>,
+    hotwords_score: f32,
+) -> Result<String> {
     let pcm_bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
     let part = reqwest::blocking::multipart::Part::bytes(pcm_bytes)
         .file_name("audio.pcm")
@@ -1867,6 +1915,12 @@ fn send_to_server(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
+        // Server-side multipart parse failures and 5xx are retryable
+        if status.as_u16() >= 500
+            || (status.as_u16() == 400 && body.contains("Failed to read uploaded file"))
+        {
+            anyhow::bail!("retryable: Server returned {status}: {body}");
+        }
         anyhow::bail!("Server returned {status}: {body}");
     }
 

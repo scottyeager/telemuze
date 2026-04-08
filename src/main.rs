@@ -8,6 +8,7 @@ mod state;
 mod telegram;
 
 use anyhow::Result;
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use clap::Parser;
 use std::sync::Arc;
@@ -62,6 +63,7 @@ async fn main() -> Result<()> {
         .merge(endpoints::transcriptions::router())
         .merge(endpoints::dictate::router())
         .merge(endpoints::long_form::router())
+        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(shared_state);
