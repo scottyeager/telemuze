@@ -62,6 +62,7 @@ enum IpcCommand {
     Toggle,
     Flush,
     Stop,
+    CopyLast,
 }
 
 // ── CLI ────────────────────────────────────────────────────────────────────
@@ -398,6 +399,8 @@ struct AppContext {
     paste_restore: bool,
     /// Sleep state — shared via Cell so command handlers can toggle it.
     sleeping: Cell<bool>,
+    /// Last dictation text, shared with tray menu for "Copy Last" action.
+    last_dictation_text: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
 impl AppContext {
@@ -449,6 +452,7 @@ impl AppContext {
             sleeping: Cell::new(false),
             aliases: cfg.aliases,
             modifiers: cfg.modifiers,
+            last_dictation_text: std::sync::Arc::new(std::sync::Mutex::new(String::new())),
         }
     }
 
@@ -2272,6 +2276,9 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
         let _ = io::stdout().flush();
     }
 
+    // Store the final text for "Copy Last" tray menu action.
+    *ctx.last_dictation_text.lock().unwrap() = text.to_string();
+
     if ctx.sound {
         play_sound("message-new-instant");
     }
@@ -3203,6 +3210,16 @@ fn main() -> Result<()> {
                 drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
                 info!("Stopping");
                 break;
+            }
+
+            Ok(Event::Ipc(IpcCommand::CopyLast)) => {
+                let text = ctx.last_dictation_text.lock().unwrap().clone();
+                if !text.is_empty() {
+                    write_clipboard(&text, &ctx.display_server, &ctx.paste_selection);
+                    info!("Copied last dictation to clipboard");
+                } else {
+                    info!("No dictation text to copy");
+                }
             }
 
             Err(_) => break, // All senders dropped
