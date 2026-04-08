@@ -179,11 +179,9 @@ pub struct FileConfig {
     // ── Local command detection (110m transducer) ─────────────────────────
     pub no_cmd: Option<bool>,
     pub cmd_model_dir: Option<PathBuf>,
-    pub cmd_boost: Option<f32>,
+    pub cmd_boost_first: Option<f32>,
     pub cmd_boost_phrase: Option<f32>,
     pub cmd_boost_vocab: Option<f32>,
-    pub cmd_boost_first: Option<f32>,
-    pub cmd_boost_continuation: Option<f32>,
     pub cmd_first_pass_ms: Option<u32>,
     pub cmd_prefill_ms: Option<u32>,
     pub cmd_silence_ms: Option<u32>,
@@ -253,11 +251,9 @@ pub struct ResolvedConfig {
     pub paste_restore: bool,
     pub no_cmd: bool,
     pub cmd_model_dir: Option<PathBuf>,
-    pub cmd_boost: f32,
+    pub cmd_boost_first: f32,
     pub cmd_boost_phrase: f32,
     pub cmd_boost_vocab: f32,
-    pub cmd_boost_first: f32,
-    pub cmd_boost_continuation: f32,
     pub cmd_first_pass_ms: u32,
     pub cmd_prefill_ms: u32,
     pub cmd_silence_ms: u32,
@@ -558,25 +554,17 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     }
     line("");
 
-    line("# Hotword boost score for command trigger words (higher = stronger bias).");
+    line("# Hotword boost for trigger verbs in pass 1 (press, click, scroll, ...).");
     line("# Range: 1.0–5.0");
-    line(&format!("cmd-boost = {}", cfg.cmd_boost));
-    line("");
-
-    line("# Boost score for multi-word command phrases (e.g. \"press control\", \"scroll up\").");
-    line(&format!("cmd-boost-phrase = {}", cfg.cmd_boost_phrase));
-    line("");
-
-    line("# Boost score for supporting vocabulary (key names, modifiers, directions).");
-    line(&format!("cmd-boost-vocab = {}", cfg.cmd_boost_vocab));
-    line("");
-
-    line("# Recognizer-level hotword score for pass 1 (first-word boost).");
     line(&format!("cmd-boost-first = {}", cfg.cmd_boost_first));
     line("");
 
-    line("# Recognizer-level hotword score for pass 2 (continuation boost).");
-    line(&format!("cmd-boost-continuation = {}", cfg.cmd_boost_continuation));
+    line("# Boost for multi-word command phrases in pass 2 (e.g. \"press control\", \"scroll up\").");
+    line(&format!("cmd-boost-phrase = {}", cfg.cmd_boost_phrase));
+    line("");
+
+    line("# Boost for supporting vocabulary in pass 2 (key names, modifiers, directions).");
+    line(&format!("cmd-boost-vocab = {}", cfg.cmd_boost_vocab));
     line("");
 
     line("# Audio from onset for pass 1 decode (ms).");
@@ -800,11 +788,9 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         paste_restore: r_bool!(paste_restore, "paste-restore"),
         no_cmd: r_bool!(no_cmd, "no-cmd"),
         cmd_model_dir: r_opt!(cmd_model_dir, "cmd-model-dir"),
-        cmd_boost: r!(cmd_boost, "cmd-boost"),
+        cmd_boost_first: r!(cmd_boost_first, "cmd-boost-first"),
         cmd_boost_phrase: r!(cmd_boost_phrase, "cmd-boost-phrase"),
         cmd_boost_vocab: r!(cmd_boost_vocab, "cmd-boost-vocab"),
-        cmd_boost_first: r!(cmd_boost_first, "cmd-boost-first"),
-        cmd_boost_continuation: r!(cmd_boost_continuation, "cmd-boost-continuation"),
         cmd_first_pass_ms: r!(cmd_first_pass_ms, "cmd-first-pass-ms"),
         cmd_prefill_ms: r!(cmd_prefill_ms, "cmd-prefill-ms"),
         cmd_silence_ms: r!(cmd_silence_ms, "cmd-silence-ms"),

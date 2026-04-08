@@ -27,11 +27,9 @@ const MODEL_BPE_VOCAB: &str = "bpe.vocab";
 
 // ── Defaults ───────────────────────────────────────────────────────────────
 
-pub const DEFAULT_CMD_BOOST: f32 = 3.0;
+pub const DEFAULT_CMD_BOOST_FIRST: f32 = 3.0;
 pub const DEFAULT_CMD_BOOST_PHRASE: f32 = 2.0;
 pub const DEFAULT_CMD_BOOST_VOCAB: f32 = 1.0;
-pub const DEFAULT_CMD_BOOST_FIRST: f32 = 3.0;
-pub const DEFAULT_CMD_BOOST_CONTINUATION: f32 = 3.0;
 pub const DEFAULT_CMD_FIRST_PASS_MS: u32 = 800;
 pub const DEFAULT_CMD_PREFILL_MS: u32 = 300;
 pub const DEFAULT_CMD_SILENCE_MS: u32 = 500;
@@ -150,14 +148,15 @@ pub fn ensure_model(model_dir: &Path) -> Result<()> {
 /// Configuration for the command recognizer.
 pub struct CmdConfig {
     pub model_dir: PathBuf,
-    pub boost_first: f32,
-    pub boost_continuation: f32,
     pub num_threads: i32,
     pub beam_width: i32,
 }
 
-/// Initialize an OfflineRecognizer for command detection with a specific hotword score.
-pub fn init_recognizer(cfg: &CmdConfig, hotwords_score: f32) -> Result<OfflineRecognizer> {
+/// Initialize an OfflineRecognizer for command detection.
+///
+/// The recognizer-level `hotwords_score` is left at its default since every
+/// word in the hotwords string carries an explicit per-word score.
+pub fn init_recognizer(cfg: &CmdConfig) -> Result<OfflineRecognizer> {
     ensure_model(&cfg.model_dir)?;
 
     // Prefer int8 model files when present
@@ -190,7 +189,6 @@ pub fn init_recognizer(cfg: &CmdConfig, hotwords_score: f32) -> Result<OfflineRe
     config.model_config.num_threads = cfg.num_threads;
     config.decoding_method = Some("modified_beam_search".to_string());
     config.max_active_paths = cfg.beam_width;
-    config.hotwords_score = hotwords_score;
 
     // Enable BPE hotword encoding if bpe.vocab exists
     let bpe_vocab = cfg.model_dir.join(MODEL_BPE_VOCAB);
@@ -210,8 +208,8 @@ pub fn init_recognizer(cfg: &CmdConfig, hotwords_score: f32) -> Result<OfflineRe
 /// Initialize a pair of recognizers for two-pass command detection.
 /// Returns (pass1_recognizer, pass2_recognizer).
 pub fn init_recognizer_pair(cfg: &CmdConfig) -> Result<(OfflineRecognizer, OfflineRecognizer)> {
-    let pass1 = init_recognizer(cfg, cfg.boost_first)?;
-    let pass2 = init_recognizer(cfg, cfg.boost_continuation)?;
+    let pass1 = init_recognizer(cfg)?;
+    let pass2 = init_recognizer(cfg)?;
     Ok((pass1, pass2))
 }
 

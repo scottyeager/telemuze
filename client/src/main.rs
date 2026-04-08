@@ -223,26 +223,17 @@ struct Cli {
     #[arg(long, env = "TELEMUZE_CMD_MODEL_DIR")]
     cmd_model_dir: Option<PathBuf>,
 
-    /// Hotword boost score for command trigger words (1.0–5.0).
-    /// Controls which words go into the first-word hotword string.
-    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST)]
-    cmd_boost: f32,
-
-    /// Hotword boost score for multi-word command phrases.
-    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_PHRASE)]
-    cmd_boost_phrase: f32,
-
-    /// Hotword boost score for supporting vocabulary (key names, modifiers).
-    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_VOCAB)]
-    cmd_boost_vocab: f32,
-
-    /// Recognizer-level hotword score for pass 1 (first-word boost).
+    /// Hotword boost for trigger verbs in pass 1 (press, click, scroll, ...).
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_FIRST)]
     cmd_boost_first: f32,
 
-    /// Recognizer-level hotword score for pass 2 (continuation boost).
-    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_CONTINUATION)]
-    cmd_boost_continuation: f32,
+    /// Hotword boost for multi-word command phrases in pass 2.
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_PHRASE)]
+    cmd_boost_phrase: f32,
+
+    /// Hotword boost for supporting vocabulary in pass 2 (key names, modifiers).
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_VOCAB)]
+    cmd_boost_vocab: f32,
 
     /// Audio from onset for pass 1 decode (ms).
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_FIRST_PASS_MS)]
@@ -444,7 +435,7 @@ impl AppContext {
             .unwrap_or_else(detect_display_server);
 
         let first_word_hotwords = build_first_word_hotwords(
-            &cfg.aliases, cfg.cmd_boost,
+            &cfg.aliases, cfg.cmd_boost_first,
         );
         let continuation_hotwords = build_continuation_hotwords(
             &cfg.aliases, &cfg.modifiers,
@@ -2539,8 +2530,6 @@ fn main() -> Result<()> {
     let cmd_cfg = cmd::CmdConfig {
         model_dir: cfg.cmd_model_dir.clone()
             .unwrap_or_else(cmd::default_model_dir),
-        boost_first: cfg.cmd_boost_first,
-        boost_continuation: cfg.cmd_boost_continuation,
         num_threads: cfg.cmd_threads,
         beam_width: cfg.cmd_beam_width,
     };
@@ -2663,8 +2652,7 @@ fn main() -> Result<()> {
         info!("Initializing two-pass command recognizers (Parakeet-TDT 110m)");
         match cmd::init_recognizer_pair(&cmd_cfg) {
             Ok((p1, p2)) => {
-                info!("Command recognizers ready (pass1 boost={}, pass2 boost={})",
-                    cmd_cfg.boost_first, cmd_cfg.boost_continuation);
+                info!("Two-pass command recognizers ready");
                 (Some(p1), Some(p2))
             }
             Err(e) => {
