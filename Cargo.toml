@@ -63,3 +63,11 @@ mic = ["cpal", "ctrlc"]
 [[example]]
 name = "speculative_decode"
 required-features = ["mic"]
+
+[[example]]
+name = "command_detect"
+required-features = ["mic"]
+
+[[example]]
+name = "two_pass_detect"
+required-features = ["mic"]
