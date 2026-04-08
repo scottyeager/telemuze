@@ -2240,7 +2240,26 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
     let should_delete_trailing_punct =
         raw_starts_lowercase && ctx.last_ended_with_punctuation.get();
 
-    if should_delete_trailing_punct && ctx.type_text {
+    // Apply continuation lowercasing.
+    // If we should delete trailing punct, text is already lowercase from server — keep it.
+    // Otherwise use the existing continuation logic.
+    let text = if should_delete_trailing_punct || ctx.should_lowercase_continuation(ListenMode::Dictation) {
+        lowercase_first_letter(text)
+    } else {
+        text.to_string()
+    };
+
+    // Parse actions BEFORE sentence extension so we can skip it for slash commands.
+    let actions = process_voice_commands(&text, ctx);
+    debug!(?actions, "Parsed dictation actions");
+
+    // Only apply sentence extension if there is actual text to output (not just
+    // slash commands or voice commands).
+    let has_text_output = actions.iter().any(|a| {
+        matches!(a, TextAction::Text(_))
+            || matches!(a, TextAction::OwnedText(s) if !s.starts_with('/'))
+    });
+    if should_delete_trailing_punct && ctx.type_text && has_text_output {
         // type_into_window appends a space, so previous output was e.g. "good performance. "
         // Cursor is after the space — delete space, delete punct, retype space.
         send_key("BackSpace", &ctx.display_server);
@@ -2251,22 +2270,9 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
         ctx.last_typed_chars.set(prev.saturating_sub(1));
     }
 
-    // Apply continuation lowercasing.
-    // If we just deleted trailing punct, text is already lowercase from server — keep it.
-    // Otherwise use the existing continuation logic.
-    let text = if should_delete_trailing_punct || ctx.should_lowercase_continuation(ListenMode::Dictation) {
-        lowercase_first_letter(text)
-    } else {
-        text.to_string()
-    };
-
     ctx.last_ended_with_punctuation
         .set(ends_with_sentence_punctuation(&text));
     ctx.last_output_time.set(Some(Instant::now()));
-
-    // In dictation mode, output all text (commands at start are still processed).
-    let actions = process_voice_commands(&text, ctx);
-    debug!(?actions, "Parsed dictation actions");
 
     let mut just_typed = false;
     let mut chars_typed: usize = 0;
