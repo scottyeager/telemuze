@@ -150,8 +150,8 @@ pub struct FileConfig {
     pub prefill_ms: Option<u32>,
     pub hotwords: Option<String>,
     pub dictation_hotwords_score: Option<f32>,
-    pub continuation_lowercase: Option<bool>,
-    pub lowercase_timeout: Option<f32>,
+    pub sentence_continuation: Option<bool>,
+    pub sentence_continuation_timeout: Option<f32>,
     pub min_dictation_words: Option<usize>,
     pub paused: Option<bool>,
     pub start_mode: Option<String>,
@@ -235,8 +235,8 @@ pub struct ResolvedConfig {
     pub prefill_ms: u32,
     pub hotwords: Option<String>,
     pub dictation_hotwords_score: f32,
-    pub continuation_lowercase: bool,
-    pub lowercase_timeout: f32,
+    pub sentence_continuation: bool,
+    pub sentence_continuation_timeout: f32,
     pub min_dictation_words: usize,
     pub start_mode: StartMode,
     pub scroll_ticks: u32,
@@ -500,16 +500,16 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line("");
 
     line("# ── Text processing ──────────────────────────────────────────────────────");
-    line("# Lowercase the first letter of idle-mode segments when the previous segment did not");
-    line("# end with sentence-ending punctuation (. ! ?). Dictation always lowercases");
-    line("# continuations regardless of this flag.");
+
+    line("# Enable sentence continuation: lowercase across segments and merge");
+    line("# punctuation when the ASR signals a continuation.");
     line("# Options: true | false");
-    line(&format!("continuation-lowercase = {}", cfg.continuation_lowercase));
+    line(&format!("sentence-continuation = {}", cfg.sentence_continuation));
     line("");
 
-    line("# Seconds after last output before continuation lowercasing resets");
+    line("# Seconds after last output before sentence continuation resets");
     line("# (treats the next segment as a fresh utterance).");
-    line(&format!("lowercase-timeout = {}", cfg.lowercase_timeout));
+    line(&format!("sentence-continuation-timeout = {}", cfg.sentence_continuation_timeout));
     line("");
 
     line("# Minimum number of words for a dictation output to be kept.");
@@ -777,8 +777,8 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         prefill_ms: r!(prefill_ms, "prefill-ms"),
         hotwords: r_opt!(hotwords, "hotwords"),
         dictation_hotwords_score: r!(dictation_hotwords_score, "dictation-hotwords-score"),
-        continuation_lowercase: r_bool!(continuation_lowercase, "continuation-lowercase"),
-        lowercase_timeout: r!(lowercase_timeout, "lowercase-timeout"),
+        sentence_continuation: r_bool!(sentence_continuation, "sentence-continuation"),
+        sentence_continuation_timeout: r!(sentence_continuation_timeout, "sentence-continuation-timeout"),
         min_dictation_words: r!(min_dictation_words, "min-dictation-words"),
         start_mode: if is_explicit(matches, "start-mode") {
             cli.start_mode

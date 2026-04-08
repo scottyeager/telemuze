@@ -43,8 +43,8 @@ const DEFAULT_FINAL_SILENCE: f32 = 3.0;
 const DEFAULT_MIN_SPEECH: f32 = 0.1;
 const DEFAULT_MAX_SPEECH: f32 = 5.0;
 const DEFAULT_DICTATION_MAX_SPEECH: f32 = 30.0;
-const DEFAULT_PREFILL_MS: u32 = 450;
-const DEFAULT_LOWERCASE_TIMEOUT: f32 = 5.0;
+const DEFAULT_PREFILL_MS: u32 = 200;
+const DEFAULT_SENTENCE_CONTINUATION_TIMEOUT: f32 = 5.0;
 
 const DEFAULT_VAD_ENERGY_GATE: f32 = 0.001;
 
@@ -186,20 +186,19 @@ struct Cli {
     #[arg(long, env = "TELEMUZE_DICTATION_HOTWORDS_SCORE", default_value_t = 1.5)]
     dictation_hotwords_score: f32,
 
-    /// Seconds after last output before continuation lowercasing resets
+    /// Enable sentence continuation (lowercasing and punctuation merging
+    /// across segments).
+    #[arg(long)]
+    sentence_continuation: bool,
+
+    /// Seconds after last output before sentence continuation resets
     /// (treats next segment as a fresh utterance).
-    #[arg(long, default_value_t = DEFAULT_LOWERCASE_TIMEOUT)]
-    lowercase_timeout: f32,
+    #[arg(long, default_value_t = DEFAULT_SENTENCE_CONTINUATION_TIMEOUT)]
+    sentence_continuation_timeout: f32,
 
     /// Initial state: "active" (listening), "sleeping" (wake words only), "paused" (fully off).
     #[arg(long, default_value_t = config::StartMode::Active)]
     start_mode: config::StartMode,
-
-    /// Lowercase the first letter of idle-mode segments when the previous
-    /// segment did not end with sentence-ending punctuation (. ! ?).
-    /// Dictation always lowercases continuations regardless of this flag.
-    #[arg(long)]
-    continuation_lowercase: bool,
 
     /// Number of scroll ticks per "scroll up" / "scroll down" voice command.
     #[arg(long, default_value_t = DEFAULT_SCROLL_TICKS)]
@@ -383,14 +382,14 @@ struct AppContext {
     type_text: bool,
     notify: bool,
     sound: bool,
-    continuation_lowercase: bool,
     scroll_ticks: u32,
     prefill_samples: usize,
     fast_silence_secs: f32,
     slow_silence_secs: f32,
     final_silence_secs: f32,
     segmenting: config::SegmentingMode,
-    lowercase_timeout_secs: f32,
+    sentence_continuation: bool,
+    sentence_continuation_timeout_secs: f32,
     dictation_max_speech_samples: usize,
     last_ended_with_punctuation: Cell<bool>,
     last_output_time: Cell<Option<Instant>>,
@@ -423,6 +422,17 @@ struct AppContext {
     last_dictation_text: std::sync::Arc<std::sync::Mutex<String>>,
 }
 
+/// Whether and how a dictation segment continues the previous sentence.
+enum SentenceContinuation {
+    /// Fresh sentence — no lowercasing, no punctuation deletion.
+    Fresh,
+    /// Continue without punctuation change — lowercase first letter.
+    Lowercase,
+    /// Previous ended with punctuation but ASR signals continuation —
+    /// delete trailing punct and keep lowercase.
+    DeletePunctuation,
+}
+
 impl AppContext {
     fn new(cfg: ResolvedConfig) -> Self {
         let base_url = cfg.url.trim_end_matches('/');
@@ -451,14 +461,15 @@ impl AppContext {
             type_text: cfg.type_text,
             notify: cfg.notify,
             sound: cfg.sound,
-            continuation_lowercase: cfg.continuation_lowercase,
+
             scroll_ticks: cfg.scroll_ticks,
             prefill_samples: (cfg.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
             fast_silence_secs: cfg.fast_silence,
             slow_silence_secs: cfg.slow_silence,
             final_silence_secs: cfg.final_silence,
             segmenting: cfg.segmenting,
-            lowercase_timeout_secs: cfg.lowercase_timeout,
+            sentence_continuation: cfg.sentence_continuation,
+            sentence_continuation_timeout_secs: cfg.sentence_continuation_timeout,
             dictation_max_speech_samples: (cfg.dictation_max_speech * SAMPLE_RATE as f32) as usize,
             last_ended_with_punctuation: Cell::new(true),
             last_output_time: Cell::new(None),
@@ -535,26 +546,32 @@ impl AppContext {
         }
     }
 
-    /// Should we lowercase the first letter of this segment?
-    fn should_lowercase_continuation(&self, mode: ListenMode) -> bool {
-        if mode == ListenMode::Dictation {
-            // In dictation mode, always lowercase continuations unless
-            // the previous segment ended with terminal punctuation or
-            // enough time has passed to treat this as a fresh utterance.
-            if self.last_ended_with_punctuation.get() {
-                return false;
-            }
-            if let Some(t) = self.last_output_time.get() {
-                if t.elapsed().as_secs_f32() > self.lowercase_timeout_secs {
-                    return false;
-                }
-            } else {
-                return false; // First segment ever
-            }
-            true
+    /// Determine how this segment relates to the previous sentence.
+    /// Gates both lowercasing and punctuation deletion on the same timeout.
+    fn sentence_continuation(&self, raw_starts_lowercase: bool) -> SentenceContinuation {
+        if !self.sentence_continuation {
+            return SentenceContinuation::Fresh;
+        }
+
+        // Must have a recent previous segment within the timeout window.
+        let within_timeout = self.last_output_time.get()
+            .map(|t| t.elapsed().as_secs_f32() <= self.sentence_continuation_timeout_secs)
+            .unwrap_or(false);
+
+        if !within_timeout {
+            return SentenceContinuation::Fresh;
+        }
+
+        if raw_starts_lowercase && self.last_ended_with_punctuation.get() {
+            // ASR returned lowercase despite previous sentence punctuation —
+            // signals a continuation; delete the trailing punct.
+            SentenceContinuation::DeletePunctuation
+        } else if !self.last_ended_with_punctuation.get() {
+            // Previous segment didn't end with punctuation — lowercase
+            // the first letter to continue the sentence.
+            SentenceContinuation::Lowercase
         } else {
-            // In idle mode, respect the CLI flag.
-            self.continuation_lowercase && !self.last_ended_with_punctuation.get()
+            SentenceContinuation::Fresh
         }
     }
 }
@@ -2316,21 +2333,13 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
 
     info!("Dictation transcribed successfully");
 
-    // Check if the server's raw text starts lowercase (model's continuation signal).
+    // Determine continuation relationship with previous segment.
     let raw_starts_lowercase = text.chars().next().map(|c| c.is_lowercase()).unwrap_or(false);
+    let continuation = ctx.sentence_continuation(raw_starts_lowercase);
 
-    // If raw text is lowercase AND previous segment ended with terminal punctuation,
-    // delete that punctuation — the model is signaling a continuation regardless of timing.
-    let should_delete_trailing_punct =
-        raw_starts_lowercase && ctx.last_ended_with_punctuation.get();
-
-    // Apply continuation lowercasing.
-    // If we should delete trailing punct, text is already lowercase from server — keep it.
-    // Otherwise use the existing continuation logic.
-    let text = if should_delete_trailing_punct || ctx.should_lowercase_continuation(ListenMode::Dictation) {
-        lowercase_first_letter(text)
-    } else {
-        text.to_string()
+    let text = match continuation {
+        SentenceContinuation::DeletePunctuation | SentenceContinuation::Lowercase => lowercase_first_letter(text),
+        SentenceContinuation::Fresh => text.to_string(),
     };
 
     // Parse actions BEFORE sentence extension so we can skip it for slash commands.
@@ -2343,7 +2352,7 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
         matches!(a, TextAction::Text(_))
             || matches!(a, TextAction::OwnedText(s) if !s.starts_with('/'))
     });
-    if should_delete_trailing_punct && ctx.type_text && has_text_output {
+    if matches!(continuation, SentenceContinuation::DeletePunctuation) && ctx.type_text && has_text_output {
         // type_into_window appends a space, so previous output was e.g. "good performance. "
         // Cursor is after the space — delete space, delete punct, retype space.
         send_key("BackSpace", &ctx.display_server);
