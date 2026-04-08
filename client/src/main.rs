@@ -439,7 +439,7 @@ impl AppContext {
         );
         let continuation_hotwords = build_continuation_hotwords(
             &cfg.aliases, &cfg.modifiers,
-            cfg.cmd_boost_phrase, cfg.cmd_boost_vocab,
+            cfg.cmd_boost_first, cfg.cmd_boost_phrase, cfg.cmd_boost_vocab,
         );
 
         Self {
@@ -963,6 +963,7 @@ fn build_first_word_hotwords(
 fn build_continuation_hotwords(
     aliases: &ResolvedAliases,
     modifiers: &[(String, String)],
+    boost_high: f32,
     boost_phrase: f32,
     boost_vocab: f32,
 ) -> String {
@@ -986,6 +987,11 @@ fn build_continuation_hotwords(
         "command",
     ].iter().map(|s| s.to_string()));
 
+    // ── High tier: phrases easily confused with others ───────────────────
+    let high: Vec<String> = vec![
+        "press enter".into(),
+    ];
+
     // ── Mid tier: multi-word phrases ─────────────────────────────────────
     let mut mid: Vec<String> = vec![
         "slash command".into(),
@@ -997,7 +1003,6 @@ fn build_continuation_hotwords(
         "scroll down".into(),
         "scroll top".into(),
         "scroll bottom".into(),
-        "press enter".into(),
         "press tab".into(),
         "press space".into(),
         "press backspace".into(),
@@ -1042,6 +1047,9 @@ fn build_continuation_hotwords(
 
     // ── Format as sherpa-onnx hotwords string ────────────────────────────
     let mut out = String::new();
+    for w in &high {
+        out.push_str(&format!("{w} :{boost_high}\n"));
+    }
     for w in &mid {
         out.push_str(&format!("{w} :{boost_phrase}\n"));
     }
