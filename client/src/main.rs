@@ -2804,7 +2804,6 @@ fn main() -> Result<()> {
     let mut cmd_silence_start: Option<Instant> = None;
     let mut cmd_spec_fired = false;
     let mut cmd_spec_text: Option<String> = None;
-    let mut cmd_spec_buf_len: usize = 0;
     let cmd_first_word_hotwords = cmd_pass1.as_ref().map(|_| ctx.first_word_hotwords.clone());
     let cmd_continuation_hotwords = cmd_pass2.as_ref().map(|_| ctx.continuation_hotwords.clone());
     let cmd_first_pass_samples = (cmd_first_pass_ms as usize * SAMPLE_RATE as usize) / 1000;
@@ -3008,7 +3007,7 @@ fn main() -> Result<()> {
                         cmd_silence_start = None;
                         cmd_spec_fired = false;
                         cmd_spec_text = None;
-                        cmd_spec_buf_len = 0;
+
                     };
                 }
 
@@ -3052,14 +3051,13 @@ fn main() -> Result<()> {
                             && silence_start.elapsed() >= Duration::from_millis(cmd_spec_silence_ms as u64)
                         {
                             cmd_spec_fired = true;
-                            cmd_spec_buf_len = cmd_buf.len();
                             if let Some(ref recognizer) = cmd_pass2 {
                                 let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
                                 let s = recognizer.create_stream_with_hotwords(hw);
                                 s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
                                 recognizer.decode(&s);
                                 cmd_spec_text = s.get_result().map(|r| cmd::normalize(&r.text));
-                                debug!(text = ?cmd_spec_text, buf_len = cmd_spec_buf_len, "Speculative pass 2");
+                                debug!(text = ?cmd_spec_text, "Speculative pass 2");
                             }
                         }
                     }
@@ -3068,32 +3066,19 @@ fn main() -> Result<()> {
                         if silence_start.elapsed() >= Duration::from_millis(cmd_silence_ms as u64)
                             && !cmd_buf.is_empty()
                         {
-                            // Run pass 2 on full cmd_buf (use cached spec result when valid)
-                            let pass2_text = if let Some(ref recognizer) = cmd_pass2 {
-                                if let Some(ref cached) = cmd_spec_text {
-                                    if cmd_spec_buf_len == cmd_buf.len() {
-                                        debug!("Using cached speculative pass 2");
-                                        cached.clone()
-                                    } else {
-                                        debug!(spec_len = cmd_spec_buf_len, cur_len = cmd_buf.len(),
-                                               "Audio grew since spec — re-decoding");
-                                        let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
-                                        let s = recognizer.create_stream_with_hotwords(hw);
-                                        s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
-                                        recognizer.decode(&s);
-                                        s.get_result()
-                                            .map(|r| cmd::normalize(&r.text))
-                                            .unwrap_or_default()
-                                    }
-                                } else {
-                                    let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
-                                    let s = recognizer.create_stream_with_hotwords(hw);
-                                    s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
-                                    recognizer.decode(&s);
-                                    s.get_result()
-                                        .map(|r| cmd::normalize(&r.text))
-                                        .unwrap_or_default()
-                                }
+                            // Run pass 2 on full cmd_buf (use cached spec result when available;
+                            // spec state is reset if speech resumes, so cached result is valid)
+                            let pass2_text = if let Some(cached) = cmd_spec_text.take() {
+                                debug!("Using cached speculative pass 2");
+                                cached
+                            } else if let Some(ref recognizer) = cmd_pass2 {
+                                let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
+                                let s = recognizer.create_stream_with_hotwords(hw);
+                                s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
+                                recognizer.decode(&s);
+                                s.get_result()
+                                    .map(|r| cmd::normalize(&r.text))
+                                    .unwrap_or_default()
                             } else {
                                 String::new()
                             };
@@ -3217,7 +3202,7 @@ fn main() -> Result<()> {
                                             cmd_silence_start = None;
                                             cmd_spec_fired = false;
                                             cmd_spec_text = None;
-                                            cmd_spec_buf_len = 0;
+                    
                                             mode = ListenMode::Dictation;
                                             last_speech_time = Some(Instant::now());
                                             recording_hold_until = None;
@@ -3427,7 +3412,6 @@ fn main() -> Result<()> {
                     cmd_silence_start = None;
                     cmd_spec_fired = false;
                     cmd_spec_text = None;
-                    cmd_spec_buf_len = 0;
                     spec_cached_text.clear();
                     spec_fast_fired = false;
                     spec_slow_fired = false;
@@ -3471,7 +3455,6 @@ fn main() -> Result<()> {
                 cmd_silence_start = None;
                 cmd_spec_fired = false;
                 cmd_spec_text = None;
-                cmd_spec_buf_len = 0;
                 spec_cached_text.clear();
                 spec_fast_fired = false;
                 spec_slow_fired = false;
