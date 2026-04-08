@@ -464,8 +464,8 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("vad-energy-gate = {}", cfg.vad_energy_gate));
     line("");
 
-    line("# Fast silence threshold (seconds). In idle mode: VAD min silence duration.");
-    line("# In speculative mode: triggers a speculative decode.");
+    line("# Fast silence threshold (seconds). VAD min silence duration — controls");
+    line("# idle-mode command detection timing. In speculative dictation: triggers a decode.");
     line(&format!("fast-silence = {}", cfg.fast_silence));
     line("");
 
@@ -487,7 +487,8 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("min-speech = {}", cfg.min_speech));
     line("");
 
-    line("# Maximum speech segment length (seconds) in idle mode before force-flushing.");
+    line("# Maximum VAD segment length (seconds) before force-flushing. Controls idle-mode");
+    line("# command classification segment size; dictation uses dictation-max-speech instead.");
     line(&format!("max-speech = {}", cfg.max_speech));
     line("");
 
@@ -513,8 +514,9 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line("");
 
     line("# ── Text processing ──────────────────────────────────────────────────────");
-    line("# Lowercase the first letter of a segment when the previous segment did not");
-    line("# end with sentence-ending punctuation (. ! ?). Only applies in idle mode.");
+    line("# Lowercase the first letter of idle-mode segments when the previous segment did not");
+    line("# end with sentence-ending punctuation (. ! ?). Dictation always lowercases");
+    line("# continuations regardless of this flag.");
     line("# Options: true | false");
     line(&format!("continuation-lowercase = {}", cfg.continuation_lowercase));
     line("");

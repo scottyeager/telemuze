@@ -40,7 +40,7 @@ const DEFAULT_FAST_SILENCE: f32 = 0.4;
 const DEFAULT_SLOW_SILENCE: f32 = 1.5;
 const DEFAULT_FINAL_SILENCE: f32 = 3.0;
 const DEFAULT_MIN_SPEECH: f32 = 0.1;
-const DEFAULT_MAX_SPEECH: f32 = 15.0;
+const DEFAULT_MAX_SPEECH: f32 = 5.0;
 const DEFAULT_DICTATION_MAX_SPEECH: f32 = 30.0;
 const DEFAULT_PREFILL_MS: u32 = 450;
 const DEFAULT_LOWERCASE_TIMEOUT: f32 = 5.0;
@@ -139,8 +139,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_VAD_ENERGY_GATE)]
     vad_energy_gate: f32,
 
-    /// Fast silence threshold (seconds). Idle mode: VAD min silence.
-    /// Speculative mode: triggers decode.
+    /// Fast silence threshold (seconds). Sets VAD min silence duration,
+    /// controlling when segments are emitted for idle-mode command detection.
+    /// In speculative dictation: triggers a decode.
     #[arg(long, default_value_t = DEFAULT_FAST_SILENCE)]
     fast_silence: f32,
 
@@ -162,7 +163,9 @@ struct Cli {
     #[arg(long, default_value_t = DEFAULT_MIN_SPEECH)]
     min_speech: f32,
 
-    /// Maximum speech segment length (seconds) in idle mode before force-flushing.
+    /// Maximum VAD segment length (seconds) before force-flushing. Controls
+    /// idle-mode command classification segment size; dictation uses
+    /// --dictation-max-speech instead.
     #[arg(long, default_value_t = DEFAULT_MAX_SPEECH)]
     max_speech: f32,
 
@@ -191,8 +194,9 @@ struct Cli {
     #[arg(long, default_value_t = config::StartMode::Active)]
     start_mode: config::StartMode,
 
-    /// Lowercase the first letter of a segment in idle mode when the previous
+    /// Lowercase the first letter of idle-mode segments when the previous
     /// segment did not end with sentence-ending punctuation (. ! ?).
+    /// Dictation always lowercases continuations regardless of this flag.
     #[arg(long)]
     continuation_lowercase: bool,
 
