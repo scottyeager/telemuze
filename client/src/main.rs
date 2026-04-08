@@ -13,6 +13,7 @@ mod config;
 mod eou;
 mod tray;
 
+use std::collections::HashMap;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::{ResolvedAliases, ResolvedConfig};
@@ -287,19 +288,11 @@ struct Cli {
 
     // ── Text output method ─────────────────────────────────────────────
 
-    /// How text reaches the target window: "type" (keystrokes), "paste" (Ctrl+V),
-    /// or "paste-shift" (Ctrl+Shift+V).
+    /// Default method for delivering text to the target window: "type" (keystrokes),
+    /// "paste" (Ctrl+V), or "paste-shift" (Ctrl+Shift+V). Per-application overrides
+    /// can be configured via [output-rules] in the config file.
     #[arg(long, default_value_t = config::OutputMethod::Type)]
     output_method: config::OutputMethod,
-
-    /// Which selection buffer to use for paste: "clipboard" or "primary".
-    /// Primary uses middle-click and leaves CLIPBOARD untouched.
-    #[arg(long, default_value_t = config::PasteSelection::Clipboard)]
-    paste_selection: config::PasteSelection,
-
-    /// Restore the original clipboard/selection content after pasting.
-    #[arg(long)]
-    paste_restore: bool,
 }
 
 #[derive(Subcommand)]
@@ -421,8 +414,9 @@ struct AppContext {
     /// Modifier key mappings (spoken word → canonical name).
     modifiers: Vec<(String, String)>,
     output_method: config::OutputMethod,
-    paste_selection: config::PasteSelection,
-    paste_restore: bool,
+    clipboard_config: config::SelectionConfig,
+    primary_config: config::SelectionConfig,
+    output_rules: HashMap<String, config::OutputMethod>,
     /// Sleep state — shared via Cell so command handlers can toggle it.
     sleeping: Cell<bool>,
     /// Last dictation text, shared with tray menu for "Copy Last" action.
@@ -480,8 +474,9 @@ impl AppContext {
             dump_audio_dir: cfg.dump_audio,
             dump_audio_counter: AtomicU32::new(0),
             output_method: cfg.output_method,
-            paste_selection: cfg.paste_selection,
-            paste_restore: cfg.paste_restore,
+            clipboard_config: cfg.clipboard,
+            primary_config: cfg.primary,
+            output_rules: cfg.output_rules,
             sleeping: Cell::new(false),
             aliases: cfg.aliases,
             modifiers: cfg.modifiers,
@@ -590,21 +585,17 @@ fn type_into_window(text: &str, display_server: &str) {
     }
 }
 
-fn read_clipboard(display_server: &str, selection: &config::PasteSelection) -> Option<String> {
+fn read_clipboard(display_server: &str, selection: &str) -> Option<String> {
     let output = if display_server == "wayland" {
         let mut cmd = std::process::Command::new("wl-paste");
         cmd.arg("--no-newline");
-        if *selection == config::PasteSelection::Primary {
+        if selection == "primary" {
             cmd.arg("--primary");
         }
         cmd.output()
     } else {
-        let sel = match selection {
-            config::PasteSelection::Clipboard => "clipboard",
-            config::PasteSelection::Primary => "primary",
-        };
         std::process::Command::new("xclip")
-            .args(["-selection", sel, "-o"])
+            .args(["-selection", selection, "-o"])
             .output()
     };
     match output {
@@ -613,10 +604,10 @@ fn read_clipboard(display_server: &str, selection: &config::PasteSelection) -> O
     }
 }
 
-fn write_clipboard(text: &str, display_server: &str, selection: &config::PasteSelection) {
+fn write_clipboard(text: &str, display_server: &str, selection: &str) {
     let result = if display_server == "wayland" {
         let mut cmd = std::process::Command::new("wl-copy");
-        if *selection == config::PasteSelection::Primary {
+        if selection == "primary" {
             cmd.arg("--primary");
         }
         cmd.stdin(std::process::Stdio::piped());
@@ -630,12 +621,8 @@ fn write_clipboard(text: &str, display_server: &str, selection: &config::PasteSe
         }
         child.wait().map(|_| ())
     } else {
-        let sel = match selection {
-            config::PasteSelection::Clipboard => "clipboard",
-            config::PasteSelection::Primary => "primary",
-        };
         let mut child = match std::process::Command::new("xclip")
-            .args(["-selection", sel])
+            .args(["-selection", selection])
             .stdin(std::process::Stdio::piped())
             .spawn()
         {
@@ -653,60 +640,96 @@ fn write_clipboard(text: &str, display_server: &str, selection: &config::PasteSe
     }
 }
 
-fn paste_into_window(text: &str, ctx: &AppContext) {
-    let saved = if ctx.paste_restore {
-        read_clipboard(&ctx.display_server, &ctx.paste_selection)
+/// Query the active window's class name for per-application output dispatch.
+fn get_active_window_class() -> Option<String> {
+    let output = std::process::Command::new("xdotool")
+        .args(["getactivewindow", "getwindowclassname"])
+        .output()
+        .ok()?;
+    if output.status.success() {
+        let class = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if class.is_empty() { None } else { Some(class) }
+    } else {
+        None
+    }
+}
+
+fn paste_into_window(text: &str, method: config::OutputMethod, ctx: &AppContext) {
+    let ds = &ctx.display_server;
+
+    // Determine which selection the paste method needs.
+    let paste_sel = match method {
+        config::OutputMethod::Paste | config::OutputMethod::PasteShift => "clipboard",
+        config::OutputMethod::Type => unreachable!(),
+    };
+
+    // Build list of selections to populate: always the one needed for paste,
+    // plus any extra selections with populate=true.
+    let mut populate: Vec<&str> = vec![paste_sel];
+    if ctx.clipboard_config.populate && paste_sel != "clipboard" {
+        populate.push("clipboard");
+    }
+    if ctx.primary_config.populate && paste_sel != "primary" {
+        populate.push("primary");
+    }
+
+    // Save originals for selections that want restore.
+    let saved_clipboard = if ctx.clipboard_config.restore && populate.contains(&"clipboard") {
+        read_clipboard(ds, "clipboard")
+    } else {
+        None
+    };
+    let saved_primary = if ctx.primary_config.restore && populate.contains(&"primary") {
+        read_clipboard(ds, "primary")
     } else {
         None
     };
 
-    write_clipboard(&format!("{text} "), &ctx.display_server, &ctx.paste_selection);
+    // Write text to all selections.
+    let padded = format!("{text} ");
+    for sel in &populate {
+        write_clipboard(&padded, ds, sel);
+    }
     std::thread::sleep(Duration::from_millis(20));
 
-    match ctx.paste_selection {
-        config::PasteSelection::Primary => {
-            // Middle-click to paste from PRIMARY
-            debug!("Pasting via middle-click (primary selection)");
-            let result = if ctx.display_server == "wayland" {
-                // xdotool click 2 works under XWayland
-                warn!("Primary selection paste on Wayland uses xdotool (XWayland); \
-                       may not work in native Wayland windows");
-                std::process::Command::new("xdotool")
-                    .args(["click", "2"])
-                    .status()
-            } else {
-                std::process::Command::new("xdotool")
-                    .args(["click", "2"])
-                    .status()
-            };
-            if let Err(e) = result {
-                warn!("Middle-click paste failed: {e}");
-            }
+    // Trigger the paste action.
+    match method {
+        config::OutputMethod::Paste => {
+            send_modified_key(&["ctrl"], "v", ds);
         }
-        config::PasteSelection::Clipboard => {
-            match ctx.output_method {
-                config::OutputMethod::Paste => {
-                    send_modified_key(&["ctrl"], "v", &ctx.display_server);
-                }
-                config::OutputMethod::PasteShift => {
-                    send_modified_key(&["ctrl", "shift"], "v", &ctx.display_server);
-                }
-                config::OutputMethod::Type => unreachable!(),
-            }
+        config::OutputMethod::PasteShift => {
+            send_modified_key(&["ctrl", "shift"], "v", ds);
         }
+        config::OutputMethod::Type => unreachable!(),
     }
 
     std::thread::sleep(Duration::from_millis(50));
 
-    if let Some(original) = saved {
-        write_clipboard(&original, &ctx.display_server, &ctx.paste_selection);
+    // Restore saved selections.
+    if let Some(original) = saved_clipboard {
+        write_clipboard(&original, ds, "clipboard");
+    }
+    if let Some(original) = saved_primary {
+        write_clipboard(&original, ds, "primary");
     }
 }
 
 fn output_text(text: &str, ctx: &AppContext) {
-    match ctx.output_method {
+    // Determine effective output method: per-app override or global default.
+    let method = if !ctx.output_rules.is_empty() {
+        get_active_window_class()
+            .and_then(|class| {
+                debug!(class, "Active window class");
+                ctx.output_rules.get(&class).copied()
+            })
+            .unwrap_or(ctx.output_method)
+    } else {
+        ctx.output_method
+    };
+
+    match method {
         config::OutputMethod::Type => type_into_window(text, &ctx.display_server),
-        _ => paste_into_window(text, ctx),
+        _ => paste_into_window(text, method, ctx),
     }
 }
 
@@ -3473,7 +3496,7 @@ fn main() -> Result<()> {
             Ok(Event::Ipc(IpcCommand::CopyLast)) => {
                 let text = ctx.last_dictation_text.lock().unwrap().clone();
                 if !text.is_empty() {
-                    write_clipboard(&text, &ctx.display_server, &ctx.paste_selection);
+                    write_clipboard(&text, &ctx.display_server, "clipboard");
                     info!("Copied last dictation to clipboard");
                 } else {
                     info!("No dictation text to copy");

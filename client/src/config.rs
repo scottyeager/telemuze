@@ -101,34 +101,21 @@ impl std::str::FromStr for OutputMethod {
     }
 }
 
-/// Which X11/Wayland selection buffer to use for paste.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum PasteSelection {
-    /// CLIPBOARD selection (Ctrl+C / Ctrl+V).
-    #[default]
-    Clipboard,
-    /// PRIMARY selection (select / middle-click).
-    Primary,
+/// Per-selection-buffer configuration (CLIPBOARD or PRIMARY).
+#[derive(Debug, Clone, Copy)]
+pub struct SelectionConfig {
+    /// Write dictation text to this selection (even if not used for paste trigger).
+    pub populate: bool,
+    /// Restore the original content after pasting.
+    pub restore: bool,
 }
 
-impl std::fmt::Display for PasteSelection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Clipboard => write!(f, "clipboard"),
-            Self::Primary => write!(f, "primary"),
-        }
-    }
-}
-
-impl std::str::FromStr for PasteSelection {
-    type Err = anyhow::Error;
-    fn from_str(s: &str) -> Result<Self> {
-        match s {
-            "clipboard" => Ok(Self::Clipboard),
-            "primary" => Ok(Self::Primary),
-            _ => anyhow::bail!("Unknown paste-selection '{s}' — expected 'clipboard' or 'primary'"),
-        }
-    }
+/// TOML-level per-selection config (all fields optional).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+pub struct FileSelectionConfig {
+    pub populate: Option<bool>,
+    pub restore: Option<bool>,
 }
 
 use std::collections::HashMap;
@@ -173,8 +160,15 @@ pub struct FileConfig {
 
     // ── Text output method ──────────────────────────────────────────────
     pub output_method: Option<String>,
-    pub paste_selection: Option<String>,
-    pub paste_restore: Option<bool>,
+
+    #[serde(default)]
+    pub clipboard: FileSelectionConfig,
+    #[serde(default)]
+    pub primary: FileSelectionConfig,
+
+    /// Per-application output method overrides keyed by window class name.
+    #[serde(default)]
+    pub output_rules: HashMap<String, String>,
 
     // ── Local command detection (110m transducer) ─────────────────────────
     pub no_cmd: Option<bool>,
@@ -248,8 +242,9 @@ pub struct ResolvedConfig {
     pub scroll_ticks: u32,
     pub dump_audio: Option<PathBuf>,
     pub output_method: OutputMethod,
-    pub paste_selection: PasteSelection,
-    pub paste_restore: bool,
+    pub clipboard: SelectionConfig,
+    pub primary: SelectionConfig,
+    pub output_rules: HashMap<String, OutputMethod>,
     pub no_cmd: bool,
     pub cmd_model_dir: Option<PathBuf>,
     pub cmd_boost_first: f32,
@@ -393,21 +388,10 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("type-text = {}", cfg.type_text));
     line("");
 
-    line("# How text reaches the target window.");
+    line("# Default method for delivering text to the target window.");
     line("# Options: \"type\" (keystrokes) | \"paste\" (Ctrl+V) | \"paste-shift\" (Ctrl+Shift+V)");
+    line("# Per-application overrides can be set in [output-rules] below.");
     line(&format!("output-method = \"{}\"", cfg.output_method));
-    line("");
-
-    line("# Which selection buffer to use for paste (ignored when output-method = \"type\").");
-    line("# \"clipboard\" pastes via Ctrl+V/Ctrl+Shift+V. \"primary\" pastes via middle-click.");
-    line("# Options: \"clipboard\" | \"primary\"");
-    line(&format!("paste-selection = \"{}\"", cfg.paste_selection));
-    line("");
-
-    line("# Restore the original clipboard/selection content after pasting.");
-    line("# When false, the dictation text remains in the buffer for easy re-paste.");
-    line("# Options: true | false");
-    line(&format!("paste-restore = {}", cfg.paste_restore));
     line("");
 
     line("# Show a system tray icon indicating recording/processing state (X11 only).");
@@ -622,6 +606,34 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("eou-no-int8 = {}", cfg.eou_no_int8));
     line("");
 
+    line("# ── Selection buffer settings ─────────────────────────────────────────");
+    line("# Each selection (clipboard, primary) can independently populate with dictation");
+    line("# text and optionally restore original content after pasting.");
+    line("# The selection required by the active paste method is always populated regardless.");
+    line("[clipboard]");
+    line(&format!("populate = {}", cfg.clipboard.populate));
+    line(&format!("restore = {}", cfg.clipboard.restore));
+    line("");
+    line("[primary]");
+    line(&format!("populate = {}", cfg.primary.populate));
+    line(&format!("restore = {}", cfg.primary.restore));
+    line("");
+
+    line("# ── Per-application output method overrides ─────────────────────────────");
+    line("# Map window class names to output methods. Falls back to the global output-method.");
+    line("# To find a window's class name, run: xdotool getactivewindow getwindowclassname");
+    line("# Keys are case-sensitive and must match the output exactly.");
+    line("[output-rules]");
+    if cfg.output_rules.is_empty() {
+        line("# TelegramDesktop = \"paste\"");
+        line("# kitty = \"paste-shift\"");
+    } else {
+        for (class, method) in &cfg.output_rules {
+            line(&format!("{class} = \"{method}\""));
+        }
+    }
+    line("");
+
     line("# ── Voice command trigger aliases ────────────────────────────────────────");
     line("# Each key maps a command type to alternate spoken words that trigger it.");
     line("# The STT model sometimes mishears these words, so add common misrecognitions.");
@@ -786,14 +798,23 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         } else {
             cli.output_method
         },
-        paste_selection: if is_explicit(matches, "paste-selection") {
-            cli.paste_selection
-        } else if let Some(ref s) = file.paste_selection {
-            s.parse().context("Invalid paste-selection in config file")?
-        } else {
-            cli.paste_selection
+        clipboard: SelectionConfig {
+            populate: file.clipboard.populate.unwrap_or(false),
+            restore: file.clipboard.restore.unwrap_or(false),
         },
-        paste_restore: r_bool!(paste_restore, "paste-restore"),
+        primary: SelectionConfig {
+            populate: file.primary.populate.unwrap_or(false),
+            restore: file.primary.restore.unwrap_or(false),
+        },
+        output_rules: {
+            let mut rules = HashMap::new();
+            for (class, method_str) in &file.output_rules {
+                let method: OutputMethod = method_str.parse()
+                    .with_context(|| format!("Invalid output-method '{method_str}' for window class '{class}' in [output-rules]"))?;
+                rules.insert(class.clone(), method);
+            }
+            rules
+        },
         no_cmd: r_bool!(no_cmd, "no-cmd"),
         cmd_model_dir: r_opt!(cmd_model_dir, "cmd-model-dir"),
         cmd_boost_first: r!(cmd_boost_first, "cmd-boost-first"),
