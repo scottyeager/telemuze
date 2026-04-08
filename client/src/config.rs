@@ -182,6 +182,10 @@ pub struct FileConfig {
     pub cmd_boost: Option<f32>,
     pub cmd_boost_phrase: Option<f32>,
     pub cmd_boost_vocab: Option<f32>,
+    pub cmd_boost_first: Option<f32>,
+    pub cmd_boost_continuation: Option<f32>,
+    pub cmd_first_pass_ms: Option<u32>,
+    pub cmd_prefill_ms: Option<u32>,
     pub cmd_silence_ms: Option<u32>,
     pub cmd_threads: Option<i32>,
     pub cmd_beam_width: Option<i32>,
@@ -252,6 +256,10 @@ pub struct ResolvedConfig {
     pub cmd_boost: f32,
     pub cmd_boost_phrase: f32,
     pub cmd_boost_vocab: f32,
+    pub cmd_boost_first: f32,
+    pub cmd_boost_continuation: f32,
+    pub cmd_first_pass_ms: u32,
+    pub cmd_prefill_ms: u32,
     pub cmd_silence_ms: u32,
     pub cmd_threads: i32,
     pub cmd_beam_width: i32,
@@ -563,6 +571,22 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("cmd-boost-vocab = {}", cfg.cmd_boost_vocab));
     line("");
 
+    line("# Recognizer-level hotword score for pass 1 (first-word boost).");
+    line(&format!("cmd-boost-first = {}", cfg.cmd_boost_first));
+    line("");
+
+    line("# Recognizer-level hotword score for pass 2 (continuation boost).");
+    line(&format!("cmd-boost-continuation = {}", cfg.cmd_boost_continuation));
+    line("");
+
+    line("# Audio from onset for pass 1 decode (ms).");
+    line(&format!("cmd-first-pass-ms = {}", cfg.cmd_first_pass_ms));
+    line("");
+
+    line("# Audio lookback before VAD trigger for command pipeline (ms).");
+    line(&format!("cmd-prefill-ms = {}", cfg.cmd_prefill_ms));
+    line("");
+
     line("# Silence duration (ms) after speech ends to trigger command decode.");
     line(&format!("cmd-silence-ms = {}", cfg.cmd_silence_ms));
     line("");
@@ -779,6 +803,10 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         cmd_boost: r!(cmd_boost, "cmd-boost"),
         cmd_boost_phrase: r!(cmd_boost_phrase, "cmd-boost-phrase"),
         cmd_boost_vocab: r!(cmd_boost_vocab, "cmd-boost-vocab"),
+        cmd_boost_first: r!(cmd_boost_first, "cmd-boost-first"),
+        cmd_boost_continuation: r!(cmd_boost_continuation, "cmd-boost-continuation"),
+        cmd_first_pass_ms: r!(cmd_first_pass_ms, "cmd-first-pass-ms"),
+        cmd_prefill_ms: r!(cmd_prefill_ms, "cmd-prefill-ms"),
         cmd_silence_ms: r!(cmd_silence_ms, "cmd-silence-ms"),
         cmd_threads: r!(cmd_threads, "cmd-threads"),
         cmd_beam_width: r!(cmd_beam_width, "cmd-beam-width"),

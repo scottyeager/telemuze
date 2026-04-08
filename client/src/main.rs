@@ -224,6 +224,7 @@ struct Cli {
     cmd_model_dir: Option<PathBuf>,
 
     /// Hotword boost score for command trigger words (1.0–5.0).
+    /// Controls which words go into the first-word hotword string.
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST)]
     cmd_boost: f32,
 
@@ -234,6 +235,22 @@ struct Cli {
     /// Hotword boost score for supporting vocabulary (key names, modifiers).
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_VOCAB)]
     cmd_boost_vocab: f32,
+
+    /// Recognizer-level hotword score for pass 1 (first-word boost).
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_FIRST)]
+    cmd_boost_first: f32,
+
+    /// Recognizer-level hotword score for pass 2 (continuation boost).
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_BOOST_CONTINUATION)]
+    cmd_boost_continuation: f32,
+
+    /// Audio from onset for pass 1 decode (ms).
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_FIRST_PASS_MS)]
+    cmd_first_pass_ms: u32,
+
+    /// Audio lookback before VAD trigger for command pipeline (ms).
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_PREFILL_MS)]
+    cmd_prefill_ms: u32,
 
     /// Silence duration (ms) after speech ends to trigger command decode.
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_SILENCE_MS)]
@@ -390,8 +407,10 @@ struct AppContext {
     display_server: String,
     notify_id: Cell<u32>,
     tray_handle: Option<tray::TrayHandle>,
-    /// Hotwords derived from command vocabulary, used by local command recognizer.
-    command_hotwords: String,
+    /// Hotwords for pass 1: trigger verbs + wake/sleep phrases.
+    first_word_hotwords: String,
+    /// Hotwords for pass 2: continuation vocabulary (modifiers, keys, phrases).
+    continuation_hotwords: String,
     /// User-provided hotwords from --hotwords flag, used in dictation mode.
     dictation_hotwords: Option<String>,
     dictation_hotwords_score: f32,
@@ -424,9 +443,12 @@ impl AppContext {
             .display_server
             .unwrap_or_else(detect_display_server);
 
-        let command_hotwords = build_command_hotwords(
+        let first_word_hotwords = build_first_word_hotwords(
+            &cfg.aliases, cfg.cmd_boost,
+        );
+        let continuation_hotwords = build_continuation_hotwords(
             &cfg.aliases, &cfg.modifiers,
-            cfg.cmd_boost, cfg.cmd_boost_phrase, cfg.cmd_boost_vocab,
+            cfg.cmd_boost_phrase, cfg.cmd_boost_vocab,
         );
 
         Self {
@@ -451,7 +473,8 @@ impl AppContext {
             display_server,
             notify_id: Cell::new(0),
             tray_handle: None,
-            command_hotwords,
+            first_word_hotwords,
+            continuation_hotwords,
             dictation_hotwords: cfg.hotwords,
             dictation_hotwords_score: cfg.dictation_hotwords_score,
             min_dictation_words: cfg.min_dictation_words,
@@ -907,32 +930,51 @@ enum TextAction<'a> {
     Command(VoiceAction),
 }
 
-/// Build a sherpa-onnx hotwords string with tiered boost scores.
+/// Build hotwords for pass 1: trigger verbs + wake/sleep phrases.
 ///
-/// - `boost` (high): command trigger words (press, click, scroll, ...)
-/// - `boost_phrase` (mid): multi-word phrases (press control, scroll up, ...)
-/// - `boost_vocab` (low): supporting vocabulary (key names, modifiers, directions)
-fn build_command_hotwords(
+/// These are the words that identify the *type* of command from the first
+/// word alone (press, click, scroll, ...) plus wake/sleep phrases.
+fn build_first_word_hotwords(
+    aliases: &ResolvedAliases,
+    boost: f32,
+) -> String {
+    let mut words: Vec<String> = Vec::new();
+    words.extend(["press", "click", "scroll", "slash", "undo"].iter().map(|s| s.to_string()));
+    words.extend(aliases.click.iter().cloned());
+    words.extend(aliases.press.iter().cloned());
+    words.extend(aliases.scroll.iter().cloned());
+    words.extend(aliases.undo.iter().cloned());
+    for trigger in &aliases.slash_command {
+        words.extend(trigger.iter().cloned());
+    }
+    // Wake/sleep phrases
+    for phrase in &aliases.wake {
+        words.push(phrase.clone());
+    }
+    for phrase in &aliases.sleep {
+        words.push(phrase.clone());
+    }
+    words.sort_unstable();
+    words.dedup();
+
+    let mut out = String::new();
+    for w in &words {
+        out.push_str(&format!("{w} :{boost}\n"));
+    }
+    out.truncate(out.trim_end().len());
+    out
+}
+
+/// Build hotwords for pass 2: mid-tier phrases + low-tier vocabulary.
+///
+/// These boost the continuation words that follow the trigger verb:
+/// modifiers, key names, directions, and multi-word phrases.
+fn build_continuation_hotwords(
     aliases: &ResolvedAliases,
     modifiers: &[(String, String)],
-    boost: f32,
     boost_phrase: f32,
     boost_vocab: f32,
 ) -> String {
-    // ── High tier: command trigger words ──────────────────────────────────
-    let mut high: Vec<String> = Vec::new();
-    high.extend(["press", "click", "scroll", "slash", "undo"].iter().map(|s| s.to_string()));
-    high.extend(aliases.click.iter().cloned());
-    high.extend(aliases.press.iter().cloned());
-    high.extend(aliases.scroll.iter().cloned());
-    high.extend(aliases.undo.iter().cloned());
-    for trigger in &aliases.slash_command {
-        high.extend(trigger.iter().cloned());
-    }
-    high.push("press enter".into());
-    high.sort_unstable();
-    high.dedup();
-
     // ── Low tier: supporting vocabulary ───────────────────────────────────
     let mut low: Vec<String> = Vec::new();
 
@@ -953,9 +995,6 @@ fn build_command_hotwords(
         "command",
     ].iter().map(|s| s.to_string()));
 
-    low.sort_unstable();
-    low.dedup();
-
     // ── Mid tier: multi-word phrases ─────────────────────────────────────
     let mut mid: Vec<String> = vec![
         "slash command".into(),
@@ -967,6 +1006,7 @@ fn build_command_hotwords(
         "scroll down".into(),
         "scroll top".into(),
         "scroll bottom".into(),
+        "press enter".into(),
         "press tab".into(),
         "press space".into(),
         "press backspace".into(),
@@ -1011,9 +1051,6 @@ fn build_command_hotwords(
 
     // ── Format as sherpa-onnx hotwords string ────────────────────────────
     let mut out = String::new();
-    for w in &high {
-        out.push_str(&format!("{w} :{boost}\n"));
-    }
     for w in &mid {
         out.push_str(&format!("{w} :{boost_phrase}\n"));
     }
@@ -2496,11 +2533,14 @@ fn main() -> Result<()> {
     let cmd_cfg = cmd::CmdConfig {
         model_dir: cfg.cmd_model_dir.clone()
             .unwrap_or_else(cmd::default_model_dir),
-        boost: cfg.cmd_boost,
+        boost_first: cfg.cmd_boost_first,
+        boost_continuation: cfg.cmd_boost_continuation,
         num_threads: cfg.cmd_threads,
         beam_width: cfg.cmd_beam_width,
     };
     let cmd_silence_ms = cfg.cmd_silence_ms;
+    let cmd_first_pass_ms = cfg.cmd_first_pass_ms;
+    let cmd_prefill_ms = cfg.cmd_prefill_ms;
     let no_eou = cfg.no_eou;
     let eou_model_dir = cfg.eou_model_dir.clone();
     let eou_cfg = eou::EouConfig {
@@ -2612,22 +2652,23 @@ fn main() -> Result<()> {
         )
         .context("Failed to build audio input stream")?;
 
-    // ── Command recognizer (initialized after audio to avoid ALSA/onnxruntime interference) ──
-    let cmd_state = if !no_cmd {
-        info!("Initializing command recognizer (Parakeet-TDT 110m)");
-        match cmd::init_recognizer(&cmd_cfg) {
-            Ok(recognizer) => {
-                info!("Command recognizer ready");
-                Some(recognizer)
+    // ── Command recognizers (initialized after audio to avoid ALSA/onnxruntime interference) ──
+    let (cmd_pass1, cmd_pass2) = if !no_cmd {
+        info!("Initializing two-pass command recognizers (Parakeet-TDT 110m)");
+        match cmd::init_recognizer_pair(&cmd_cfg) {
+            Ok((p1, p2)) => {
+                info!("Command recognizers ready (pass1 boost={}, pass2 boost={})",
+                    cmd_cfg.boost_first, cmd_cfg.boost_continuation);
+                (Some(p1), Some(p2))
             }
             Err(e) => {
                 warn!("Command recognizer unavailable, falling back to server classification: {e}");
-                None
+                (None, None)
             }
         }
     } else {
         info!("Local command detection disabled (--no-cmd)");
-        None
+        (None, None)
     };
 
     // ── EOU recognizer (initialized after audio to avoid ALSA/onnxruntime interference) ──
@@ -2687,13 +2728,19 @@ fn main() -> Result<()> {
     let mut recording_hold_until: Option<Instant> = None;
     let prefill_samples = ctx.prefill_samples;
 
-    // Command detection state
-    let mut cmd_listening = false; // true while buffering speech for command decode
-    let mut cmd_buf: Vec<f32> = Vec::new(); // audio buffered for command decode
-    let mut cmd_silence_start: Option<Instant> = None; // when speech ended
-    let cmd_hotwords = cmd_state.as_ref().map(|_| {
-        ctx.command_hotwords.clone()
-    });
+    // Command detection state (two-pass)
+    enum CmdDetectState {
+        Idle,
+        Capturing { onset_sample_count: usize },
+        WaitingSilence { pass1_text: String },
+    }
+    let mut cmd_detect = CmdDetectState::Idle;
+    let mut cmd_buf: Vec<f32> = Vec::new();
+    let mut cmd_silence_start: Option<Instant> = None;
+    let cmd_first_word_hotwords = cmd_pass1.as_ref().map(|_| ctx.first_word_hotwords.clone());
+    let cmd_continuation_hotwords = cmd_pass2.as_ref().map(|_| ctx.continuation_hotwords.clone());
+    let cmd_first_pass_samples = (cmd_first_pass_ms as usize * SAMPLE_RATE as usize) / 1000;
+    let cmd_prefill_samples = (cmd_prefill_ms as usize * SAMPLE_RATE as usize) / 1000;
 
     // EOU state
     let mut eou_active = false;
@@ -2882,36 +2929,109 @@ fn main() -> Result<()> {
 
                 audio_buf.extend_from_slice(&chunk);
 
-                // ── Check command decode silence trigger ──────────────
-                // If we're buffering speech for command detection and
-                // silence has exceeded the threshold, decode now.
+                // ── Two-pass command detection state machine ─────────
                 let mut cmd_consumed = false;
-                if cmd_listening {
+
+                // Helper macro-like: reset cmd state to idle
+                macro_rules! cmd_reset {
+                    () => {
+                        cmd_detect = CmdDetectState::Idle;
+                        cmd_buf.clear();
+                        cmd_silence_start = None;
+                    };
+                }
+
+                // Buffer audio while not idle
+                if !matches!(cmd_detect, CmdDetectState::Idle) {
+                    cmd_buf.extend_from_slice(&chunk);
+                }
+
+                // Check if pass 1 should fire (enough audio since onset)
+                if let CmdDetectState::Capturing { onset_sample_count } = &cmd_detect {
+                    let samples_since_onset = cmd_buf.len().saturating_sub(*onset_sample_count);
+                    if samples_since_onset >= cmd_first_pass_samples {
+                        // Run pass 1 on audio up to onset + first_pass_samples
+                        let pass1_end = onset_sample_count + cmd_first_pass_samples;
+                        let pass1_audio = &cmd_buf[..pass1_end.min(cmd_buf.len())];
+
+                        let pass1_text = if let Some(ref recognizer) = cmd_pass1 {
+                            let hw = cmd_first_word_hotwords.as_deref().unwrap_or("");
+                            let s = recognizer.create_stream_with_hotwords(hw);
+                            s.accept_waveform(SAMPLE_RATE as i32, pass1_audio);
+                            recognizer.decode(&s);
+                            s.get_result()
+                                .map(|r| cmd::normalize(&r.text))
+                                .unwrap_or_default()
+                        } else {
+                            String::new()
+                        };
+
+                        debug!(text = %pass1_text, "Pass 1 decode");
+                        cmd_detect = CmdDetectState::WaitingSilence { pass1_text };
+                    }
+                }
+
+                // Check silence triggers for both Capturing (short utterance) and WaitingSilence
+                if !matches!(cmd_detect, CmdDetectState::Idle) {
                     if let Some(silence_start) = cmd_silence_start {
                         if silence_start.elapsed() >= Duration::from_millis(cmd_silence_ms as u64)
                             && !cmd_buf.is_empty()
                         {
-                            // Decode the buffered audio with the command recognizer
-                            if let Some(ref recognizer) = cmd_state {
-                                let hotwords_str = cmd_hotwords.as_deref().unwrap_or("");
-                                let s = recognizer.create_stream_with_hotwords(hotwords_str);
+                            // Run pass 2 on full cmd_buf
+                            let pass2_text = if let Some(ref recognizer) = cmd_pass2 {
+                                let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
+                                let s = recognizer.create_stream_with_hotwords(hw);
                                 s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
                                 recognizer.decode(&s);
-
-                                let text = s.get_result()
+                                s.get_result()
                                     .map(|r| cmd::normalize(&r.text))
-                                    .unwrap_or_default();
+                                    .unwrap_or_default()
+                            } else {
+                                String::new()
+                            };
 
-                                if !text.is_empty() {
-                                    debug!(text = %text, "Command decode result");
+                            // Build combined text: first word from pass1 + rest from pass2
+                            let combined = if let CmdDetectState::WaitingSilence { ref pass1_text } = cmd_detect {
+                                let first_word = pass1_text.split_whitespace().next().unwrap_or("");
+                                let pass2_rest: String = pass2_text
+                                    .split_whitespace()
+                                    .skip(1)
+                                    .collect::<Vec<_>>()
+                                    .join(" ");
+                                if pass2_rest.is_empty() {
+                                    first_word.to_string()
+                                } else {
+                                    format!("{first_word} {pass2_rest}")
+                                }
+                            } else {
+                                // Short utterance — no pass 1, use pass 2 only
+                                String::new()
+                            };
 
-                                    // Check wake/sleep first
-                                    if let Some(wake) = check_wake_sleep(&text, &ctx) {
+                            debug!(combined = %combined, pass2 = %pass2_text, "Two-pass decode");
+
+                            // Pick the best text: try combined first, then pass2
+                            let texts_to_try: Vec<&str> = [combined.as_str(), pass2_text.as_str()]
+                                .into_iter()
+                                .filter(|t| !t.is_empty())
+                                .collect();
+
+                            if texts_to_try.is_empty() {
+                                // Empty decode — discard
+                                cmd_reset!();
+                                vad.drain();
+                                was_detected = false;
+                                cmd_consumed = true;
+                            } else {
+                                // Fallback parsing: try combined, then pass2
+                                let mut handled = false;
+
+                                // 1. Check wake/sleep on each candidate
+                                for &text in &texts_to_try {
+                                    if let Some(wake) = check_wake_sleep(text, &ctx) {
                                         ctx.apply_wake_sleep(wake);
                                         sleeping = ctx.sleeping.get();
-                                        cmd_listening = false;
-                                        cmd_buf.clear();
-                                        cmd_silence_start = None;
+                                        cmd_reset!();
                                         cmd_consumed = true;
                                         vad.drain();
                                         audio_buf.clear();
@@ -2922,34 +3042,17 @@ fn main() -> Result<()> {
                                             r.reset(s);
                                         }
                                         eou_active = false;
-                                    } else if is_undo_command(&text, &ctx.aliases.undo) {
-                                        execute_undo(&ctx);
-                                        cmd_listening = false;
-                                        cmd_buf.clear();
-                                        cmd_silence_start = None;
-                                        cmd_consumed = true;
-                                        vad.drain();
-                                        was_detected = false;
-                                        ctx.set_tray_status(TrayStatus::Listening);
-                                        if let Some((ref r, ref s)) = eou_state {
-                                            r.reset(s);
-                                        }
-                                        eou_active = false;
-                                    } else {
-                                        // Try to parse as a voice command
-                                        let actions = process_voice_commands(&text, &ctx);
-                                        let has_command = actions.iter().any(|a| matches!(a, TextAction::Command(_)));
-                                        // Slash commands produce OwnedText("/cmd"), not Command
-                                        let has_slash = actions.iter().any(|a| matches!(a, TextAction::OwnedText(s) if s.starts_with('/')));
-                                        let has_text = actions.iter().any(|a| matches!(a, TextAction::Text(_)));
+                                        handled = true;
+                                        break;
+                                    }
+                                }
 
-                                        if (has_command || has_slash) && !has_text {
-                                            debug!("Command recognized locally");
-                                            execute_commands(&text, &ctx);
-                                            sleeping = ctx.sleeping.get();
-                                            cmd_listening = false;
-                                            cmd_buf.clear();
-                                            cmd_silence_start = None;
+                                // 2. Check undo on each candidate
+                                if !handled {
+                                    for &text in &texts_to_try {
+                                        if is_undo_command(text, &ctx.aliases.undo) {
+                                            execute_undo(&ctx);
+                                            cmd_reset!();
                                             cmd_consumed = true;
                                             vad.drain();
                                             was_detected = false;
@@ -2958,12 +3061,43 @@ fn main() -> Result<()> {
                                                 r.reset(s);
                                             }
                                             eou_active = false;
-                                        } else if sleeping {
-                                            // In sleep mode, discard non-wake speech
+                                            handled = true;
+                                            break;
+                                        }
+                                    }
+                                }
+
+                                // 3. Try process_voice_commands on each candidate
+                                if !handled {
+                                    let mut found_cmd = false;
+                                    for &text in &texts_to_try {
+                                        let actions = process_voice_commands(text, &ctx);
+                                        let has_command = actions.iter().any(|a| matches!(a, TextAction::Command(_)));
+                                        let has_slash = actions.iter().any(|a| matches!(a, TextAction::OwnedText(s) if s.starts_with('/')));
+                                        let has_text = actions.iter().any(|a| matches!(a, TextAction::Text(_)));
+
+                                        if (has_command || has_slash) && !has_text {
+                                            debug!(text, "Command recognized locally");
+                                            execute_commands(text, &ctx);
+                                            sleeping = ctx.sleeping.get();
+                                            cmd_reset!();
+                                            cmd_consumed = true;
+                                            vad.drain();
+                                            was_detected = false;
+                                            ctx.set_tray_status(TrayStatus::Listening);
+                                            if let Some((ref r, ref s)) = eou_state {
+                                                r.reset(s);
+                                            }
+                                            eou_active = false;
+                                            found_cmd = true;
+                                            break;
+                                        }
+                                    }
+
+                                    if !found_cmd {
+                                        if sleeping {
                                             debug!("Sleep mode — ignoring non-wake speech");
-                                            cmd_listening = false;
-                                            cmd_buf.clear();
-                                            cmd_silence_start = None;
+                                            cmd_reset!();
                                             cmd_consumed = true;
                                             vad.drain();
                                             was_detected = false;
@@ -2971,7 +3105,7 @@ fn main() -> Result<()> {
                                             // Not a command → enter dictation with buffered audio
                                             debug!("Not a command — entering dictation");
                                             utterance_audio = std::mem::take(&mut cmd_buf);
-                                            cmd_listening = false;
+                                            cmd_detect = CmdDetectState::Idle;
                                             cmd_silence_start = None;
                                             mode = ListenMode::Dictation;
                                             last_speech_time = Some(Instant::now());
@@ -2980,13 +3114,6 @@ fn main() -> Result<()> {
                                             was_detected = false;
                                         }
                                     }
-                                } else {
-                                    // Empty decode — discard
-                                    cmd_listening = false;
-                                    cmd_buf.clear();
-                                    cmd_silence_start = None;
-                                    vad.drain();
-                                    was_detected = false;
                                 }
                             }
                         }
@@ -2994,11 +3121,6 @@ fn main() -> Result<()> {
                 }
                 if cmd_consumed {
                     continue;
-                }
-
-                // ── Buffer audio for command detection ────────────────
-                if cmd_listening {
-                    cmd_buf.extend_from_slice(&chunk);
                 }
 
                 // ── Process frames through VAD ────────────────────────
@@ -3011,7 +3133,7 @@ fn main() -> Result<()> {
                     // neural model ~31×/s during quiet periods.
                     if energy_gate_sq > 0.0
                         && !was_detected
-                        && !cmd_listening
+                        && matches!(cmd_detect, CmdDetectState::Idle)
                         && mode == ListenMode::Idle
                     {
                         let sum_sq: f32 = frame.iter().map(|&s| s * s).sum();
@@ -3050,19 +3172,19 @@ fn main() -> Result<()> {
                                 }
                             }
                             // Start command listening on speech onset in idle mode
-                            if mode == ListenMode::Idle && cmd_state.is_some() && !cmd_listening {
-                                cmd_listening = true;
+                            if mode == ListenMode::Idle && cmd_pass1.is_some() && matches!(cmd_detect, CmdDetectState::Idle) {
                                 cmd_silence_start = None;
-                                // Include prefill audio from before speech onset
-                                let prefill_start = vad_pos.saturating_sub(WINDOW_SIZE + prefill_samples);
+                                // Include prefill audio from before speech onset (using cmd-specific prefill)
+                                let prefill_start = vad_pos.saturating_sub(WINDOW_SIZE + cmd_prefill_samples);
                                 let start = prefill_start.min(audio_buf.len());
                                 cmd_buf = audio_buf[start..vad_pos].to_vec();
-                                debug!(sleeping, "Command listening started");
+                                cmd_detect = CmdDetectState::Capturing { onset_sample_count: cmd_buf.len() };
+                                debug!(sleeping, "Command listening started (two-pass)");
                             }
                         }
                     } else if was_detected {
                         // Speech just ended — start silence timer for command decode
-                        if cmd_listening && cmd_silence_start.is_none() {
+                        if !matches!(cmd_detect, CmdDetectState::Idle) && cmd_silence_start.is_none() {
                             cmd_silence_start = Some(Instant::now());
                         }
                         // Start debounce hold instead of immediately transitioning.
@@ -3118,7 +3240,7 @@ fn main() -> Result<()> {
                                     continue;
                                 }
 
-                                if cmd_listening {
+                                if !matches!(cmd_detect, CmdDetectState::Idle) {
                                     // Command recognizer is handling this segment —
                                     // it will be decoded when silence triggers.
                                 } else if sleeping {
@@ -3169,7 +3291,7 @@ fn main() -> Result<()> {
                 // unbounded growth while preserving data for segment prefill.
                 // Suppress compaction while command listening is active so we
                 // preserve the speech audio for decode.
-                if !cmd_listening {
+                if matches!(cmd_detect, CmdDetectState::Idle) {
                     let keep_from = vad_pos.saturating_sub(prefill_samples);
                     if keep_from > 0 {
                         audio_buf.drain(..keep_from);
@@ -3187,7 +3309,7 @@ fn main() -> Result<()> {
                     mode = ListenMode::Idle;
                     last_speech_time = None;
                     recording_hold_until = None;
-                    cmd_listening = false;
+                    cmd_detect = CmdDetectState::Idle;
                     cmd_buf.clear();
                     cmd_silence_start = None;
                     spec_cached_text.clear();
@@ -3228,7 +3350,7 @@ fn main() -> Result<()> {
                 sleeping = ctx.sleeping.get();
                 was_detected = false;
                 recording_hold_until = None;
-                cmd_listening = false;
+                cmd_detect = CmdDetectState::Idle;
                 cmd_buf.clear();
                 cmd_silence_start = None;
                 spec_cached_text.clear();
