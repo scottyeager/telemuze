@@ -251,6 +251,10 @@ struct Cli {
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_SILENCE_MS)]
     cmd_silence_ms: u32,
 
+    /// Speculative silence (ms) for early command decode; 0 disables.
+    #[arg(long, default_value_t = cmd::DEFAULT_CMD_SPEC_SILENCE_MS)]
+    cmd_spec_silence_ms: u32,
+
     /// Number of threads for the command recognizer.
     #[arg(long, default_value_t = cmd::DEFAULT_CMD_THREADS)]
     cmd_threads: i32,
@@ -2600,6 +2604,7 @@ fn main() -> Result<()> {
         beam_width: cfg.cmd_beam_width,
     };
     let cmd_silence_ms = cfg.cmd_silence_ms;
+    let cmd_spec_silence_ms = cfg.cmd_spec_silence_ms;
     let cmd_first_pass_ms = cfg.cmd_first_pass_ms;
     let cmd_prefill_ms = cfg.cmd_prefill_ms;
     let no_eou = cfg.no_eou;
@@ -2797,6 +2802,9 @@ fn main() -> Result<()> {
     let mut cmd_detect = CmdDetectState::Idle;
     let mut cmd_buf: Vec<f32> = Vec::new();
     let mut cmd_silence_start: Option<Instant> = None;
+    let mut cmd_spec_fired = false;
+    let mut cmd_spec_text: Option<String> = None;
+    let mut cmd_spec_buf_len: usize = 0;
     let cmd_first_word_hotwords = cmd_pass1.as_ref().map(|_| ctx.first_word_hotwords.clone());
     let cmd_continuation_hotwords = cmd_pass2.as_ref().map(|_| ctx.continuation_hotwords.clone());
     let cmd_first_pass_samples = (cmd_first_pass_ms as usize * SAMPLE_RATE as usize) / 1000;
@@ -2998,6 +3006,9 @@ fn main() -> Result<()> {
                         cmd_detect = CmdDetectState::Idle;
                         cmd_buf.clear();
                         cmd_silence_start = None;
+                        cmd_spec_fired = false;
+                        cmd_spec_text = None;
+                        cmd_spec_buf_len = 0;
                     };
                 }
 
@@ -3033,19 +3044,56 @@ fn main() -> Result<()> {
 
                 // Check silence triggers for both Capturing (short utterance) and WaitingSilence
                 if !matches!(cmd_detect, CmdDetectState::Idle) {
+                    // Speculative pass 2: decode early, cache result
                     if let Some(silence_start) = cmd_silence_start {
-                        if silence_start.elapsed() >= Duration::from_millis(cmd_silence_ms as u64)
+                        if cmd_spec_silence_ms > 0
+                            && !cmd_spec_fired
                             && !cmd_buf.is_empty()
+                            && silence_start.elapsed() >= Duration::from_millis(cmd_spec_silence_ms as u64)
                         {
-                            // Run pass 2 on full cmd_buf
-                            let pass2_text = if let Some(ref recognizer) = cmd_pass2 {
+                            cmd_spec_fired = true;
+                            cmd_spec_buf_len = cmd_buf.len();
+                            if let Some(ref recognizer) = cmd_pass2 {
                                 let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
                                 let s = recognizer.create_stream_with_hotwords(hw);
                                 s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
                                 recognizer.decode(&s);
-                                s.get_result()
-                                    .map(|r| cmd::normalize(&r.text))
-                                    .unwrap_or_default()
+                                cmd_spec_text = s.get_result().map(|r| cmd::normalize(&r.text));
+                                debug!(text = ?cmd_spec_text, buf_len = cmd_spec_buf_len, "Speculative pass 2");
+                            }
+                        }
+                    }
+
+                    if let Some(silence_start) = cmd_silence_start {
+                        if silence_start.elapsed() >= Duration::from_millis(cmd_silence_ms as u64)
+                            && !cmd_buf.is_empty()
+                        {
+                            // Run pass 2 on full cmd_buf (use cached spec result when valid)
+                            let pass2_text = if let Some(ref recognizer) = cmd_pass2 {
+                                if let Some(ref cached) = cmd_spec_text {
+                                    if cmd_spec_buf_len == cmd_buf.len() {
+                                        debug!("Using cached speculative pass 2");
+                                        cached.clone()
+                                    } else {
+                                        debug!(spec_len = cmd_spec_buf_len, cur_len = cmd_buf.len(),
+                                               "Audio grew since spec — re-decoding");
+                                        let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
+                                        let s = recognizer.create_stream_with_hotwords(hw);
+                                        s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
+                                        recognizer.decode(&s);
+                                        s.get_result()
+                                            .map(|r| cmd::normalize(&r.text))
+                                            .unwrap_or_default()
+                                    }
+                                } else {
+                                    let hw = cmd_continuation_hotwords.as_deref().unwrap_or("");
+                                    let s = recognizer.create_stream_with_hotwords(hw);
+                                    s.accept_waveform(SAMPLE_RATE as i32, &cmd_buf);
+                                    recognizer.decode(&s);
+                                    s.get_result()
+                                        .map(|r| cmd::normalize(&r.text))
+                                        .unwrap_or_default()
+                                }
                             } else {
                                 String::new()
                             };
@@ -3167,6 +3215,9 @@ fn main() -> Result<()> {
                                             utterance_audio = std::mem::take(&mut cmd_buf);
                                             cmd_detect = CmdDetectState::Idle;
                                             cmd_silence_start = None;
+                                            cmd_spec_fired = false;
+                                            cmd_spec_text = None;
+                                            cmd_spec_buf_len = 0;
                                             mode = ListenMode::Dictation;
                                             last_speech_time = Some(Instant::now());
                                             recording_hold_until = None;
@@ -3212,6 +3263,8 @@ fn main() -> Result<()> {
                         last_speech_time = Some(Instant::now());
                         recording_hold_until = None; // cancel pending transition
                         cmd_silence_start = None; // speech resumed, cancel silence timer
+                        cmd_spec_fired = false;
+                        cmd_spec_text = None;
                         // Reset speculative flags when speech resumes
                         if mode == ListenMode::Dictation
                             && (spec_fast_fired || spec_slow_fired)
@@ -3372,6 +3425,9 @@ fn main() -> Result<()> {
                     cmd_detect = CmdDetectState::Idle;
                     cmd_buf.clear();
                     cmd_silence_start = None;
+                    cmd_spec_fired = false;
+                    cmd_spec_text = None;
+                    cmd_spec_buf_len = 0;
                     spec_cached_text.clear();
                     spec_fast_fired = false;
                     spec_slow_fired = false;
@@ -3413,6 +3469,9 @@ fn main() -> Result<()> {
                 cmd_detect = CmdDetectState::Idle;
                 cmd_buf.clear();
                 cmd_silence_start = None;
+                cmd_spec_fired = false;
+                cmd_spec_text = None;
+                cmd_spec_buf_len = 0;
                 spec_cached_text.clear();
                 spec_fast_fired = false;
                 spec_slow_fired = false;

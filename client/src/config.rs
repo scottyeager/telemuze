@@ -185,6 +185,7 @@ pub struct FileConfig {
     pub cmd_first_pass_ms: Option<u32>,
     pub cmd_prefill_ms: Option<u32>,
     pub cmd_silence_ms: Option<u32>,
+    pub cmd_spec_silence_ms: Option<u32>,
     pub cmd_threads: Option<i32>,
     pub cmd_beam_width: Option<i32>,
 
@@ -257,6 +258,7 @@ pub struct ResolvedConfig {
     pub cmd_first_pass_ms: u32,
     pub cmd_prefill_ms: u32,
     pub cmd_silence_ms: u32,
+    pub cmd_spec_silence_ms: u32,
     pub cmd_threads: i32,
     pub cmd_beam_width: i32,
     pub no_eou: bool,
@@ -581,6 +583,10 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("cmd-silence-ms = {}", cfg.cmd_silence_ms));
     line("");
 
+    line("# Speculative silence (ms) for early command decode; 0 disables.");
+    line(&format!("cmd-spec-silence-ms = {}", cfg.cmd_spec_silence_ms));
+    line("");
+
     line("# Number of threads for the command recognizer.");
     line(&format!("cmd-threads = {}", cfg.cmd_threads));
     line("");
@@ -796,6 +802,7 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         cmd_first_pass_ms: r!(cmd_first_pass_ms, "cmd-first-pass-ms"),
         cmd_prefill_ms: r!(cmd_prefill_ms, "cmd-prefill-ms"),
         cmd_silence_ms: r!(cmd_silence_ms, "cmd-silence-ms"),
+        cmd_spec_silence_ms: r!(cmd_spec_silence_ms, "cmd-spec-silence-ms"),
         cmd_threads: r!(cmd_threads, "cmd-threads"),
         cmd_beam_width: r!(cmd_beam_width, "cmd-beam-width"),
         no_eou: r_bool!(no_eou, "no-eou"),
