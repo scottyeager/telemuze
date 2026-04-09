@@ -385,7 +385,7 @@ struct AppContext {
     sentence_continuation: bool,
     sentence_continuation_timeout_secs: f32,
     dictation_max_speech_samples: usize,
-    last_ended_with_punctuation: Cell<bool>,
+    last_ended_with_punctuation: Cell<Option<char>>,
     last_output_time: Cell<Option<Instant>>,
     /// Number of characters typed in the last segment (for undo via backspace).
     last_typed_chars: Cell<usize>,
@@ -464,7 +464,7 @@ impl AppContext {
             sentence_continuation: cfg.sentence_continuation,
             sentence_continuation_timeout_secs: cfg.sentence_continuation_timeout,
             dictation_max_speech_samples: (cfg.dictation_max_speech * SAMPLE_RATE as f32) as usize,
-            last_ended_with_punctuation: Cell::new(true),
+            last_ended_with_punctuation: Cell::new(Some('.')),
             last_output_time: Cell::new(None),
             last_typed_chars: Cell::new(0),
             display_server,
@@ -562,12 +562,15 @@ impl AppContext {
             return SentenceContinuation::Fresh;
         }
 
-        if raw_starts_lowercase && self.last_ended_with_punctuation.get() {
+        // Em dash is not sentence-ending — treat it like no punctuation.
+        let sentence_punct = self.last_ended_with_punctuation.get()
+            .filter(|&c| c != '\u{2014}');
+        if raw_starts_lowercase && sentence_punct.is_some() {
             // ASR returned lowercase despite previous sentence punctuation —
             // signals a continuation; delete the trailing punct.
             SentenceContinuation::DeletePunctuation
-        } else if !self.last_ended_with_punctuation.get() {
-            // Previous segment didn't end with punctuation — lowercase
+        } else if sentence_punct.is_none() {
+            // Previous segment didn't end with sentence punctuation — lowercase
             // the first letter to continue the sentence.
             SentenceContinuation::Lowercase
         } else {
@@ -600,6 +603,47 @@ fn type_into_window(text: &str, display_server: &str) {
     if let Err(e) = result {
         warn!("Text injection failed: {e}");
     }
+}
+
+/// Insert a punctuation character, replacing trailing space (and any existing
+/// trailing punctuation) from the previous output.
+fn type_punctuation(ch: char, ctx: &AppContext) {
+    let ds = &ctx.display_server;
+    let old_punct = ctx.last_ended_with_punctuation.get();
+    let old_had_space = old_punct.map_or(true, |c| c != '\u{2014}');
+    let new_has_space = ch != '\u{2014}';
+
+    // Delete trailing space (if previous output had one).
+    if old_had_space {
+        send_key("BackSpace", ds);
+    }
+    // Delete existing punctuation character (if replacing).
+    if old_punct.is_some() {
+        send_key("BackSpace", ds);
+    }
+
+    // Type the new punctuation character, with trailing space unless em dash.
+    let s = if new_has_space { format!("{ch} ") } else { format!("{ch}") };
+    let result = if ds == "wayland" {
+        std::process::Command::new("wtype").arg(&s).status()
+    } else {
+        std::process::Command::new("xdotool")
+            .args(["type", "--clearmodifiers", &s])
+            .status()
+    };
+    if let Err(e) = result {
+        warn!("Punctuation injection failed: {e}");
+    }
+
+    // Update tracking.
+    ctx.last_ended_with_punctuation.set(Some(ch));
+    ctx.last_output_time.set(Some(Instant::now()));
+    // Adjust last_typed_chars for the net character change.
+    let deleted = (if old_had_space { 1i32 } else { 0 }) + (if old_punct.is_some() { 1 } else { 0 });
+    let inserted = 1 + if new_has_space { 1i32 } else { 0 };
+    let delta = inserted - deleted;
+    let prev = ctx.last_typed_chars.get() as i32;
+    ctx.last_typed_chars.set((prev + delta).max(0) as usize);
 }
 
 fn read_clipboard(display_server: &str, selection: &str) -> Option<String> {
@@ -927,6 +971,8 @@ enum VoiceAction {
         /// Number of times to apply the scroll tick count.
         repeats: u32,
     },
+    /// Insert a punctuation mark, replacing trailing space from previous output.
+    Punctuation(char),
 }
 
 /// A voice command: a phrase (lowercased words) mapped to an action.
@@ -978,7 +1024,9 @@ fn build_first_word_hotwords(
     boost: f32,
 ) -> String {
     let mut words: Vec<String> = Vec::new();
-    words.extend(["press", "click", "scroll", "slash", "undo"].iter().map(|s| s.to_string()));
+    words.extend(["press", "click", "scroll", "slash", "undo",
+        "period", "comma", "colon", "semicolon", "question", "exclamation",
+    ].iter().map(|s| s.to_string()));
     words.extend(aliases.click.iter().cloned());
     words.extend(aliases.press.iter().cloned());
     words.extend(aliases.scroll.iter().cloned());
@@ -1060,6 +1108,12 @@ fn build_continuation_hotwords(
         "press shift".into(),
         "press alt".into(),
         "press super".into(),
+        "question mark".into(),
+        "exclamation point".into(),
+        "exclamation mark".into(),
+        "full stop".into(),
+        "em dash".into(),
+        "semi colon".into(),
     ];
 
     // Alias phrases for slash command triggers
@@ -1457,6 +1511,35 @@ fn key_name(word: &str) -> Option<&'static str> {
     }
 }
 
+/// Punctuation trigger phrases mapped to their characters.
+const PUNCTUATION_TRIGGERS: &[(&[&str], char)] = &[
+    (&["period"], '.'),
+    (&["full", "stop"], '.'),
+    (&["comma"], ','),
+    (&["question", "mark"], '?'),
+    (&["exclamation", "point"], '!'),
+    (&["exclamation", "mark"], '!'),
+    (&["colon"], ':'),
+    (&["semicolon"], ';'),
+    (&["semi", "colon"], ';'),
+    (&["em", "dash"], '\u{2014}'),
+    (&["m", "dash"], '\u{2014}'),
+];
+
+/// Try to find a punctuation command in `lower` starting from `from`.
+/// Returns (start_byte, end_byte, VoiceAction::Punctuation(ch)) or None.
+fn find_punctuation(lower: &str, from: usize) -> Option<(usize, usize, VoiceAction)> {
+    let mut best: Option<(usize, usize, char)> = None;
+    for &(words, ch) in PUNCTUATION_TRIGGERS {
+        if let Some((start, end)) = find_phrase(lower, from, words) {
+            if best.as_ref().is_none_or(|b| start < b.0 || (start == b.0 && end > b.1)) {
+                best = Some((start, end, ch));
+            }
+        }
+    }
+    best.map(|(s, e, ch)| (s, e, VoiceAction::Punctuation(ch)))
+}
+
 /// Try to find "scroll up/down/top/bottom [up/down...]" in `lower` starting
 /// from `from`.  Repeated direction words multiply the scroll count.
 /// "top" and "bottom" scroll 100 repeats in the respective direction.
@@ -1659,6 +1742,13 @@ fn process_voice_commands<'a>(text: &'a str, ctx: &AppContext) -> Vec<TextAction
 
         // "press <key>" (unmodified) dynamic command
         if let Some((start, end, action)) = find_key_press(&lower, cursor, &ctx.aliases.press) {
+            if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
+                best = Some((start, end, action));
+            }
+        }
+
+        // Punctuation commands ("period", "question mark", etc.)
+        if let Some((start, end, action)) = find_punctuation(&lower, cursor) {
             if no_text_before(start) && best.as_ref().is_none_or(|b| start < b.0) {
                 best = Some((start, end, action));
             }
@@ -2062,8 +2152,14 @@ fn lowercase_first_letter(s: &str) -> String {
     }
 }
 
-fn ends_with_sentence_punctuation(s: &str) -> bool {
-    s.trim_end().ends_with(['.', '!', '?'])
+fn ends_with_punctuation_char(s: &str) -> Option<char> {
+    let trimmed = s.trim_end();
+    let last = trimmed.chars().last()?;
+    if matches!(last, '.' | '!' | '?' | ',' | ':' | ';' | '\u{2014}') {
+        Some(last)
+    } else {
+        None
+    }
 }
 
 
@@ -2216,6 +2312,14 @@ fn execute_commands(text: &str, ctx: &AppContext) {
                 }
                 just_typed = false;
             }
+            TextAction::Command(VoiceAction::Punctuation(ch)) => {
+                if ctx.type_text {
+                    type_punctuation(*ch, ctx);
+                } else {
+                    println!("[{ch}]");
+                }
+                just_typed = false;
+            }
             TextAction::OwnedText(ref s) => {
                 if ctx.type_text {
                     if just_typed {
@@ -2350,10 +2454,6 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode, s
         ctx.last_typed_chars.set(prev.saturating_sub(1));
     }
 
-    ctx.last_ended_with_punctuation
-        .set(ends_with_sentence_punctuation(&text));
-    ctx.last_output_time.set(Some(Instant::now()));
-
     let mut just_typed = false;
     let mut chars_typed: usize = 0;
     for action in &actions {
@@ -2426,7 +2526,23 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode, s
                 }
                 just_typed = false;
             }
+            TextAction::Command(VoiceAction::Punctuation(ch)) => {
+                if ctx.type_text {
+                    type_punctuation(*ch, ctx);
+                } else {
+                    println!("[{ch}]");
+                }
+                just_typed = false;
+            }
         }
+    }
+
+    // Update punctuation/timing state only when text was output (punctuation
+    // commands update these themselves inside type_punctuation).
+    if has_text_output {
+        ctx.last_ended_with_punctuation
+            .set(ends_with_punctuation_char(&text));
+        ctx.last_output_time.set(Some(Instant::now()));
     }
 
     ctx.last_typed_chars.set(chars_typed);
