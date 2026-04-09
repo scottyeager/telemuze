@@ -39,7 +39,6 @@ const WINDOW_SIZE: usize = 512; // sherpa-onnx Silero VAD frame size
 const DEFAULT_VAD_THRESHOLD: f32 = 0.5;
 const DEFAULT_FAST_SILENCE: f32 = 0.4;
 const DEFAULT_SLOW_SILENCE: f32 = 1.5;
-const DEFAULT_FINAL_SILENCE: f32 = 3.0;
 const DEFAULT_MIN_SPEECH: f32 = 0.1;
 const DEFAULT_MAX_SPEECH: f32 = 5.0;
 const DEFAULT_DICTATION_MAX_SPEECH: f32 = 30.0;
@@ -147,16 +146,12 @@ struct Cli {
     fast_silence: f32,
 
     /// Slow silence threshold (seconds). VAD mode: flushes dictation.
-    /// Speculative mode: emits text if it ends with sentence punctuation.
+    /// Speculative mode: emits cached text unconditionally after this silence.
     #[arg(long, default_value_t = DEFAULT_SLOW_SILENCE)]
     slow_silence: f32,
 
-    /// Final silence threshold (seconds). Speculative mode: emits text unconditionally.
-    #[arg(long, default_value_t = DEFAULT_FINAL_SILENCE)]
-    final_silence: f32,
-
     /// Dictation segmenting mode: "vad" (silence-based flush) or "speculative"
-    /// (server-side decode with punctuation-gated output).
+    /// (server-side decode with silence-gated output).
     #[arg(long, default_value_t = config::SegmentingMode::Vad)]
     segmenting: config::SegmentingMode,
 
@@ -386,7 +381,6 @@ struct AppContext {
     prefill_samples: usize,
     fast_silence_secs: f32,
     slow_silence_secs: f32,
-    final_silence_secs: f32,
     segmenting: config::SegmentingMode,
     sentence_continuation: bool,
     sentence_continuation_timeout_secs: f32,
@@ -466,7 +460,6 @@ impl AppContext {
             prefill_samples: (cfg.prefill_ms as usize * SAMPLE_RATE as usize) / 1000,
             fast_silence_secs: cfg.fast_silence,
             slow_silence_secs: cfg.slow_silence,
-            final_silence_secs: cfg.final_silence,
             segmenting: cfg.segmenting,
             sentence_continuation: cfg.sentence_continuation,
             sentence_continuation_timeout_secs: cfg.sentence_continuation_timeout,
@@ -548,14 +541,21 @@ impl AppContext {
 
     /// Determine how this segment relates to the previous sentence.
     /// Gates both lowercasing and punctuation deletion on the same timeout.
-    fn sentence_continuation(&self, raw_starts_lowercase: bool) -> SentenceContinuation {
+    fn sentence_continuation(&self, raw_starts_lowercase: bool, speech_onset: Option<Instant>) -> SentenceContinuation {
         if !self.sentence_continuation {
             return SentenceContinuation::Fresh;
         }
 
         // Must have a recent previous segment within the timeout window.
+        // Use speech_onset (when the user started speaking) rather than now(),
+        // because transcription delay can push us past the timeout even when
+        // the user started speaking immediately after the previous segment.
+        let check_time = speech_onset.unwrap_or_else(Instant::now);
         let within_timeout = self.last_output_time.get()
-            .map(|t| t.elapsed().as_secs_f32() <= self.sentence_continuation_timeout_secs)
+            .map(|t| {
+                let elapsed = check_time.saturating_duration_since(t).as_secs_f32();
+                elapsed <= self.sentence_continuation_timeout_secs
+            })
             .unwrap_or(false);
 
         if !within_timeout {
@@ -2066,19 +2066,6 @@ fn ends_with_sentence_punctuation(s: &str) -> bool {
     s.trim_end().ends_with(['.', '!', '?'])
 }
 
-/// Check if text ends with sentence-ending punctuation (`.` `?` `!`), excluding
-/// ellipsis (`...`). Used by speculative mode to decide whether to commit text.
-fn ends_with_sentence_punct(text: &str) -> bool {
-    let trimmed = text.trim_end();
-    if trimmed.ends_with('?') || trimmed.ends_with('!') {
-        return true;
-    }
-    if trimmed.ends_with('.') {
-        // Exclude ellipsis "..."
-        return !trimmed.ends_with("...");
-    }
-    false
-}
 
 // ── Segment flushing ───────────────────────────────────────────────────────
 
@@ -2311,7 +2298,7 @@ fn send_and_decode(utterance_audio: &[f32], ctx: &AppContext, tray_mode: ListenM
 
 /// Process transcribed dictation text: wake/sleep, undo, word-count filter,
 /// continuation lowercasing, command parsing, and output.
-fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
+fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode, speech_onset: Option<Instant>) {
     // Check for wake/sleep and undo before the word-count filter.
     if let Some(wake) = check_wake_sleep(text, ctx) {
         ctx.apply_wake_sleep(wake);
@@ -2335,7 +2322,7 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
 
     // Determine continuation relationship with previous segment.
     let raw_starts_lowercase = text.chars().next().map(|c| c.is_lowercase()).unwrap_or(false);
-    let continuation = ctx.sentence_continuation(raw_starts_lowercase);
+    let continuation = ctx.sentence_continuation(raw_starts_lowercase, speech_onset);
 
     let text = match continuation {
         SentenceContinuation::DeletePunctuation | SentenceContinuation::Lowercase => lowercase_first_letter(text),
@@ -2458,13 +2445,13 @@ fn process_dictation_text(text: &str, ctx: &AppContext, tray_mode: ListenMode) {
 }
 
 /// Send accumulated dictation audio to the server, output the transcription.
-fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: ListenMode) {
+fn flush_utterance(utterance_audio: &mut Vec<f32>, ctx: &AppContext, tray_mode: ListenMode, speech_onset: Option<Instant>) {
     if utterance_audio.is_empty() {
         return;
     }
 
     if let Some(text) = send_and_decode(utterance_audio, ctx, tray_mode) {
-        process_dictation_text(&text, ctx, tray_mode);
+        process_dictation_text(&text, ctx, tray_mode, speech_onset);
     }
     utterance_audio.clear();
 }
@@ -2491,11 +2478,11 @@ fn finish_segment_ui(ctx: &AppContext, mode: ListenMode) {
 
 /// Flush any in-progress speech. In dictation mode, sends accumulated
 /// utterance audio. In idle mode, processes remaining VAD segments as commands.
-fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mode: ListenMode) {
+fn drain_vad(vad: &mut Vad, utterance_audio: &mut Vec<f32>, ctx: &AppContext, mode: ListenMode, speech_onset: Option<Instant>) {
     // In dictation mode, send accumulated audio if any.
     if mode == ListenMode::Dictation {
         ctx.set_tray_status(TrayStatus::Processing);
-        flush_utterance(utterance_audio, ctx, ListenMode::Idle);
+        flush_utterance(utterance_audio, ctx, ListenMode::Idle, speech_onset);
     }
 
     // Drain any remaining VAD segments (idle mode commands).
@@ -2821,6 +2808,7 @@ fn main() -> Result<()> {
     let mut was_detected = false;
     let mut mode = ListenMode::Idle;
     let mut last_speech_time: Option<Instant> = None;
+    let mut dictation_onset: Option<Instant> = None;
     let mut utterance_audio: Vec<f32> = Vec::new();
     let mut recording_hold_until: Option<Instant> = None;
     let prefill_samples = ctx.prefill_samples;
@@ -2879,18 +2867,17 @@ fn main() -> Result<()> {
                             ctx.set_tray_status(TrayStatus::Dictating);
                         }
 
-                        // SLOW: emit if cached text ends with sentence punct
+                        // SLOW: emit cached text unconditionally
                         if !spec_slow_fired
                             && spec_fast_fired
                             && silence >= ctx.slow_silence_secs
                         {
                             spec_slow_fired = true;
                             if !spec_cached_text.is_empty()
-                                && ends_with_sentence_punct(&spec_cached_text)
                             {
                                 debug!(text = %spec_cached_text, "[emit]");
                                 ctx.set_tray_status(TrayStatus::Processing);
-                                process_dictation_text(&spec_cached_text, &ctx, ListenMode::Idle);
+                                process_dictation_text(&spec_cached_text, &ctx, ListenMode::Idle, dictation_onset);
                                 sleeping = ctx.sleeping.get();
                                 utterance_audio.clear();
                                 spec_cached_text.clear();
@@ -2905,39 +2892,7 @@ fn main() -> Result<()> {
                                     recognizer.reset(eou_stream);
                                 }
                                 eou_active = false;
-                            } else if !spec_cached_text.is_empty() {
-                                debug!(text = %spec_cached_text, "[skip] no sentence ending");
                             }
-                        }
-
-                        // FINAL: emit unconditionally
-                        if spec_slow_fired
-                            && !spec_cached_text.is_empty()
-                            && silence >= ctx.final_silence_secs
-                        {
-                            // Re-decode in case more audio arrived since fast trigger
-                            if let Some(text) = send_and_decode(&utterance_audio, &ctx, ListenMode::Idle) {
-                                spec_cached_text = text;
-                            }
-                            if !spec_cached_text.is_empty() {
-                                debug!(text = %spec_cached_text, "[timeout]");
-                                ctx.set_tray_status(TrayStatus::Processing);
-                                process_dictation_text(&spec_cached_text, &ctx, ListenMode::Idle);
-                                sleeping = ctx.sleeping.get();
-                            }
-                            utterance_audio.clear();
-                            spec_cached_text.clear();
-                            spec_fast_fired = false;
-                            spec_slow_fired = false;
-                            mode = ListenMode::Idle;
-                            vad.drain();
-                            was_detected = false;
-                            last_speech_time = None;
-                            recording_hold_until = None;
-                            if let Some((ref recognizer, ref eou_stream)) = eou_state {
-                                recognizer.reset(eou_stream);
-                            }
-                            eou_active = false;
                         }
                     } else if silence > ctx.slow_silence_secs
                         && !utterance_audio.is_empty()
@@ -2947,7 +2902,7 @@ fn main() -> Result<()> {
                         // commands are accepted immediately.
                         debug!(silence, "Dictation silence, flushing and returning to idle");
                         ctx.set_tray_status(TrayStatus::Processing);
-                        flush_utterance(&mut utterance_audio, &ctx, ListenMode::Idle);
+                        flush_utterance(&mut utterance_audio, &ctx, ListenMode::Idle, dictation_onset);
                         sleeping = ctx.sleeping.get();
                         mode = ListenMode::Idle;
                         vad.drain();
@@ -2965,7 +2920,7 @@ fn main() -> Result<()> {
                         let secs = utterance_audio.len() as f32 / SAMPLE_RATE as f32;
                         debug!(duration = secs, "Dictation max speech, force-flushing");
                         ctx.set_tray_status(TrayStatus::RecordingProcessing);
-                        flush_utterance(&mut utterance_audio, &ctx, ListenMode::Dictation);
+                        flush_utterance(&mut utterance_audio, &ctx, ListenMode::Dictation, dictation_onset);
                         sleeping = ctx.sleeping.get();
                         // Reset so the next speech frame properly re-enters Recording.
                         was_detected = false;
@@ -3017,7 +2972,7 @@ fn main() -> Result<()> {
                                 eou::EouEvent::Eou(ref text) => {
                                     debug!(text, "EOU boundary — flushing dictation");
                                     ctx.set_tray_status(TrayStatus::RecordingProcessing);
-                                    flush_utterance(&mut utterance_audio, &ctx, ListenMode::Dictation);
+                                    flush_utterance(&mut utterance_audio, &ctx, ListenMode::Dictation, dictation_onset);
                                     recognizer.reset(eou_stream);
                                 }
                                 eou::EouEvent::Partial(_) => {}
@@ -3236,7 +3191,9 @@ fn main() -> Result<()> {
                                             cmd_spec_text = None;
                     
                                             mode = ListenMode::Dictation;
-                                            last_speech_time = Some(Instant::now());
+                                            let now = Instant::now();
+                                            last_speech_time = Some(now);
+                                            dictation_onset = Some(now);
                                             recording_hold_until = None;
                                             ctx.set_tray_status(TrayStatus::Dictating);
                                             was_detected = false;
@@ -3389,7 +3346,9 @@ fn main() -> Result<()> {
                                             debug!("Switching to dictation mode");
                                             utterance_audio = samples;
                                             mode = ListenMode::Dictation;
-                                            last_speech_time = Some(Instant::now());
+                                            let now = Instant::now();
+                                            last_speech_time = Some(now);
+                                            dictation_onset = Some(now);
                                             recording_hold_until = None;
                                             ctx.set_tray_status(TrayStatus::Dictating);
                                             vad.drain();
@@ -3433,7 +3392,7 @@ fn main() -> Result<()> {
             Ok(Event::Ipc(IpcCommand::Toggle)) => {
                 if listening {
                     // Pause: flush any in-progress speech, stop audio.
-                    drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
+                    drain_vad(&mut vad, &mut utterance_audio, &ctx, mode, dictation_onset);
                     stream.pause().ok();
                     was_detected = false;
                     mode = ListenMode::Idle;
@@ -3478,7 +3437,7 @@ fn main() -> Result<()> {
             }
 
             Ok(Event::Ipc(IpcCommand::Flush)) => {
-                drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
+                drain_vad(&mut vad, &mut utterance_audio, &ctx, mode, dictation_onset);
                 sleeping = ctx.sleeping.get();
                 was_detected = false;
                 recording_hold_until = None;
@@ -3497,7 +3456,7 @@ fn main() -> Result<()> {
             }
 
             Ok(Event::Ipc(IpcCommand::Stop)) => {
-                drain_vad(&mut vad, &mut utterance_audio, &ctx, mode);
+                drain_vad(&mut vad, &mut utterance_audio, &ctx, mode, dictation_onset);
                 info!("Stopping");
                 break;
             }

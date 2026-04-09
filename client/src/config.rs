@@ -10,7 +10,7 @@ pub enum SegmentingMode {
     /// Silence-based flush (current behavior).
     #[default]
     Vad,
-    /// Server-side decode with punctuation-gated output.
+    /// Server-side decode with silence-gated output.
     Speculative,
 }
 
@@ -142,7 +142,6 @@ pub struct FileConfig {
     pub vad_energy_gate: Option<f32>,
     pub fast_silence: Option<f32>,
     pub slow_silence: Option<f32>,
-    pub final_silence: Option<f32>,
     pub segmenting: Option<String>,
     pub min_speech: Option<f32>,
     pub max_speech: Option<f32>,
@@ -227,7 +226,6 @@ pub struct ResolvedConfig {
     pub vad_energy_gate: f32,
     pub fast_silence: f32,
     pub slow_silence: f32,
-    pub final_silence: f32,
     pub segmenting: SegmentingMode,
     pub min_speech: f32,
     pub max_speech: f32,
@@ -456,16 +454,12 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line("");
 
     line("# Slow silence threshold (seconds). In vad mode: flushes dictation.");
-    line("# In speculative mode: emits text if it ends with sentence punctuation.");
+    line("# In speculative mode: emits cached text unconditionally after this silence.");
     line(&format!("slow-silence = {}", cfg.slow_silence));
     line("");
 
-    line("# Final silence threshold (seconds). In speculative mode: emits text unconditionally.");
-    line(&format!("final-silence = {}", cfg.final_silence));
-    line("");
-
     line("# Dictation segmenting mode.");
-    line("# Options: \"vad\" (silence-based flush) | \"speculative\" (server-side decode with punct-gated output)");
+    line("# Options: \"vad\" (silence-based flush) | \"speculative\" (server-side decode with silence-gated output)");
     line(&format!("segmenting = \"{}\"", cfg.segmenting));
     line("");
 
@@ -763,7 +757,6 @@ pub fn resolve(cli: &Cli, matches: &ArgMatches) -> Result<(ResolvedConfig, Optio
         vad_energy_gate: r!(vad_energy_gate, "vad-energy-gate"),
         fast_silence: r!(fast_silence, "fast-silence"),
         slow_silence: r!(slow_silence, "slow-silence"),
-        final_silence: r!(final_silence, "final-silence"),
         segmenting: if is_explicit(matches, "segmenting") {
             cli.segmenting
         } else if let Some(ref s) = file.segmenting {
