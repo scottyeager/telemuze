@@ -30,6 +30,9 @@ struct SegmentResponse {
     start: f64,
     end: f64,
     text: String,
+    tokens: Vec<String>,
+    /// Per-token timestamps in seconds, absolute (offset by segment start).
+    token_timestamps: Vec<f64>,
 }
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -127,6 +130,12 @@ async fn handle_long_form(
             start: s.start_secs,
             end: s.end_secs,
             text: s.text.clone(),
+            tokens: s.tokens.clone(),
+            token_timestamps: s
+                .token_timestamps
+                .iter()
+                .map(|&t| s.start_secs + t as f64)
+                .collect(),
         })
         .collect();
 

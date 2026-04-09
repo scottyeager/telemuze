@@ -40,9 +40,9 @@ impl VadEngine {
             silero_vad: SileroVadModelConfig {
                 model: Some(model_path.to_string_lossy().into_owned()),
                 threshold: 0.5,
-                min_silence_duration: 0.5,
+                min_silence_duration: 1.0,
                 min_speech_duration: 0.1,
-                max_speech_duration: 15.0,
+                max_speech_duration: 600.0,
                 window_size: WINDOW_SIZE,
             },
             sample_rate: SAMPLE_RATE,

@@ -103,7 +103,7 @@ async fn handle_smart_dictation(
 
     // Step 2: STT transcription
     let raw_text = match state.stt_engine.lock().unwrap().transcribe_with_hotwords(&pcm, hotwords.as_deref()) {
-        Ok(text) => text,
+        Ok(result) => result.text,
         Err(e) => {
             error!("STT failed: {e}");
             return (

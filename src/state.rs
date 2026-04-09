@@ -10,12 +10,16 @@ use crate::engines::stt::SttEngine;
 use crate::engines::vad::{SpeechSegment, VadEngine};
 use crate::models::ModelManager;
 
-/// A transcribed speech segment with timestamps.
+/// A transcribed speech segment with timestamps and token-level timing.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TranscribedSegment {
     pub start_secs: f64,
     pub end_secs: f64,
     pub text: String,
+    /// Per-token strings from the recognizer (BPE subwords).
+    pub tokens: Vec<String>,
+    /// Per-token timestamps in seconds, relative to segment start.
+    pub token_timestamps: Vec<f32>,
 }
 
 /// Shared application state holding all loaded AI models.
@@ -163,18 +167,21 @@ impl AppState {
         let mut results = Vec::with_capacity(segments.len());
         for (i, seg) in segments.iter().enumerate() {
             match self.stt_engine.lock().unwrap().transcribe_with_hotwords(&seg.samples, hotwords) {
-                Ok(text) if !text.trim().is_empty() => {
+                Ok(stt_result) if !stt_result.text.trim().is_empty() => {
                     info!(
-                        "Segment {}/{}: [{:.1}s - {:.1}s] '{text}'",
+                        "Segment {}/{}: [{:.1}s - {:.1}s] '{}'",
                         i + 1,
                         segments.len(),
                         seg.start_secs,
                         seg.end_secs,
+                        stt_result.text,
                     );
                     results.push(TranscribedSegment {
                         start_secs: seg.start_secs,
                         end_secs: seg.end_secs,
-                        text,
+                        text: stt_result.text,
+                        tokens: stt_result.tokens,
+                        token_timestamps: stt_result.timestamps,
                     });
                 }
                 Ok(_) => {}
@@ -204,18 +211,21 @@ impl AppState {
         hotwords: Option<&str>,
     ) -> Option<TranscribedSegment> {
         match self.stt_engine.lock().unwrap().transcribe_with_hotwords(&seg.samples, hotwords) {
-            Ok(text) if !text.trim().is_empty() => {
+            Ok(stt_result) if !stt_result.text.trim().is_empty() => {
                 info!(
-                    "Segment {}/{}: [{:.1}s - {:.1}s] '{text}'",
+                    "Segment {}/{}: [{:.1}s - {:.1}s] '{}'",
                     index + 1,
                     total,
                     seg.start_secs,
                     seg.end_secs,
+                    stt_result.text,
                 );
                 Some(TranscribedSegment {
                     start_secs: seg.start_secs,
                     end_secs: seg.end_secs,
-                    text,
+                    text: stt_result.text,
+                    tokens: stt_result.tokens,
+                    token_timestamps: stt_result.timestamps,
                 })
             }
             Ok(_) => None,

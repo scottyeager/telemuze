@@ -116,9 +116,9 @@ async fn handle_transcription(
 
     // Run STT (no LLM correction for OpenAI compatibility)
     match state.stt_engine.lock().unwrap().transcribe_with_hotwords(&pcm, hotwords.as_deref()) {
-        Ok(text) => {
-            info!("Transcription complete: {} chars", text.len());
-            Json(TranscriptionResponse { text }).into_response()
+        Ok(result) => {
+            info!("Transcription complete: {} chars", result.text.len());
+            Json(TranscriptionResponse { text: result.text }).into_response()
         }
         Err(e) => {
             error!("STT failed: {e}");

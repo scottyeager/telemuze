@@ -13,6 +13,15 @@ use tracing::{debug, error, info, warn};
 /// Maximum number of zombie decode threads before we skip beam search entirely.
 const MAX_ZOMBIES: u32 = 3;
 
+/// Result from STT transcription including token-level timing.
+#[derive(Debug, Clone)]
+pub struct SttResult {
+    pub text: String,
+    pub tokens: Vec<String>,
+    /// Per-token timestamps in seconds (relative to start of audio segment).
+    pub timestamps: Vec<f32>,
+}
+
 /// Wraps the sherpa-onnx OfflineRecognizer for Parakeet TDT inference.
 pub struct SttEngine {
     /// Primary recognizer using modified_beam_search (supports hotwords).
@@ -107,7 +116,7 @@ impl SttEngine {
     }
 
     /// Transcribe mono 16kHz f32 PCM audio to text.
-    pub fn transcribe(&self, pcm_16khz: &[f32]) -> Result<String> {
+    pub fn transcribe(&self, pcm_16khz: &[f32]) -> Result<SttResult> {
         self.transcribe_with_hotwords(pcm_16khz, None)
     }
 
@@ -120,7 +129,7 @@ impl SttEngine {
         &self,
         pcm_16khz: &[f32],
         hotwords: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<SttResult> {
         let audio_duration_secs = pcm_16khz.len() as f64 / 16_000.0;
         // If too many zombie beam threads have accumulated, skip beam search
         // entirely to avoid further CPU waste.
@@ -148,8 +157,12 @@ impl SttEngine {
                 let result = stream
                     .get_result()
                     .context("sherpa-onnx returned no recognition result")?;
-                debug!(tokens = ?result.tokens, "Recognition tokens");
-                Ok(result.text)
+                debug!(tokens = ?result.tokens, timestamps = ?result.timestamps, "Recognition tokens");
+                Ok(SttResult {
+                    text: result.text,
+                    tokens: result.tokens,
+                    timestamps: result.timestamps.unwrap_or_default(),
+                })
             }
             Err(_) => {
                 // Leak the stream so the background thread (which
@@ -171,7 +184,7 @@ impl SttEngine {
     }
 
     /// Decode audio using the greedy fallback recognizer.
-    fn greedy_decode(&self, pcm_16khz: &[f32], audio_duration_secs: f64) -> Result<String> {
+    fn greedy_decode(&self, pcm_16khz: &[f32], audio_duration_secs: f64) -> Result<SttResult> {
         let fallback_stream = self.greedy_recognizer.create_stream();
         fallback_stream.accept_waveform(16000, pcm_16khz);
         let fallback_start = Instant::now();
@@ -184,8 +197,12 @@ impl SttEngine {
         let result = fallback_stream
             .get_result()
             .context("sherpa-onnx returned no recognition result")?;
-        debug!(tokens = ?result.tokens, "Greedy fallback recognition tokens");
-        Ok(result.text)
+        debug!(tokens = ?result.tokens, timestamps = ?result.timestamps, "Greedy fallback recognition tokens");
+        Ok(SttResult {
+            text: result.text,
+            tokens: result.tokens,
+            timestamps: result.timestamps.unwrap_or_default(),
+        })
     }
 
     /// Run `recognizer.decode()` on a background thread with a timeout.
