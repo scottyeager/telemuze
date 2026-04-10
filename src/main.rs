@@ -3,9 +3,11 @@ mod config;
 mod endpoints;
 mod engines;
 pub mod hotwords;
+mod long_form;
 mod models;
 mod state;
 mod telegram;
+mod worker;
 
 use anyhow::Result;
 use axum::extract::DefaultBodyLimit;
@@ -19,8 +21,27 @@ use tracing::info;
 use crate::config::Config;
 use crate::state::AppState;
 
+fn main() -> Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("transcribe") {
+        // Worker mode: minimal logging, one-shot. Stdout is reserved
+        // for the JSON output the parent process parses, so tracing
+        // must write to stderr.
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "telemuze=info".into()),
+            )
+            .init();
+        return worker::run(&args[2..]);
+    }
+
+    server_main()
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn server_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

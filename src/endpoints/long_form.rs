@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::audio;
-use crate::engines::diarization::split_by_speakers;
+use crate::long_form;
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -116,85 +116,32 @@ async fn handle_long_form(
         info!("Hotwords: {:?}", hotwords.as_deref().unwrap());
     }
 
-    // VAD segmentation + per-segment STT
-    let segments = match state.vad_transcribe_with_hotwords(&pcm, hotwords.as_deref()) {
-        Ok(s) => s,
+    // Delegate queueing, tempfile, subprocess spawns, and join.
+    let outcome = match state.long_form_transcribe(&pcm, hotwords.as_deref()).await {
+        Ok(o) => o,
         Err(e) => {
-            error!("VAD transcription failed: {e}");
+            error!("Long-form transcription failed: {e}");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("VAD transcription failed: {e}")})),
+                Json(serde_json::json!({"error": format!("Long-form transcription failed: {e}")})),
             )
                 .into_response();
         }
     };
 
-    // Run diarization if the engine is loaded, then split ASR segments at
-    // speaker-change boundaries using per-token timestamps.
-    let diar_segs_opt = if let Some(diar) = &state.diarization_engine {
-        match diar.diarize(&pcm) {
-            Ok(d) => {
-                let n_spk = d.iter().map(|s| s.speaker).max().map(|m| m + 1).unwrap_or(0);
-                let mut totals: std::collections::BTreeMap<i32, f64> = Default::default();
-                for s in &d {
-                    *totals.entry(s.speaker).or_insert(0.0) += (s.end - s.start) as f64;
-                }
-                let totals_str: Vec<String> = totals
-                    .iter()
-                    .map(|(spk, dur)| format!("spk{}={:.1}s", spk, dur))
-                    .collect();
-                info!(
-                    "Diarization: {} segments, {} speakers ({})",
-                    d.len(),
-                    n_spk,
-                    totals_str.join(" ")
-                );
-                Some(d)
-            }
-            Err(e) => {
-                error!("Diarization failed: {e}");
-                None
-            }
-        }
-    } else {
-        None
-    };
+    let subs = long_form::finalize(outcome);
 
-    let result_segments: Vec<SegmentResponse> = if let Some(diar_segs) = &diar_segs_opt {
-        let split = split_by_speakers(&segments, diar_segs);
-        info!(
-            "split_by_speakers: {} ASR segs -> {} output segs",
-            segments.len(),
-            split.len()
-        );
-        split
-            .into_iter()
-            .map(|s| SegmentResponse {
-                start: s.start,
-                end: s.end,
-                text: s.text,
-                tokens: s.tokens,
-                token_timestamps: s.token_timestamps,
-                speaker: s.speaker,
-            })
-            .collect()
-    } else {
-        segments
-            .iter()
-            .map(|s| SegmentResponse {
-                start: s.start_secs,
-                end: s.end_secs,
-                text: s.text.clone(),
-                tokens: s.tokens.clone(),
-                token_timestamps: s
-                    .token_timestamps
-                    .iter()
-                    .map(|&t| s.start_secs + t as f64)
-                    .collect(),
-                speaker: None,
-            })
-            .collect()
-    };
+    let result_segments: Vec<SegmentResponse> = subs
+        .into_iter()
+        .map(|s| SegmentResponse {
+            start: s.start,
+            end: s.end,
+            text: s.text,
+            tokens: s.tokens,
+            token_timestamps: s.token_timestamps,
+            speaker: s.speaker,
+        })
+        .collect();
 
     let full_text: String = result_segments
         .iter()

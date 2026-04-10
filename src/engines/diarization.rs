@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::NamedTempFile;
 use tracing::debug;
@@ -31,6 +31,7 @@ struct WireOutput {
 /// subprocess. The subprocess loads the Sortformer ONNX model, runs
 /// inference on a raw PCM tempfile, prints JSON to stdout, and exits —
 /// keeping the 492 MB model out of the always-on server's address space.
+#[derive(Clone)]
 pub struct DiarizationEngine {
     binary_path: PathBuf,
     model_path: PathBuf,
@@ -47,7 +48,6 @@ impl DiarizationEngine {
     /// Run diarization on mono 16 kHz f32 PCM. Spawns the diarize binary
     /// once and returns when it exits.
     pub fn diarize(&self, pcm: &[f32]) -> Result<Vec<DiarSegment>> {
-        // 1. Materialize PCM as a tempfile of raw f32-LE bytes.
         let mut tmp = NamedTempFile::new().context("Failed to create PCM tempfile")?;
         let mut bytes = Vec::with_capacity(pcm.len() * 4);
         for sample in pcm {
@@ -56,20 +56,23 @@ impl DiarizationEngine {
         tmp.write_all(&bytes)
             .context("Failed to write PCM tempfile")?;
         tmp.flush().context("Failed to flush PCM tempfile")?;
+        self.diarize_from_path(tmp.path())
+    }
 
+    /// Run diarization using an already-materialized raw f32-LE PCM tempfile.
+    /// The caller owns the tempfile lifetime.
+    pub fn diarize_from_path(&self, pcm_path: &Path) -> Result<Vec<DiarSegment>> {
         debug!(
-            "Spawning {} for {} samples ({:.2}s)",
+            "Spawning {} on pcm path {}",
             self.binary_path.display(),
-            pcm.len(),
-            pcm.len() as f64 / 16_000.0
+            pcm_path.display()
         );
 
-        // 2. Spawn the subprocess and read it to completion.
         let output = Command::new(&self.binary_path)
             .arg("--model")
             .arg(&self.model_path)
             .arg("--pcm")
-            .arg(tmp.path())
+            .arg(pcm_path)
             .output()
             .with_context(|| {
                 format!(
@@ -78,8 +81,6 @@ impl DiarizationEngine {
                 )
             })?;
 
-        // Forward subprocess stderr into our tracing pipeline so it lands
-        // in journalctl alongside everything else.
         if !output.stderr.is_empty() {
             for line in String::from_utf8_lossy(&output.stderr).lines() {
                 debug!("diarize: {}", line);
@@ -95,7 +96,6 @@ impl DiarizationEngine {
             );
         }
 
-        // 3. Parse stdout as JSON.
         let stdout = std::str::from_utf8(&output.stdout)
             .context("telemuze-diarize stdout was not valid UTF-8")?;
         let parsed: WireOutput = serde_json::from_str(stdout.trim())

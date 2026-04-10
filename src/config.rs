@@ -36,6 +36,16 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_DIARIZE_BINARY")]
     pub diarize_binary: Option<PathBuf>,
 
+    /// Path to the telemuze binary used to spawn long-form worker subprocesses.
+    /// Defaults to the currently running telemuze binary.
+    #[arg(long, env = "TELEMUZE_LONGFORM_BINARY")]
+    pub longform_binary: Option<PathBuf>,
+
+    /// Maximum number of concurrent long-form transcription jobs. Additional
+    /// jobs queue in FIFO order. Default 1 — one long-form worker at a time.
+    #[arg(long, env = "TELEMUZE_MAX_LONGFORM_CONCURRENCY", default_value_t = 1)]
+    pub max_longform_concurrency: usize,
+
     /// Directory for storing downloaded models.
     /// Defaults to ~/.local/share/telemuze/models
     #[arg(long, env = "TELEMUZE_MODELS_DIR")]

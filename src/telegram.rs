@@ -21,7 +21,13 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::audio;
+use crate::long_form;
 use crate::state::AppState;
+
+/// Duration threshold (seconds) above which Telegram audio is routed
+/// through the long-form subprocess pipeline. Below this we keep the
+/// in-process VAD+STT loop used for voice dictations.
+const LONG_FORM_THRESHOLD_SECS: f64 = 60.0;
 
 /// Maximum length for a single Telegram message.
 const TELEGRAM_MAX_LEN: usize = 4096;
@@ -153,7 +159,7 @@ impl StatusMessage {
 async fn handle_message(
     client: &Client,
     message: &grammers_client::update::Message,
-    state: &AppState,
+    state: &Arc<AppState>,
 ) -> Result<()> {
     // Check if the sender is in the allowed users list.
     if !state.telegram_allowed_users.is_empty() {
@@ -233,12 +239,15 @@ async fn download_media(client: &Client, media: &Media) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// Transcribe audio bytes via VAD+STT and reply with the result.
+/// Transcribe audio bytes and reply with the result. Routes to the
+/// in-process VAD+STT loop for short clips (≤60 s, voice-dictation style)
+/// or to the long-form subprocess pipeline for longer audio (multi-speaker
+/// meetings, podcasts), matching the HTTP endpoint's behavior.
 async fn transcribe_and_reply(
     client: &Client,
     message: &grammers_client::update::Message,
     bytes: &[u8],
-    state: &AppState,
+    state: &Arc<AppState>,
     label: &str,
     status: StatusMessage,
 ) -> Result<()> {
@@ -247,19 +256,36 @@ async fn transcribe_and_reply(
     let duration_secs = pcm.len() as f64 / 16_000.0;
     info!("Telegram {label}: {:.1}s of audio", duration_secs);
 
-    let duration_display = format_duration(duration_secs);
+    let duration_display = long_form::format_duration(duration_secs);
+
+    if duration_secs <= LONG_FORM_THRESHOLD_SECS {
+        transcribe_short(message, &pcm, state, &duration_display, status).await?;
+    } else {
+        transcribe_long(client, message, &pcm, state, &duration_display, status).await?;
+    }
+    Ok(())
+}
+
+/// In-process path for short voice dictations (≤60 s). No subprocess,
+/// no queue, no diarization — replies with plain text.
+async fn transcribe_short(
+    message: &grammers_client::update::Message,
+    pcm: &[f32],
+    state: &AppState,
+    duration_display: &str,
+    status: StatusMessage,
+) -> Result<()> {
     status
         .update(&format!("Transcribing {duration_display} of audio..."))
         .await;
 
-    let segments = state.vad_segment(&pcm)?;
+    let segments = state.vad_segment(pcm)?;
     let total = segments.len();
 
     let mut results = Vec::with_capacity(total);
     for (i, seg) in segments.iter().enumerate() {
-        // Update progress for multi-segment transcriptions.
         if total > 1 {
-            let position = format_duration(seg.start_secs);
+            let position = long_form::format_duration(seg.start_secs);
             status
                 .update(&format!(
                     "Transcribing {duration_display} of audio... (segment {}/{total}, {position})",
@@ -284,7 +310,46 @@ async fn transcribe_and_reply(
     if full_text.is_empty() {
         message.reply("No speech detected.").await?;
     } else {
-        send_reply(client, message, &full_text).await?;
+        message.reply(full_text.as_str()).await?;
+    }
+    Ok(())
+}
+
+/// Long-form path (>60 s): routes through the same subprocess pipeline
+/// the HTTP endpoint uses, with speaker labels and timestamps in the
+/// rendered output. Queues behind any other long-form job automatically.
+async fn transcribe_long(
+    client: &Client,
+    message: &grammers_client::update::Message,
+    pcm: &[f32],
+    state: &Arc<AppState>,
+    duration_display: &str,
+    status: StatusMessage,
+) -> Result<()> {
+    // The semaphore acquisition inside long_form_transcribe is FIFO;
+    // we show a coarse "Queued" state up front and then transition to
+    // "Transcribing" once we're running.
+    status
+        .update(&format!(
+            "Queued for long-form transcription ({duration_display})..."
+        ))
+        .await;
+
+    let outcome = state.long_form_transcribe(pcm, None).await?;
+
+    status
+        .update(&format!("Finalizing transcript ({duration_display})..."))
+        .await;
+
+    let subs = long_form::finalize(outcome);
+    let text = long_form::format_as_text(&subs);
+
+    status.delete().await;
+
+    if text.is_empty() {
+        message.reply("No speech detected.").await?;
+    } else {
+        send_reply(client, message, &text).await?;
     }
     Ok(())
 }
@@ -315,17 +380,3 @@ async fn send_reply(
     Ok(())
 }
 
-/// Format a duration in seconds into a human-readable string.
-fn format_duration(secs: f64) -> String {
-    let total = secs as u64;
-    let h = total / 3600;
-    let m = (total % 3600) / 60;
-    let s = total % 60;
-    if h > 0 {
-        format!("{h}h {m:02}m {s:02}s")
-    } else if m > 0 {
-        format!("{m}m {s:02}s")
-    } else {
-        format!("{s}s")
-    }
-}

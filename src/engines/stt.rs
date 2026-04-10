@@ -43,6 +43,7 @@ impl SttEngine {
         hotwords_score: f32,
         max_active_paths: i32,
         blank_penalty: f32,
+        num_threads: i32,
     ) -> Result<Self> {
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.transducer.encoder =
@@ -54,7 +55,7 @@ impl SttEngine {
         config.model_config.tokens =
             Some(model_dir.join("tokens.txt").to_string_lossy().into_owned());
         config.model_config.model_type = Some("nemo_transducer".into());
-        config.model_config.num_threads = 2;
+        config.model_config.num_threads = num_threads;
         config.decoding_method = Some("modified_beam_search".into());
         config.max_active_paths = max_active_paths;
         config.blank_penalty = blank_penalty;
@@ -74,7 +75,7 @@ impl SttEngine {
         info!(
             "Creating beam_search recognizer (hotwords_score={hotwords_score}, \
              max_active_paths={max_active_paths}, blank_penalty={blank_penalty}, \
-             num_threads=2)"
+             num_threads={num_threads})"
         );
         let recognizer = OfflineRecognizer::create(&config)
             .context("Failed to create sherpa-onnx OfflineRecognizer (beam search)")?;

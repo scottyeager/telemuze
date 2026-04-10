@@ -1,15 +1,20 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tempfile::NamedTempFile;
+use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::config::Config;
 use crate::engines::diarization::DiarizationEngine;
 use crate::engines::dictionary::{Dictionary, PipelineConfig};
 use crate::engines::llm::LlmEngine;
+use crate::engines::long_form::LongFormEngine;
 use crate::engines::stt::SttEngine;
 use crate::engines::vad::{SpeechSegment, VadEngine};
+use crate::long_form::LongFormOutcome;
 use crate::models::ModelManager;
 
 /// A transcribed speech segment with timestamps and token-level timing.
@@ -36,6 +41,11 @@ pub struct AppState {
     /// model file are located at startup. The engine is internally
     /// stateless (each call spawns a fresh subprocess), so no Mutex.
     pub diarization_engine: Option<DiarizationEngine>,
+    /// Long-form worker launcher — spawns `telemuze transcribe` children.
+    pub long_form_engine: LongFormEngine,
+    /// FIFO queue for long-form jobs. Permit count defaults to 1 so only
+    /// one worker runs at a time (bounded peak RAM).
+    pub long_form_semaphore: Arc<Semaphore>,
     pub terms_content: String,
     pub dictionary: Dictionary,
     pub pipeline_config: PipelineConfig,
@@ -75,6 +85,7 @@ impl AppState {
             config.hotwords_score,
             config.max_active_paths,
             config.blank_penalty,
+            2,
         )?;
         info!("STT model loaded.");
 
@@ -102,6 +113,21 @@ impl AppState {
         info!("VAD model loaded.");
 
         let diarization_engine = Self::load_diarization_engine(config, &mgr);
+
+        let long_form_binary = locate_long_form_binary(config);
+        info!("Long-form worker binary: {}", long_form_binary.display());
+        let long_form_engine = LongFormEngine::new(
+            long_form_binary,
+            stt_path.clone(),
+            vad_path.clone(),
+            config.hotwords_score,
+            config.max_active_paths,
+            config.blank_penalty,
+            8,
+        );
+        let permits = config.max_longform_concurrency.max(1);
+        info!("Long-form concurrency: {permits} permit(s)");
+        let long_form_semaphore = Arc::new(Semaphore::new(permits));
 
         // Load terms file
         let terms_file = config.resolved_terms_file();
@@ -148,11 +174,78 @@ impl AppState {
             llm_engine,
             vad_engine: Mutex::new(vad_engine),
             diarization_engine,
+            long_form_engine,
+            long_form_semaphore,
             terms_content,
             dictionary,
             pipeline_config,
             disable_llm_correction: config.disable_llm_correction,
             telegram_allowed_users,
+        })
+    }
+
+    /// Run a long-form transcription job: acquires the long-form permit
+    /// (FIFO queue), materializes the PCM to a single tempfile, spawns
+    /// transcribe + diarize workers in parallel, and returns the merged
+    /// outcome. The permit is held across both subprocess spawns so the
+    /// peak RAM from worker children is bounded by the permit count.
+    pub async fn long_form_transcribe(
+        self: &Arc<Self>,
+        pcm: &[f32],
+        hotwords: Option<&str>,
+    ) -> Result<LongFormOutcome> {
+        let waited_start = std::time::Instant::now();
+        let _permit = self
+            .long_form_semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .context("Long-form semaphore closed")?;
+        let waited = waited_start.elapsed();
+        if waited > std::time::Duration::from_millis(50) {
+            info!(
+                "Long-form job waited {:.1}s in queue",
+                waited.as_secs_f64()
+            );
+        }
+
+        let pcm_file = write_pcm_tempfile(pcm)?;
+        let pcm_path = pcm_file.path().to_path_buf();
+
+        let long_form = self.long_form_engine.clone();
+        let hw_owned = hotwords.map(str::to_owned);
+        let pcm_for_asr = pcm_path.clone();
+        let asr_task = tokio::task::spawn_blocking(move || {
+            long_form.transcribe(&pcm_for_asr, hw_owned.as_deref())
+        });
+
+        let diar_task = self.diarization_engine.clone().map(|diar| {
+            let pcm_for_diar = pcm_path.clone();
+            tokio::task::spawn_blocking(move || diar.diarize_from_path(&pcm_for_diar))
+        });
+
+        let asr_segments = asr_task.await.context("ASR task join failed")??;
+
+        let diar_segments = match diar_task {
+            Some(t) => match t.await.context("Diarization task join failed")? {
+                Ok(d) => {
+                    let n_spk = d.iter().map(|s| s.speaker).max().map(|m| m + 1).unwrap_or(0);
+                    info!("Diarization: {} segments, {} speakers", d.len(), n_spk);
+                    Some(d)
+                }
+                Err(e) => {
+                    error!("Diarization failed: {e}");
+                    None
+                }
+            },
+            None => None,
+        };
+
+        drop(pcm_file);
+
+        Ok(LongFormOutcome {
+            asr_segments,
+            diar_segments,
         })
     }
 
@@ -188,52 +281,6 @@ impl AppState {
             model_path.display()
         );
         Some(DiarizationEngine::new(binary_path, model_path))
-    }
-
-    /// Run VAD segmentation followed by per-segment STT transcription.
-    ///
-    /// Returns transcribed segments (skipping empty/failed ones).
-    pub fn vad_transcribe(&self, pcm: &[f32]) -> Result<Vec<TranscribedSegment>> {
-        self.vad_transcribe_with_hotwords(pcm, None)
-    }
-
-    /// Run VAD segmentation + per-segment STT with optional hotwords.
-    pub fn vad_transcribe_with_hotwords(
-        &self,
-        pcm: &[f32],
-        hotwords: Option<&str>,
-    ) -> Result<Vec<TranscribedSegment>> {
-        let segments = self.vad_engine.lock().unwrap().segment_audio(pcm)?;
-        info!("VAD found {} speech segments", segments.len());
-
-        let mut results = Vec::with_capacity(segments.len());
-        for (i, seg) in segments.iter().enumerate() {
-            match self.stt_engine.lock().unwrap().transcribe_with_hotwords(&seg.samples, hotwords) {
-                Ok(stt_result) if !stt_result.text.trim().is_empty() => {
-                    info!(
-                        "Segment {}/{}: [{:.1}s - {:.1}s] '{}'",
-                        i + 1,
-                        segments.len(),
-                        seg.start_secs,
-                        seg.end_secs,
-                        stt_result.text,
-                    );
-                    results.push(TranscribedSegment {
-                        start_secs: seg.start_secs,
-                        end_secs: seg.end_secs,
-                        text: stt_result.text,
-                        tokens: stt_result.tokens,
-                        token_timestamps: stt_result.timestamps,
-                    });
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    error!("STT failed for segment {}: {e}", i + 1);
-                }
-            }
-        }
-
-        Ok(results)
     }
 
     /// Run VAD segmentation only, returning the speech segments for
@@ -277,6 +324,33 @@ impl AppState {
             }
         }
     }
+}
+
+/// Write mono 16 kHz f32 PCM to a temp file as raw f32-LE bytes.
+/// Returned `NamedTempFile` auto-deletes when dropped.
+fn write_pcm_tempfile(pcm: &[f32]) -> Result<NamedTempFile> {
+    let mut tmp = NamedTempFile::new().context("Failed to create PCM tempfile")?;
+    let mut bytes = Vec::with_capacity(pcm.len() * 4);
+    for sample in pcm {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    tmp.write_all(&bytes)
+        .context("Failed to write PCM tempfile")?;
+    tmp.flush().context("Failed to flush PCM tempfile")?;
+    Ok(tmp)
+}
+
+/// Locate the telemuze binary used to spawn long-form workers.
+/// Falls back to the currently running executable.
+fn locate_long_form_binary(config: &Config) -> PathBuf {
+    if let Some(p) = &config.longform_binary {
+        if p.exists() {
+            return p.clone();
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .unwrap_or_else(|| PathBuf::from("telemuze"))
 }
 
 /// Locate the `telemuze-diarize` subprocess binary.
