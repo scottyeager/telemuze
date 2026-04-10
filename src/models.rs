@@ -32,6 +32,8 @@ pub enum ModelKind {
     Vad,
     /// Large Language Model (GGUF file for native inference).
     Llm,
+    /// Speaker diarization (segmentation or embedding model).
+    Diarization,
 }
 
 /// A single file to download as part of a model.
@@ -107,6 +109,40 @@ const SILERO_VAD: ModelInfo = ModelInfo {
     files: SILERO_VAD_FILES,
 };
 
+// Pyannote segmentation 3.0 (int8) — exported by csukuangfj for sherpa-onnx
+// Used for speaker diarization (segmentation step).
+const PYANNOTE_SEG_FILES: &[ModelFile] = &[ModelFile {
+    url: "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.int8.onnx",
+    filename: "pyannote-segmentation-3-0.int8.onnx",
+}];
+
+const PYANNOTE_SEG: ModelInfo = ModelInfo {
+    id: "pyannote-segmentation-3-0",
+    name: "Pyannote Segmentation 3.0 (int8)",
+    dirname: "pyannote-segmentation-3-0.int8.onnx",
+    is_directory: false,
+    kind: ModelKind::Diarization,
+    is_downloaded: false,
+    files: PYANNOTE_SEG_FILES,
+};
+
+// NeMo TitaNet Small — speaker embedding extractor for diarization clustering.
+// Hosted on k2-fsa/sherpa-onnx GitHub releases.
+const TITANET_SMALL_FILES: &[ModelFile] = &[ModelFile {
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx",
+    filename: "nemo_en_titanet_small.onnx",
+}];
+
+const TITANET_SMALL: ModelInfo = ModelInfo {
+    id: "nemo-titanet-small",
+    name: "NeMo TitaNet Small (speaker embedding)",
+    dirname: "nemo_en_titanet_small.onnx",
+    is_directory: false,
+    kind: ModelKind::Diarization,
+    is_downloaded: false,
+    files: TITANET_SMALL_FILES,
+};
+
 // Qwen3.5-0.8B GGUF — quantized by lmstudio-community
 // Original model: https://huggingface.co/Qwen/Qwen3.5-0.8B
 // GGUF: https://huggingface.co/lmstudio-community/Qwen3.5-0.8B-GGUF
@@ -148,6 +184,8 @@ fn default_models() -> HashMap<&'static str, ModelInfo> {
     let mut m = HashMap::new();
     m.insert(PARAKEET.id, PARAKEET);
     m.insert(SILERO_VAD.id, SILERO_VAD);
+    m.insert(PYANNOTE_SEG.id, PYANNOTE_SEG);
+    m.insert(TITANET_SMALL.id, TITANET_SMALL);
     m.insert(QWEN_0_8B.id, QWEN_0_8B);
     m.insert(QWEN_2B.id, QWEN_2B);
     m
