@@ -188,6 +188,7 @@ pub fn init_recognizer(cfg: &CmdConfig) -> Result<OfflineRecognizer> {
     );
     config.model_config.model_type = Some("nemo_transducer".to_string());
     config.model_config.num_threads = cfg.num_threads;
+    config.model_config.provider = Some("cpu".into());
     config.decoding_method = Some("modified_beam_search".to_string());
     config.max_active_paths = cfg.beam_width;
 
