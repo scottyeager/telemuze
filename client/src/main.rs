@@ -2983,32 +2983,33 @@ fn main() -> Result<()> {
                             ctx.set_tray_status(TrayStatus::Dictating);
                         }
 
-                        // SLOW: emit cached text unconditionally
+                        // SLOW: return to idle; emit cached text if we have any
                         if !spec_slow_fired
                             && spec_fast_fired
                             && silence >= ctx.slow_silence_secs
                         {
-                            spec_slow_fired = true;
-                            if !spec_cached_text.is_empty()
-                            {
+                            if !spec_cached_text.is_empty() {
                                 debug!(text = %spec_cached_text, "[emit]");
                                 ctx.set_tray_status(TrayStatus::Processing);
                                 process_dictation_text(&spec_cached_text, &ctx, ListenMode::Idle, dictation_onset);
                                 sleeping = ctx.sleeping.get();
-                                utterance_audio.clear();
-                                spec_cached_text.clear();
-                                spec_fast_fired = false;
-                                spec_slow_fired = false;
-                                mode = ListenMode::Idle;
-                                vad.drain();
-                                was_detected = false;
-                                last_speech_time = None;
-                                recording_hold_until = None;
-                                if let Some((ref recognizer, ref eou_stream)) = eou_state {
-                                    recognizer.reset(eou_stream);
-                                }
-                                eou_active = false;
+                            } else {
+                                debug!(silence, "Slow silence with empty speculative decode — returning to idle");
+                                finish_segment_ui(&ctx, ListenMode::Idle);
                             }
+                            utterance_audio.clear();
+                            spec_cached_text.clear();
+                            spec_fast_fired = false;
+                            spec_slow_fired = false;
+                            mode = ListenMode::Idle;
+                            vad.drain();
+                            was_detected = false;
+                            last_speech_time = None;
+                            recording_hold_until = None;
+                            if let Some((ref recognizer, ref eou_stream)) = eou_state {
+                                recognizer.reset(eou_stream);
+                            }
+                            eou_active = false;
                         }
                     } else if silence > ctx.slow_silence_secs
                         && !utterance_audio.is_empty()
