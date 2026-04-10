@@ -89,12 +89,6 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_HOTWORDS_SCORE", default_value_t = 1.5)]
     pub hotwords_score: f32,
 
-    /// Maximum seconds to wait for a single STT decode call before aborting.
-    /// Catches infinite beam search loops (e.g. from extreme hotword scores).
-    /// Set to 0 to disable the timeout.
-    #[arg(long, env = "TELEMUZE_DECODE_TIMEOUT", default_value_t = 5)]
-    pub decode_timeout: u64,
-
     /// Maximum number of active beam search paths (beam width).
     /// Lower values are faster but may reduce accuracy. Range: 1–10.
     #[arg(long, env = "TELEMUZE_MAX_ACTIVE_PATHS", default_value_t = 4)]

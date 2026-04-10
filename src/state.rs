@@ -70,7 +70,6 @@ impl AppState {
         let stt_engine = SttEngine::new(
             &stt_path,
             config.hotwords_score,
-            config.decode_timeout,
             config.max_active_paths,
             config.blank_penalty,
         )?;
