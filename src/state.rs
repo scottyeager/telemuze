@@ -1,9 +1,10 @@
 use anyhow::Result;
 use std::collections::HashSet;
 use std::sync::Mutex;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::config::Config;
+use crate::engines::diarization::DiarizationEngine;
 use crate::engines::dictionary::{Dictionary, PipelineConfig};
 use crate::engines::llm::LlmEngine;
 use crate::engines::stt::SttEngine;
@@ -30,6 +31,8 @@ pub struct AppState {
     pub stt_engine: Mutex<SttEngine>,
     pub llm_engine: LlmEngine,
     pub vad_engine: Mutex<VadEngine>,
+    /// Present when diarization model files are found at startup.
+    pub diarization_engine: Option<Mutex<DiarizationEngine>>,
     pub terms_content: String,
     pub dictionary: Dictionary,
     pub pipeline_config: PipelineConfig,
@@ -96,6 +99,8 @@ impl AppState {
         let vad_engine = VadEngine::new(&vad_path)?;
         info!("VAD model loaded.");
 
+        let diarization_engine = Self::load_diarization_engine(config, &mgr);
+
         // Load terms file
         let terms_file = config.resolved_terms_file();
         let terms_content = match std::fs::read_to_string(&terms_file) {
@@ -140,12 +145,60 @@ impl AppState {
             stt_engine: Mutex::new(stt_engine),
             llm_engine,
             vad_engine: Mutex::new(vad_engine),
+            diarization_engine: diarization_engine.map(Mutex::new),
             terms_content,
             dictionary,
             pipeline_config,
             disable_llm_correction: config.disable_llm_correction,
             telegram_allowed_users,
         })
+    }
+
+    fn load_diarization_engine(config: &Config, mgr: &ModelManager) -> Option<DiarizationEngine> {
+        let (seg_path, emb_path) = match (
+            config.diarization_segmentation_model_path.as_ref(),
+            config.diarization_embedding_model_path.as_ref(),
+        ) {
+            (Some(seg), Some(emb)) => (seg.clone(), emb.clone()),
+            (None, None) => {
+                // Fall back to well-known filenames in the models directory.
+                let models_dir = mgr.models_dir();
+                let seg = models_dir.join("pyannote-segmentation-3-0.int8.onnx");
+                let emb = models_dir.join("nemo_en_titanet_small.onnx");
+                if seg.exists() && emb.exists() {
+                    (seg, emb)
+                } else {
+                    info!(
+                        "Diarization models not found in {} — speaker labels disabled. \
+                         To enable, place pyannote-segmentation-3-0.int8.onnx and \
+                         nemo_en_titanet_small.onnx in the models directory, or set \
+                         --diarization-segmentation-model-path and \
+                         --diarization-embedding-model-path.",
+                        models_dir.display()
+                    );
+                    return None;
+                }
+            }
+            _ => {
+                warn!(
+                    "Diarization requires both --diarization-segmentation-model-path and \
+                     --diarization-embedding-model-path; skipping diarization."
+                );
+                return None;
+            }
+        };
+
+        info!(
+            "Loading diarization models: segmentation={:?}, embedding={:?}",
+            seg_path, emb_path
+        );
+        match DiarizationEngine::new(&seg_path, &emb_path) {
+            Ok(engine) => Some(engine),
+            Err(e) => {
+                warn!("Failed to initialize diarization engine: {e} — speaker labels disabled");
+                None
+            }
+        }
     }
 
     /// Run VAD segmentation followed by per-segment STT transcription.

@@ -17,6 +17,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::audio;
+use crate::engines::diarization::assign_speakers;
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -33,6 +34,10 @@ struct SegmentResponse {
     tokens: Vec<String>,
     /// Per-token timestamps in seconds, absolute (offset by segment start).
     token_timestamps: Vec<f64>,
+    /// 0-based speaker index from diarization. None when diarization is disabled
+    /// or no diarization segment overlaps this ASR segment.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speaker: Option<i32>,
 }
 
 pub fn router() -> Router<Arc<AppState>> {
@@ -46,6 +51,7 @@ async fn handle_long_form(
     let mut file_data: Option<Vec<u8>> = None;
     let mut raw_hotwords: Option<String> = None;
     let mut hotwords_score: Option<f32> = None;
+    let mut num_speakers: Option<i32> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -70,6 +76,11 @@ async fn handle_long_form(
             "hotwords_score" => {
                 if let Ok(text) = field.text().await {
                     hotwords_score = text.parse().ok();
+                }
+            }
+            "num_speakers" => {
+                if let Ok(text) = field.text().await {
+                    num_speakers = text.parse::<i32>().ok().filter(|&n| n > 0);
                 }
             }
             _ => {}
@@ -124,9 +135,27 @@ async fn handle_long_form(
         }
     };
 
+    // Run diarization if the engine is loaded, then assign speakers to segments.
+    let speaker_labels: Vec<Option<i32>> = if let Some(diar_mutex) = &state.diarization_engine {
+        match diar_mutex.lock().unwrap().diarize(&pcm, num_speakers) {
+            Ok(diar_segs) => {
+                let starts: Vec<f64> = segments.iter().map(|s| s.start_secs).collect();
+                let ends: Vec<f64> = segments.iter().map(|s| s.end_secs).collect();
+                assign_speakers(&starts, &ends, &diar_segs)
+            }
+            Err(e) => {
+                error!("Diarization failed: {e}");
+                vec![None; segments.len()]
+            }
+        }
+    } else {
+        vec![None; segments.len()]
+    };
+
     let result_segments: Vec<SegmentResponse> = segments
         .iter()
-        .map(|s| SegmentResponse {
+        .zip(speaker_labels.iter())
+        .map(|(s, &speaker)| SegmentResponse {
             start: s.start_secs,
             end: s.end_secs,
             text: s.text.clone(),
@@ -136,6 +165,7 @@ async fn handle_long_form(
                 .iter()
                 .map(|&t| s.start_secs + t as f64)
                 .collect(),
+            speaker,
         })
         .collect();
 
