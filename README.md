@@ -79,6 +79,20 @@ Features:
 * Keyboard and mouse control features (press "enter", click in different parts of the screen, scrolling, etc)
 * Undo the last text input by saying "undo"
 
+## Python tooling (optional)
+
+A Python environment is only needed if you're converting NeMo checkpoints to ONNX (the `scripts/export_*.py` scripts) or running benchmarks against native NeMo implementations. The shipped Rust binaries don't need it.
+
+```sh
+uv venv .venv --python 3.12
+uv pip install -r requirements.txt
+
+# Example: download and export parakeet-unified to ONNX
+uv run scripts/export_parakeet_unified.py
+```
+
+Source checkpoints are downloaded via `huggingface_hub` into the standard HF cache at `~/.cache/huggingface/hub/`. Converted ONNX outputs land in `~/.local/share/telemuze/models/`.
+
 ## WIP
 
 - **In-process LLM inference** — While this is implemented in a basic way, making a small LLM really useful in this setting is more challenging

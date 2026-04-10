@@ -20,6 +20,8 @@ DEFAULT_OUTPUT_DIR = (
     Path.home() / ".local" / "share" / "telemuze" / "models" / "nemotron-speech-streaming-en-0.6b"
 )
 
+HF_MODEL_NAME = "nvidia/nemotron-speech-streaming-en-0.6b"
+
 
 def add_meta_data(filename: str, meta_data: Dict[str, str]):
     """Add meta data to an ONNX model. It is changed in-place."""
@@ -54,8 +56,8 @@ def main():
     parser = argparse.ArgumentParser(description="Export nemotron-speech-streaming-en-0.6b to ONNX")
     parser.add_argument(
         "--nemo-path",
-        default="/home/scott/code/nemotron-speech-streaming-en-0.6b/nemotron-speech-streaming-en-0.6b.nemo",
-        help="Path to .nemo checkpoint",
+        default=None,
+        help="Path to local .nemo checkpoint (downloads from HuggingFace if omitted)",
     )
     parser.add_argument(
         "--output-dir",
@@ -76,11 +78,14 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
-    nemo_path = args.nemo_path
-    print(f"Step 1: Loading model from {nemo_path}...")
     import nemo.collections.asr as nemo_asr
 
-    asr_model = nemo_asr.models.ASRModel.restore_from(nemo_path)
+    if args.nemo_path:
+        print(f"Step 1: Loading model from {args.nemo_path}...")
+        asr_model = nemo_asr.models.ASRModel.restore_from(args.nemo_path)
+    else:
+        print(f"Step 1: Downloading model from HuggingFace ({HF_MODEL_NAME})...")
+        asr_model = nemo_asr.models.ASRModel.from_pretrained(model_name=HF_MODEL_NAME)
     print("Model loaded.")
 
     # Save tokens

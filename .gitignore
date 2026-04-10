@@ -21,5 +21,6 @@ Cargo.lock
 # Model weights (stored in ~/.local/share/telemuze/models/)
 /models/
 
-# Python cache
+# Python venv and cache
+/.venv/
 __pycache__/
