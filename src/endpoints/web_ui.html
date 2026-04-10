@@ -135,6 +135,28 @@
     color: #4caf50;
   }
 
+  .options-row {
+    display: flex;
+    gap: 1rem;
+    margin-top: 1rem;
+    align-items: center;
+  }
+
+  .options-row label {
+    font-size: 0.85rem;
+    color: #888;
+  }
+
+  .options-row input[type="number"] {
+    background: #181a20;
+    border: 1px solid #3a3f4b;
+    border-radius: 6px;
+    color: #e0e0e0;
+    padding: 0.3rem 0.5rem;
+    width: 4rem;
+    font-size: 0.85rem;
+  }
+
   .transcript-box {
     background: #181a20;
     border: 1px solid #2a2d35;
@@ -142,10 +164,28 @@
     padding: 1.25rem;
     font-size: 0.92rem;
     line-height: 1.65;
-    white-space: pre-wrap;
-    word-wrap: break-word;
     max-height: 60vh;
     overflow-y: auto;
+  }
+
+  .segment {
+    margin-bottom: 0.6rem;
+  }
+
+  .seg-meta {
+    font-size: 0.78rem;
+    color: #6c8aff;
+    margin-bottom: 0.15rem;
+    font-family: monospace;
+  }
+
+  .seg-speaker {
+    color: #e0a040;
+    font-weight: 600;
+  }
+
+  .seg-text {
+    color: #e0e0e0;
   }
 
   .error-text {
@@ -172,6 +212,10 @@
     <div class="file-name" id="fileName"></div>
   </div>
   <input type="file" id="fileInput" accept="audio/*,video/*,.ogg,.opus,.m4a,.mp3,.wav,.flac,.webm,.mp4,.mkv">
+
+  <div class="options-row">
+    <label>Speakers: <input type="number" id="numSpeakers" min="0" max="20" value="0" title="0 = auto / no diarization"></label>
+  </div>
 
   <div class="processing" id="processing" style="display:none">
     <div class="spinner"></div>
@@ -232,6 +276,8 @@ async function handleFile(file) {
 
   const form = new FormData();
   form.append('file', file);
+  const ns = parseInt(document.getElementById('numSpeakers').value, 10);
+  if (ns > 0) form.append('num_speakers', ns.toString());
 
   try {
     const resp = await fetch('/v1/transcribe/long', { method: 'POST', body: form });
@@ -241,7 +287,7 @@ async function handleFile(file) {
     }
     const data = await resp.json();
     processing.style.display = 'none';
-    transcript.textContent = data.full_text;
+    renderSegments(data.segments || [], data.full_text);
     result.style.display = 'block';
   } catch (err) {
     processing.style.display = 'none';
@@ -250,8 +296,56 @@ async function handleFile(file) {
   }
 }
 
+function fmtTime(secs) {
+  const h = Math.floor(secs / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  const s = Math.floor(secs % 60);
+  if (h > 0) return h + ':' + String(m).padStart(2,'0') + ':' + String(s).padStart(2,'0');
+  return m + ':' + String(s).padStart(2,'0');
+}
+
+function renderSegments(segments, fallbackText) {
+  transcript.innerHTML = '';
+  if (!segments.length) {
+    transcript.textContent = fallbackText;
+    return;
+  }
+  const hasSpeakers = segments.some(s => s.speaker != null);
+  for (const seg of segments) {
+    const div = document.createElement('div');
+    div.className = 'segment';
+    let meta = '[' + fmtTime(seg.start) + ']';
+    if (hasSpeakers && seg.speaker != null) {
+      meta += ' <span class="seg-speaker">Speaker ' + (seg.speaker + 1) + '</span>';
+    }
+    const metaEl = document.createElement('div');
+    metaEl.className = 'seg-meta';
+    metaEl.innerHTML = meta;
+    div.appendChild(metaEl);
+    const textEl = document.createElement('div');
+    textEl.className = 'seg-text';
+    textEl.textContent = seg.text;
+    div.appendChild(textEl);
+    transcript.appendChild(div);
+  }
+}
+
+function getPlainText() {
+  const segs = transcript.querySelectorAll('.segment');
+  if (!segs.length) return transcript.textContent;
+  const lines = [];
+  for (const seg of segs) {
+    const meta = seg.querySelector('.seg-meta');
+    const text = seg.querySelector('.seg-text');
+    // Extract plain text from meta (strip HTML tags)
+    const metaText = meta.textContent.trim();
+    lines.push(metaText + '\n' + text.textContent);
+  }
+  return lines.join('\n\n');
+}
+
 copyBtn.addEventListener('click', () => {
-  navigator.clipboard.writeText(transcript.textContent).then(() => {
+  navigator.clipboard.writeText(getPlainText()).then(() => {
     copyBtn.textContent = 'Copied!';
     copyBtn.classList.add('copied');
     setTimeout(() => { copyBtn.textContent = 'Copy'; copyBtn.classList.remove('copied'); }, 1500);
@@ -259,7 +353,7 @@ copyBtn.addEventListener('click', () => {
 });
 
 downloadBtn.addEventListener('click', () => {
-  const blob = new Blob([transcript.textContent], { type: 'text/plain' });
+  const blob = new Blob([getPlainText()], { type: 'text/plain' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'transcript.txt';
