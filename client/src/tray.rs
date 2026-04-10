@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::sync::Mutex;
 use x11rb::atom_manager;
@@ -115,7 +116,7 @@ fn sample_bg(conn: &RustConnection, win: Window) -> (u8, u8, u8) {
 pub struct TrayHandle {
     status: std::sync::Arc<Mutex<TrayStatus>>,
     repaint_conn: std::sync::Arc<RustConnection>,
-    win: Window,
+    win: std::sync::Arc<AtomicU32>,
 }
 
 impl Clone for TrayHandle {
@@ -123,7 +124,7 @@ impl Clone for TrayHandle {
         Self {
             status: std::sync::Arc::clone(&self.status),
             repaint_conn: std::sync::Arc::clone(&self.repaint_conn),
-            win: self.win,
+            win: std::sync::Arc::clone(&self.win),
         }
     }
 }
@@ -134,14 +135,21 @@ impl TrayHandle {
         if *s != status {
             *s = status;
             drop(s);
+            let win = self.win.load(Ordering::SeqCst);
+            if win == x11rb::NONE {
+                // Not currently docked (e.g. tray manager just died); the
+                // listener will repaint after the next re-dock from the
+                // status mutex.
+                return;
+            }
             let _ = self.repaint_conn.send_event(
                 false,
-                self.win,
+                win,
                 EventMask::EXPOSURE,
                 ExposeEvent {
                     response_type: x11rb::protocol::xproto::EXPOSE_EVENT,
                     sequence: 0,
-                    window: self.win,
+                    window: win,
                     x: 0,
                     y: 0,
                     width: ICON_SIZE,
@@ -154,8 +162,11 @@ impl TrayHandle {
     }
 
     pub fn shutdown(&self) {
-        let _ = self.repaint_conn.destroy_window(self.win);
-        let _ = self.repaint_conn.flush();
+        let win = self.win.load(Ordering::SeqCst);
+        if win != x11rb::NONE {
+            let _ = self.repaint_conn.destroy_window(win);
+            let _ = self.repaint_conn.flush();
+        }
     }
 }
 
@@ -425,17 +436,33 @@ fn show_popup_menu(
 
 // ── Spawn tray ───────────────────────────────────────────────────────────
 
-pub fn spawn_tray(
-    tx: mpsc::SyncSender<crate::Event>,
-    initial: TrayStatus,
-) -> anyhow::Result<TrayHandle> {
-    let (conn, screen_num) =
-        RustConnection::connect(None).map_err(|e| anyhow::anyhow!("X11 connect: {e}"))?;
-    let screen = conn.setup().roots[screen_num].clone();
-    let atoms = Atoms::new(&conn)?.reply()?;
-    let depth = screen.root_depth;
+/// Per-dock state. Recreated from scratch on every (re)dock — never
+/// reused across a tray-manager change.
+struct IconWindow {
+    win: Window,
+    gc: Gcontext,
+    /// The tray manager window we docked into. We watch this for
+    /// `DestroyNotify` so we can react to the manager dying even if no
+    /// new manager has yet broadcast `MANAGER`.
+    manager: Window,
+    win_w: u16,
+    win_h: u16,
+    /// Cached background sample of the parent (the manager's container).
+    /// Reset on `ConfigureNotify`, `ReparentNotify`, and on every redock.
+    cached_bg: Option<(u8, u8, u8)>,
+    /// Icons composited against the current `cached_bg`.
+    composited: Vec<(TrayStatus, Vec<u8>)>,
+}
 
-    // Find the system tray manager
+/// Look up the current tray manager, create a fresh icon window, dock it,
+/// and start watching the manager for `DestroyNotify`. Returns `Err` if no
+/// tray manager currently owns `_NET_SYSTEM_TRAY_S0`.
+fn create_and_dock(
+    conn: &RustConnection,
+    screen: &x11rb::protocol::xproto::Screen,
+    atoms: &Atoms,
+    depth: u8,
+) -> anyhow::Result<IconWindow> {
     let tray_owner = conn
         .get_selection_owner(atoms._NET_SYSTEM_TRAY_S0)?
         .reply()?
@@ -496,49 +523,111 @@ pub fn spawn_tray(
             ]),
         },
     )?;
-    conn.flush()?;
 
-    // Create a GC for drawing
+    // Watch the manager for DestroyNotify. Mirrors Qt's
+    // qxcbsystemtraytracker.cpp xcb_change_window_attributes on m_trayWindow.
+    conn.change_window_attributes(
+        tray_owner,
+        &ChangeWindowAttributesAux::default().event_mask(EventMask::STRUCTURE_NOTIFY),
+    )?;
+
     let gc = conn.generate_id()?;
     conn.create_gc(gc, win, &CreateGCAux::default())?;
+
+    conn.flush()?;
+
+    Ok(IconWindow {
+        win,
+        gc,
+        manager: tray_owner,
+        win_w: ICON_SIZE,
+        win_h: ICON_SIZE,
+        cached_bg: None,
+        composited: Vec::new(),
+    })
+}
+
+pub fn spawn_tray(
+    tx: mpsc::SyncSender<crate::Event>,
+    initial: TrayStatus,
+) -> anyhow::Result<TrayHandle> {
+    let (conn, screen_num) =
+        RustConnection::connect(None).map_err(|e| anyhow::anyhow!("X11 connect: {e}"))?;
+    let screen = conn.setup().roots[screen_num].clone();
+    let atoms = Atoms::new(&conn)?.reply()?;
+    let depth = screen.root_depth;
+
+    // Subscribe to MANAGER ClientMessage broadcasts. The XEmbed system
+    // tray spec sends MANAGER to the root window with mask=StructureNotify
+    // when a new tray manager claims the selection — without this we'd
+    // never re-dock after a panel restart or monitor switch.
+    conn.change_window_attributes(
+        screen.root,
+        &ChangeWindowAttributesAux::default().event_mask(EventMask::STRUCTURE_NOTIFY),
+    )?;
+
+    let initial_icon = create_and_dock(&conn, &screen, &atoms, depth)?;
 
     // Open a second connection for sending repaint signals from other threads
     let (repaint_conn, _) =
         RustConnection::connect(None).map_err(|e| anyhow::anyhow!("X11 connect: {e}"))?;
 
     let status = std::sync::Arc::new(Mutex::new(initial));
+    let win_atomic = std::sync::Arc::new(AtomicU32::new(initial_icon.win));
     let handle = TrayHandle {
         status: std::sync::Arc::clone(&status),
         repaint_conn: std::sync::Arc::new(repaint_conn),
-        win,
+        win: std::sync::Arc::clone(&win_atomic),
     };
 
     std::thread::spawn(move || {
-        let mut win_w = ICON_SIZE;
-        let mut win_h = ICON_SIZE;
-        // Cache composited icons keyed by background color
-        let mut cached_bg: Option<(u8, u8, u8)> = None;
-        let mut composited: Vec<(TrayStatus, Vec<u8>)> = Vec::new();
+        listener_loop(conn, screen, atoms, depth, status, win_atomic, tx, initial_icon);
+    });
 
-        loop {
-            let event = match conn.wait_for_event() {
-                Ok(e) => e,
-                Err(_) => break,
-            };
-            match event {
-                Event::ConfigureNotify(ev) => {
-                    win_w = ev.width;
-                    win_h = ev.height;
-                    // Background may change on reparent/resize
-                    cached_bg = None;
+    Ok(handle)
+}
+
+fn listener_loop(
+    conn: RustConnection,
+    screen: x11rb::protocol::xproto::Screen,
+    atoms: Atoms,
+    depth: u8,
+    status: std::sync::Arc<Mutex<TrayStatus>>,
+    win_atomic: std::sync::Arc<AtomicU32>,
+    tx: mpsc::SyncSender<crate::Event>,
+    initial_icon: IconWindow,
+) {
+    let mut current: Option<IconWindow> = Some(initial_icon);
+
+    loop {
+        let event = match conn.wait_for_event() {
+            Ok(e) => e,
+            Err(_) => break,
+        };
+        match event {
+            Event::ConfigureNotify(ev) => {
+                if let Some(icon) = current.as_mut() {
+                    if ev.window == icon.win {
+                        icon.win_w = ev.width;
+                        icon.win_h = ev.height;
+                        icon.cached_bg = None;
+                    }
                 }
-                Event::Expose(ev) if ev.count == 0 => {
+            }
+            Event::Expose(ev) if ev.count == 0 => {
+                if let Some(icon) = current.as_mut() {
+                    if ev.window != icon.win {
+                        continue;
+                    }
                     let s = *status.lock().unwrap();
+                    let win = icon.win;
+                    let gc = icon.gc;
+                    let win_w = icon.win_w;
+                    let win_h = icon.win_h;
 
-                    // Sample background and composite icons if needed
                     let bg = sample_bg(&conn, win);
-                    if cached_bg != Some(bg) {
-                        composited = [
+                    if icon.cached_bg != Some(bg) {
+                        icon.composited = [
                             TrayStatus::Idle,
                             TrayStatus::Sleeping,
                             TrayStatus::Listening,
@@ -550,15 +639,13 @@ pub fn spawn_tray(
                         .iter()
                         .map(|&st| (st, composite_icon(icon_rgba(st), bg.0, bg.1, bg.2)))
                         .collect();
-                        cached_bg = Some(bg);
+                        icon.cached_bg = Some(bg);
                     }
 
-                    let data = &composited.iter().find(|(st, _)| *st == s).unwrap().1;
+                    let data = &icon.composited.iter().find(|(st, _)| *st == s).unwrap().1;
 
-                    // Clear window to parent background
                     let _ = conn.clear_area(false, win, 0, 0, win_w, win_h);
 
-                    // Blit icon centered
                     let ox = (win_w as i16 - ICON_SIZE as i16) / 2;
                     let oy = (win_h as i16 - ICON_SIZE as i16) / 2;
                     let _ = conn.put_image(
@@ -575,33 +662,82 @@ pub fn spawn_tray(
                     );
                     let _ = conn.flush();
                 }
-                Event::ButtonPress(ev) => {
-                    if ev.detail == 1 {
-                        let _ = tx.send(crate::Event::Ipc(IpcCommand::Toggle));
-                    } else if ev.detail == 3 {
-                        if let Some(action) =
-                            show_popup_menu(&conn, &screen, ev.root_x, ev.root_y)
-                        {
-                            let cmd = match action {
-                                MenuAction::CopyLast => IpcCommand::CopyLast,
-                                MenuAction::Toggle => IpcCommand::Toggle,
-                                MenuAction::Exit => IpcCommand::Stop,
-                            };
-                            let _ = tx.send(crate::Event::Ipc(cmd));
-                        }
-                        // Force tray icon repaint — Expose events were consumed
-                        // by the popup's nested event loop.
-                        let _ = conn.clear_area(true, win, 0, 0, win_w, win_h);
+            }
+            Event::ButtonPress(ev) => {
+                let icon_win = current.as_ref().map(|i| i.win);
+                if Some(ev.event) != icon_win {
+                    continue;
+                }
+                if ev.detail == 1 {
+                    let _ = tx.send(crate::Event::Ipc(IpcCommand::Toggle));
+                } else if ev.detail == 3 {
+                    if let Some(action) =
+                        show_popup_menu(&conn, &screen, ev.root_x, ev.root_y)
+                    {
+                        let cmd = match action {
+                            MenuAction::CopyLast => IpcCommand::CopyLast,
+                            MenuAction::Toggle => IpcCommand::Toggle,
+                            MenuAction::Exit => IpcCommand::Stop,
+                        };
+                        let _ = tx.send(crate::Event::Ipc(cmd));
+                    }
+                    // Force tray icon repaint — Expose events were consumed
+                    // by the popup's nested event loop.
+                    if let Some(icon) = current.as_ref() {
+                        let _ = conn.clear_area(true, icon.win, 0, 0, icon.win_w, icon.win_h);
                         let _ = conn.flush();
                     }
                 }
-                Event::DestroyNotify(ev) if ev.window == win => {
-                    break;
-                }
-                _ => {}
             }
+            Event::ClientMessage(ev) => {
+                if ev.type_ == atoms.MANAGER {
+                    let data = ev.data.as_data32();
+                    if data[1] == atoms._NET_SYSTEM_TRAY_S0 {
+                        // A new tray manager has claimed the selection.
+                        // Tear down whatever we have and re-dock to it.
+                        if let Some(old) = current.take() {
+                            let _ = conn.destroy_window(old.win);
+                            let _ = conn.free_gc(old.gc);
+                            let _ = conn.flush();
+                        }
+                        win_atomic.store(x11rb::NONE, Ordering::SeqCst);
+                        match create_and_dock(&conn, &screen, &atoms, depth) {
+                            Ok(new_icon) => {
+                                win_atomic.store(new_icon.win, Ordering::SeqCst);
+                                current = Some(new_icon);
+                            }
+                            Err(_) => {
+                                // No owner yet — wait for the next MANAGER.
+                            }
+                        }
+                    }
+                }
+            }
+            Event::DestroyNotify(ev) => {
+                let matches_win = current.as_ref().map(|i| i.win) == Some(ev.window);
+                let matches_mgr = current.as_ref().map(|i| i.manager) == Some(ev.window);
+                if matches_win || matches_mgr {
+                    if let Some(old) = current.take() {
+                        // The window is already gone server-side — don't
+                        // call destroy_window. The GC outlives its window
+                        // so we can free it cleanly.
+                        let _ = conn.free_gc(old.gc);
+                        let _ = conn.flush();
+                    }
+                    win_atomic.store(x11rb::NONE, Ordering::SeqCst);
+                    // Wait for MANAGER broadcast from the next manager.
+                }
+            }
+            Event::ReparentNotify(ev) => {
+                if let Some(icon) = current.as_mut() {
+                    if ev.window == icon.win {
+                        icon.cached_bg = None;
+                        let _ = conn.clear_area(true, icon.win, 0, 0, icon.win_w, icon.win_h);
+                        let _ = conn.flush();
+                    }
+                }
+            }
+            _ => {}
         }
-    });
-
-    Ok(handle)
+    }
 }
