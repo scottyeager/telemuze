@@ -1,0 +1,16 @@
+[package]
+name = "telemuze-dist"
+version = "0.1.0"
+edition = "2021"
+description = "Self-contained distribution binary for telemuze (embeds server + shared libraries)"
+
+[[bin]]
+name = "telemuze-dist"
+path = "src/main.rs"
+
+[build-dependencies]
+flate2 = "1"
+
+[dependencies]
+flate2 = "1"
+libc = "0.2"
