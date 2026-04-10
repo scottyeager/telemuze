@@ -126,21 +126,23 @@ const PYANNOTE_SEG: ModelInfo = ModelInfo {
     files: PYANNOTE_SEG_FILES,
 };
 
-// NeMo TitaNet Small — speaker embedding extractor for diarization clustering.
+// 3DSpeaker CAM++ — speaker embedding extractor for diarization clustering.
+// Trained on VoxCeleb (English). Smaller than TitaNet small (~28MB) and
+// more discriminative on conversational audio.
 // Hosted on k2-fsa/sherpa-onnx GitHub releases.
-const TITANET_SMALL_FILES: &[ModelFile] = &[ModelFile {
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx",
-    filename: "nemo_en_titanet_small.onnx",
+const CAMPP_FILES: &[ModelFile] = &[ModelFile {
+    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
+    filename: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
 }];
 
-const TITANET_SMALL: ModelInfo = ModelInfo {
-    id: "nemo-titanet-small",
-    name: "NeMo TitaNet Small (speaker embedding)",
-    dirname: "nemo_en_titanet_small.onnx",
+const CAMPP: ModelInfo = ModelInfo {
+    id: "3dspeaker-campplus-en",
+    name: "3DSpeaker CAM++ EN (speaker embedding)",
+    dirname: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
     is_directory: false,
     kind: ModelKind::Diarization,
     is_downloaded: false,
-    files: TITANET_SMALL_FILES,
+    files: CAMPP_FILES,
 };
 
 // Qwen3.5-0.8B GGUF — quantized by lmstudio-community
@@ -185,7 +187,7 @@ fn default_models() -> HashMap<&'static str, ModelInfo> {
     m.insert(PARAKEET.id, PARAKEET);
     m.insert(SILERO_VAD.id, SILERO_VAD);
     m.insert(PYANNOTE_SEG.id, PYANNOTE_SEG);
-    m.insert(TITANET_SMALL.id, TITANET_SMALL);
+    m.insert(CAMPP.id, CAMPP);
     m.insert(QWEN_0_8B.id, QWEN_0_8B);
     m.insert(QWEN_2B.id, QWEN_2B);
     m
@@ -264,18 +266,15 @@ impl ModelManager {
         Ok(self.models_dir.join(info.dirname))
     }
 
-    /// Check whether all required models (at least one STT + one VAD) are
-    /// present on disk. LLM is optional (native inference is not required
-    /// when an HTTP backend is configured).
+    /// Check whether all required non-LLM models are present on disk.
+    /// LLM is optional (native inference is not required when an HTTP
+    /// backend is configured).
     pub fn all_models_available(&self) -> bool {
         let models = self.models.lock().unwrap();
-        let has_stt = models
+        models
             .values()
-            .any(|m| matches!(m.kind, ModelKind::Stt) && m.is_downloaded);
-        let has_vad = models
-            .values()
-            .any(|m| matches!(m.kind, ModelKind::Vad) && m.is_downloaded);
-        has_stt && has_vad
+            .filter(|m| !matches!(m.kind, ModelKind::Llm))
+            .all(|m| m.is_downloaded)
     }
 
     /// Download a specific LLM model if not already present.

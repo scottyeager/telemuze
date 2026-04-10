@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tracing::{error, info};
 
 use crate::audio;
-use crate::engines::diarization::assign_speakers;
+use crate::engines::diarization::split_by_speakers;
 use crate::state::AppState;
 
 #[derive(Serialize)]
@@ -135,41 +135,71 @@ async fn handle_long_form(
         }
     };
 
-    // Run diarization if the engine is loaded, then assign speakers to segments.
-    let speaker_labels: Vec<Option<i32>> = if let Some(diar_mutex) = &state.diarization_engine {
+    // Run diarization if the engine is loaded, then split ASR segments at
+    // speaker-change boundaries using per-token timestamps.
+    let diar_segs_opt = if let Some(diar_mutex) = &state.diarization_engine {
         match diar_mutex.lock().unwrap().diarize(&pcm, num_speakers) {
-            Ok(diar_segs) => {
-                let starts: Vec<f64> = segments.iter().map(|s| s.start_secs).collect();
-                let ends: Vec<f64> = segments.iter().map(|s| s.end_secs).collect();
-                assign_speakers(&starts, &ends, &diar_segs)
+            Ok(d) => {
+                let n_spk = d.iter().map(|s| s.speaker).max().map(|m| m + 1).unwrap_or(0);
+                info!("Diarization: {} segments, {} unique speakers", d.len(), n_spk);
+                // Per-speaker total duration so we can see if one speaker is
+                // dominating the output even when both should be present.
+                let mut totals: std::collections::BTreeMap<i32, f64> = Default::default();
+                for s in &d {
+                    *totals.entry(s.speaker).or_insert(0.0) += (s.end - s.start) as f64;
+                }
+                for (spk, dur) in &totals {
+                    info!("  speaker {}: {:.1}s total", spk, dur);
+                }
+                for (i, s) in d.iter().enumerate() {
+                    info!("  diar[{}]: [{:.2}s - {:.2}s] speaker {}", i, s.start, s.end, s.speaker);
+                }
+                Some(d)
             }
             Err(e) => {
                 error!("Diarization failed: {e}");
-                vec![None; segments.len()]
+                None
             }
         }
     } else {
-        vec![None; segments.len()]
+        None
     };
 
-    let result_segments: Vec<SegmentResponse> = segments
-        .iter()
-        .zip(speaker_labels.iter())
-        .map(|(s, &speaker)| SegmentResponse {
-            start: s.start_secs,
-            end: s.end_secs,
-            text: s.text.clone(),
-            tokens: s.tokens.clone(),
-            token_timestamps: s
-                .token_timestamps
-                .iter()
-                .map(|&t| s.start_secs + t as f64)
-                .collect(),
-            speaker,
-        })
-        .collect();
+    let result_segments: Vec<SegmentResponse> = if let Some(diar_segs) = &diar_segs_opt {
+        split_by_speakers(&segments, diar_segs)
+            .into_iter()
+            .map(|s| SegmentResponse {
+                start: s.start,
+                end: s.end,
+                text: s.text,
+                tokens: s.tokens,
+                token_timestamps: s.token_timestamps,
+                speaker: s.speaker,
+            })
+            .collect()
+    } else {
+        segments
+            .iter()
+            .map(|s| SegmentResponse {
+                start: s.start_secs,
+                end: s.end_secs,
+                text: s.text.clone(),
+                tokens: s.tokens.clone(),
+                token_timestamps: s
+                    .token_timestamps
+                    .iter()
+                    .map(|&t| s.start_secs + t as f64)
+                    .collect(),
+                speaker: None,
+            })
+            .collect()
+    };
 
-    let full_text: String = segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
+    let full_text: String = result_segments
+        .iter()
+        .map(|s| s.text.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
     info!(
         "Long-form transcription complete: {} segments, {} chars",
         result_segments.len(),

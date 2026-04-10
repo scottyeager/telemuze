@@ -161,22 +161,31 @@ impl AppState {
             (Some(seg), Some(emb)) => (seg.clone(), emb.clone()),
             (None, None) => {
                 // Fall back to well-known filenames in the models directory.
+                // Prefer CAM++ embeddings (more discriminative); fall back
+                // to TitaNet small if a user has it from an earlier install.
                 let models_dir = mgr.models_dir();
                 let seg = models_dir.join("pyannote-segmentation-3-0.int8.onnx");
-                let emb = models_dir.join("nemo_en_titanet_small.onnx");
-                if seg.exists() && emb.exists() {
-                    (seg, emb)
+                let campp = models_dir.join("3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx");
+                let titanet = models_dir.join("nemo_en_titanet_small.onnx");
+                let emb = if campp.exists() {
+                    campp
+                } else if titanet.exists() {
+                    titanet
                 } else {
                     info!(
-                        "Diarization models not found in {} — speaker labels disabled. \
-                         To enable, place pyannote-segmentation-3-0.int8.onnx and \
-                         nemo_en_titanet_small.onnx in the models directory, or set \
-                         --diarization-segmentation-model-path and \
-                         --diarization-embedding-model-path.",
+                        "Diarization embedding model not found in {} — speaker labels disabled.",
+                        models_dir.display()
+                    );
+                    return None;
+                };
+                if !seg.exists() {
+                    info!(
+                        "Diarization segmentation model not found in {} — speaker labels disabled.",
                         models_dir.display()
                     );
                     return None;
                 }
+                (seg, emb)
             }
             _ => {
                 warn!(
