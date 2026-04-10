@@ -135,28 +135,6 @@
     color: #4caf50;
   }
 
-  .options-row {
-    display: flex;
-    gap: 1rem;
-    margin-top: 1rem;
-    align-items: center;
-  }
-
-  .options-row label {
-    font-size: 0.85rem;
-    color: #888;
-  }
-
-  .options-row input[type="number"] {
-    background: #181a20;
-    border: 1px solid #3a3f4b;
-    border-radius: 6px;
-    color: #e0e0e0;
-    padding: 0.3rem 0.5rem;
-    width: 4rem;
-    font-size: 0.85rem;
-  }
-
   .transcript-box {
     background: #181a20;
     border: 1px solid #2a2d35;
@@ -212,10 +190,6 @@
     <div class="file-name" id="fileName"></div>
   </div>
   <input type="file" id="fileInput" accept="audio/*,video/*,.ogg,.opus,.m4a,.mp3,.wav,.flac,.webm,.mp4,.mkv">
-
-  <div class="options-row">
-    <label>Speakers: <input type="number" id="numSpeakers" min="0" max="20" value="0" title="0 = auto / no diarization"></label>
-  </div>
 
   <div class="processing" id="processing" style="display:none">
     <div class="spinner"></div>
@@ -276,8 +250,6 @@ async function handleFile(file) {
 
   const form = new FormData();
   form.append('file', file);
-  const ns = parseInt(document.getElementById('numSpeakers').value, 10);
-  if (ns > 0) form.append('num_speakers', ns.toString());
 
   try {
     const resp = await fetch('/v1/transcribe/long', { method: 'POST', body: form });

@@ -1,11 +1,10 @@
-use anyhow::{Context, Result};
-use sherpa_onnx::{
-    OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
-    OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
-    SpeakerEmbeddingExtractorConfig,
-};
-use std::path::Path;
-use tracing::info;
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::Command;
+use tempfile::NamedTempFile;
+use tracing::debug;
 
 /// A single diarization segment with a 0-based speaker label.
 pub struct DiarSegment {
@@ -14,73 +13,100 @@ pub struct DiarSegment {
     pub speaker: i32,
 }
 
-/// Wraps the sherpa-onnx offline speaker diarization pipeline
-/// (pyannote segmentation → embedding → agglomerative clustering).
+/// Wire format for a single segment as emitted by the
+/// `telemuze-diarize` subprocess on stdout.
+#[derive(Deserialize)]
+struct WireSegment {
+    start: f64,
+    end: f64,
+    speaker: i32,
+}
+
+#[derive(Deserialize)]
+struct WireOutput {
+    segments: Vec<WireSegment>,
+}
+
+/// Diarization engine that delegates to a one-shot `telemuze-diarize`
+/// subprocess. The subprocess loads the Sortformer ONNX model, runs
+/// inference on a raw PCM tempfile, prints JSON to stdout, and exits —
+/// keeping the 492 MB model out of the always-on server's address space.
 pub struct DiarizationEngine {
-    diarizer: OfflineSpeakerDiarization,
-    /// Baseline config stored so we can update clustering params between calls
-    /// without touching the already-loaded model paths.
-    config: OfflineSpeakerDiarizationConfig,
+    binary_path: PathBuf,
+    model_path: PathBuf,
 }
 
 impl DiarizationEngine {
-    pub fn new(segmentation_model: &Path, embedding_model: &Path) -> Result<Self> {
-        let config = OfflineSpeakerDiarizationConfig {
-            segmentation: OfflineSpeakerSegmentationModelConfig {
-                pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
-                    model: Some(segmentation_model.to_string_lossy().into_owned()),
-                },
-                ..Default::default()
-            },
-            embedding: SpeakerEmbeddingExtractorConfig {
-                model: Some(embedding_model.to_string_lossy().into_owned()),
-                ..Default::default()
-            },
-            // clustering defaults: num_clusters=-1 (auto), threshold=0.5
-            ..Default::default()
-        };
-
-        let diarizer = OfflineSpeakerDiarization::create(&config)
-            .context("Failed to create OfflineSpeakerDiarization")?;
-
-        info!("Diarization engine ready (sample_rate={}Hz)", diarizer.sample_rate());
-
-        Ok(Self { diarizer, config })
+    pub fn new(binary_path: PathBuf, model_path: PathBuf) -> Self {
+        Self {
+            binary_path,
+            model_path,
+        }
     }
 
-    /// Diarize mono 16 kHz PCM. Pass `num_speakers` when known to skip
-    /// threshold-based automatic estimation.
-    pub fn diarize(&self, pcm: &[f32], num_speakers: Option<i32>) -> Result<Vec<DiarSegment>> {
-        // Rebuild clustering config, swapping in num_clusters if provided.
-        // set_config only touches clustering params on the already-loaded session.
-        if let Some(n) = num_speakers {
-            info!("Diarization: forcing num_speakers={}", n);
-            let mut config = self.config.clone();
-            config.clustering.num_clusters = n;
-            self.diarizer.set_config(&config);
-        } else {
-            info!("Diarization: auto mode (threshold-based clustering)");
-            // Reset to auto mode in case a prior call set num_clusters.
-            self.diarizer.set_config(&self.config);
+    /// Run diarization on mono 16 kHz f32 PCM. Spawns the diarize binary
+    /// once and returns when it exits.
+    pub fn diarize(&self, pcm: &[f32]) -> Result<Vec<DiarSegment>> {
+        // 1. Materialize PCM as a tempfile of raw f32-LE bytes.
+        let mut tmp = NamedTempFile::new().context("Failed to create PCM tempfile")?;
+        let mut bytes = Vec::with_capacity(pcm.len() * 4);
+        for sample in pcm {
+            bytes.extend_from_slice(&sample.to_le_bytes());
         }
+        tmp.write_all(&bytes)
+            .context("Failed to write PCM tempfile")?;
+        tmp.flush().context("Failed to flush PCM tempfile")?;
 
-        let result = self
-            .diarizer
-            .process(pcm)
-            .context("Diarization returned no result")?;
-
-        info!(
-            "Diarization: {} speaker(s), {} segments",
-            result.num_speakers(),
-            result.num_segments()
+        debug!(
+            "Spawning {} for {} samples ({:.2}s)",
+            self.binary_path.display(),
+            pcm.len(),
+            pcm.len() as f64 / 16_000.0
         );
 
-        Ok(result
-            .sort_by_start_time()
+        // 2. Spawn the subprocess and read it to completion.
+        let output = Command::new(&self.binary_path)
+            .arg("--model")
+            .arg(&self.model_path)
+            .arg("--pcm")
+            .arg(tmp.path())
+            .output()
+            .with_context(|| {
+                format!(
+                    "Failed to spawn diarize binary: {}",
+                    self.binary_path.display()
+                )
+            })?;
+
+        // Forward subprocess stderr into our tracing pipeline so it lands
+        // in journalctl alongside everything else.
+        if !output.stderr.is_empty() {
+            for line in String::from_utf8_lossy(&output.stderr).lines() {
+                debug!("diarize: {}", line);
+            }
+        }
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "telemuze-diarize exited with status {}: {}",
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        // 3. Parse stdout as JSON.
+        let stdout = std::str::from_utf8(&output.stdout)
+            .context("telemuze-diarize stdout was not valid UTF-8")?;
+        let parsed: WireOutput = serde_json::from_str(stdout.trim())
+            .context("Failed to parse telemuze-diarize JSON output")?;
+
+        Ok(parsed
+            .segments
             .into_iter()
             .map(|s| DiarSegment {
-                start: s.start,
-                end: s.end,
+                start: s.start as f32,
+                end: s.end as f32,
                 speaker: s.speaker,
             })
             .collect())

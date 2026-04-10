@@ -51,7 +51,6 @@ async fn handle_long_form(
     let mut file_data: Option<Vec<u8>> = None;
     let mut raw_hotwords: Option<String> = None;
     let mut hotwords_score: Option<f32> = None;
-    let mut num_speakers: Option<i32> = None;
 
     while let Ok(Some(field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
@@ -76,11 +75,6 @@ async fn handle_long_form(
             "hotwords_score" => {
                 if let Ok(text) = field.text().await {
                     hotwords_score = text.parse().ok();
-                }
-            }
-            "num_speakers" => {
-                if let Ok(text) = field.text().await {
-                    num_speakers = text.parse::<i32>().ok().filter(|&n| n > 0);
                 }
             }
             _ => {}
@@ -137,23 +131,11 @@ async fn handle_long_form(
 
     // Run diarization if the engine is loaded, then split ASR segments at
     // speaker-change boundaries using per-token timestamps.
-    let diar_segs_opt = if let Some(diar_mutex) = &state.diarization_engine {
-        match diar_mutex.lock().unwrap().diarize(&pcm, num_speakers) {
+    let diar_segs_opt = if let Some(diar) = &state.diarization_engine {
+        match diar.diarize(&pcm) {
             Ok(d) => {
                 let n_spk = d.iter().map(|s| s.speaker).max().map(|m| m + 1).unwrap_or(0);
                 info!("Diarization: {} segments, {} unique speakers", d.len(), n_spk);
-                // Per-speaker total duration so we can see if one speaker is
-                // dominating the output even when both should be present.
-                let mut totals: std::collections::BTreeMap<i32, f64> = Default::default();
-                for s in &d {
-                    *totals.entry(s.speaker).or_insert(0.0) += (s.end - s.start) as f64;
-                }
-                for (spk, dur) in &totals {
-                    info!("  speaker {}: {:.1}s total", spk, dur);
-                }
-                for (i, s) in d.iter().enumerate() {
-                    info!("  diar[{}]: [{:.2}s - {:.2}s] speaker {}", i, s.start, s.end, s.speaker);
-                }
                 Some(d)
             }
             Err(e) => {

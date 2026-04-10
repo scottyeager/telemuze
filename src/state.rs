@@ -1,7 +1,8 @@
 use anyhow::Result;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Mutex;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use crate::config::Config;
 use crate::engines::diarization::DiarizationEngine;
@@ -31,8 +32,10 @@ pub struct AppState {
     pub stt_engine: Mutex<SttEngine>,
     pub llm_engine: LlmEngine,
     pub vad_engine: Mutex<VadEngine>,
-    /// Present when diarization model files are found at startup.
-    pub diarization_engine: Option<Mutex<DiarizationEngine>>,
+    /// Present when both the diarize subprocess binary and the Sortformer
+    /// model file are located at startup. The engine is internally
+    /// stateless (each call spawns a fresh subprocess), so no Mutex.
+    pub diarization_engine: Option<DiarizationEngine>,
     pub terms_content: String,
     pub dictionary: Dictionary,
     pub pipeline_config: PipelineConfig,
@@ -144,7 +147,7 @@ impl AppState {
             stt_engine: Mutex::new(stt_engine),
             llm_engine,
             vad_engine: Mutex::new(vad_engine),
-            diarization_engine: diarization_engine.map(Mutex::new),
+            diarization_engine,
             terms_content,
             dictionary,
             pipeline_config,
@@ -154,59 +157,37 @@ impl AppState {
     }
 
     fn load_diarization_engine(config: &Config, mgr: &ModelManager) -> Option<DiarizationEngine> {
-        let (seg_path, emb_path) = match (
-            config.diarization_segmentation_model_path.as_ref(),
-            config.diarization_embedding_model_path.as_ref(),
-        ) {
-            (Some(seg), Some(emb)) => (seg.clone(), emb.clone()),
-            (None, None) => {
-                // Fall back to well-known filenames in the models directory.
-                // Prefer CAM++ embeddings (more discriminative); fall back
-                // to TitaNet small if a user has it from an earlier install.
-                let models_dir = mgr.models_dir();
-                let seg = models_dir.join("pyannote-segmentation-3-0.int8.onnx");
-                let campp = models_dir.join("3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx");
-                let titanet = models_dir.join("nemo_en_titanet_small.onnx");
-                let emb = if campp.exists() {
-                    campp
-                } else if titanet.exists() {
-                    titanet
-                } else {
-                    info!(
-                        "Diarization embedding model not found in {} — speaker labels disabled.",
-                        models_dir.display()
-                    );
-                    return None;
-                };
-                if !seg.exists() {
-                    info!(
-                        "Diarization segmentation model not found in {} — speaker labels disabled.",
-                        models_dir.display()
-                    );
-                    return None;
-                }
-                (seg, emb)
-            }
-            _ => {
-                warn!(
-                    "Diarization requires both --diarization-segmentation-model-path and \
-                     --diarization-embedding-model-path; skipping diarization."
-                );
+        let binary_path = match locate_diarize_binary(config) {
+            Some(p) => p,
+            None => {
+                info!("telemuze-diarize binary not found — speaker labels disabled.");
                 return None;
             }
         };
 
-        info!(
-            "Loading diarization models: segmentation={:?}, embedding={:?}",
-            seg_path, emb_path
-        );
-        match DiarizationEngine::new(&seg_path, &emb_path) {
-            Ok(engine) => Some(engine),
-            Err(e) => {
-                warn!("Failed to initialize diarization engine: {e} — speaker labels disabled");
-                None
+        let model_path = match config.diarization_model_path.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                let p = mgr
+                    .models_dir()
+                    .join("diar_streaming_sortformer_4spk-v2.1.onnx");
+                if !p.exists() {
+                    info!(
+                        "Diarization model not found at {} — speaker labels disabled.",
+                        p.display()
+                    );
+                    return None;
+                }
+                p
             }
-        }
+        };
+
+        info!(
+            "Diarization configured (binary={}, model={})",
+            binary_path.display(),
+            model_path.display()
+        );
+        Some(DiarizationEngine::new(binary_path, model_path))
     }
 
     /// Run VAD segmentation followed by per-segment STT transcription.
@@ -296,4 +277,39 @@ impl AppState {
             }
         }
     }
+}
+
+/// Locate the `telemuze-diarize` subprocess binary.
+///
+/// Search order:
+/// 1. Explicit `--diarize-binary` / `TELEMUZE_DIARIZE_BINARY` override.
+/// 2. Sibling of the running `telemuze` binary (matches Cargo's
+///    `target/{debug,release}/` layout and any reasonable install layout).
+/// 3. PATH lookup.
+fn locate_diarize_binary(config: &Config) -> Option<PathBuf> {
+    if let Some(p) = &config.diarize_binary {
+        return if p.exists() { Some(p.clone()) } else { None };
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("telemuze-diarize");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+        }
+    }
+    which_in_path("telemuze-diarize")
+}
+
+/// Minimal PATH walker — looks for an executable file with the given
+/// name in each `PATH` entry. Avoids pulling in the `which` crate.
+fn which_in_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
 }

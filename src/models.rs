@@ -109,40 +109,24 @@ const SILERO_VAD: ModelInfo = ModelInfo {
     files: SILERO_VAD_FILES,
 };
 
-// Pyannote segmentation 3.0 (int8) — exported by csukuangfj for sherpa-onnx
-// Used for speaker diarization (segmentation step).
-const PYANNOTE_SEG_FILES: &[ModelFile] = &[ModelFile {
-    url: "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.int8.onnx",
-    filename: "pyannote-segmentation-3-0.int8.onnx",
+// NVIDIA Sortformer v2.1 (4 speaker, streaming) — community ONNX export.
+// NVIDIA's official ONNX export is broken; this build is from
+// huggingface.co/altunenes/parakeet-rs and is the model the parakeet-rs
+// crate is tuned against. Used by the telemuze-diarize subprocess.
+// Supports up to 4 speakers; requires ~492 MB on disk.
+const SORTFORMER_FILES: &[ModelFile] = &[ModelFile {
+    url: "https://huggingface.co/altunenes/parakeet-rs/resolve/main/diar_streaming_sortformer_4spk-v2.1.onnx",
+    filename: "diar_streaming_sortformer_4spk-v2.1.onnx",
 }];
 
-const PYANNOTE_SEG: ModelInfo = ModelInfo {
-    id: "pyannote-segmentation-3-0",
-    name: "Pyannote Segmentation 3.0 (int8)",
-    dirname: "pyannote-segmentation-3-0.int8.onnx",
+const SORTFORMER: ModelInfo = ModelInfo {
+    id: "sortformer-v2.1-4spk",
+    name: "NVIDIA Sortformer v2.1 (4 speaker)",
+    dirname: "diar_streaming_sortformer_4spk-v2.1.onnx",
     is_directory: false,
     kind: ModelKind::Diarization,
     is_downloaded: false,
-    files: PYANNOTE_SEG_FILES,
-};
-
-// 3DSpeaker CAM++ — speaker embedding extractor for diarization clustering.
-// Trained on VoxCeleb (English). Smaller than TitaNet small (~28MB) and
-// more discriminative on conversational audio.
-// Hosted on k2-fsa/sherpa-onnx GitHub releases.
-const CAMPP_FILES: &[ModelFile] = &[ModelFile {
-    url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
-    filename: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
-}];
-
-const CAMPP: ModelInfo = ModelInfo {
-    id: "3dspeaker-campplus-en",
-    name: "3DSpeaker CAM++ EN (speaker embedding)",
-    dirname: "3dspeaker_speech_campplus_sv_en_voxceleb_16k.onnx",
-    is_directory: false,
-    kind: ModelKind::Diarization,
-    is_downloaded: false,
-    files: CAMPP_FILES,
+    files: SORTFORMER_FILES,
 };
 
 // Qwen3.5-0.8B GGUF — quantized by lmstudio-community
@@ -186,8 +170,7 @@ fn default_models() -> HashMap<&'static str, ModelInfo> {
     let mut m = HashMap::new();
     m.insert(PARAKEET.id, PARAKEET);
     m.insert(SILERO_VAD.id, SILERO_VAD);
-    m.insert(PYANNOTE_SEG.id, PYANNOTE_SEG);
-    m.insert(CAMPP.id, CAMPP);
+    m.insert(SORTFORMER.id, SORTFORMER);
     m.insert(QWEN_0_8B.id, QWEN_0_8B);
     m.insert(QWEN_2B.id, QWEN_2B);
     m

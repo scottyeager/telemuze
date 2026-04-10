@@ -23,17 +23,18 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_VAD_MODEL_PATH")]
     pub vad_model_path: Option<PathBuf>,
 
-    /// Path to the pyannote segmentation ONNX model for speaker diarization.
-    /// If omitted, looks for pyannote-segmentation-3-0.int8.onnx in --models-dir.
-    /// Diarization requires both this and --diarization-embedding-model-path.
-    #[arg(long, env = "TELEMUZE_DIARIZATION_SEGMENTATION_MODEL_PATH")]
-    pub diarization_segmentation_model_path: Option<PathBuf>,
+    /// Path to the NVIDIA Sortformer v2.1 ONNX model file (4-speaker max).
+    /// If omitted, looks for diar_streaming_sortformer_4spk-v2.1.onnx in
+    /// --models-dir. Diarization is performed by spawning the
+    /// `telemuze-diarize` subprocess once per long-form request.
+    #[arg(long, env = "TELEMUZE_DIARIZATION_MODEL_PATH")]
+    pub diarization_model_path: Option<PathBuf>,
 
-    /// Path to the speaker embedding ONNX model for speaker diarization.
-    /// If omitted, looks for nemo_en_titanet_small.onnx in --models-dir.
-    /// Diarization requires both this and --diarization-segmentation-model-path.
-    #[arg(long, env = "TELEMUZE_DIARIZATION_EMBEDDING_MODEL_PATH")]
-    pub diarization_embedding_model_path: Option<PathBuf>,
+    /// Path to the `telemuze-diarize` subprocess binary.
+    /// If omitted, looks alongside the running telemuze binary, then on PATH.
+    /// When the binary cannot be found, diarization is silently disabled.
+    #[arg(long, env = "TELEMUZE_DIARIZE_BINARY")]
+    pub diarize_binary: Option<PathBuf>,
 
     /// Directory for storing downloaded models.
     /// Defaults to ~/.local/share/telemuze/models

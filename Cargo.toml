@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "dist"]
+members = [".", "dist", "diarize"]
 resolver = "2"
 
 [package]
