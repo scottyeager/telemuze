@@ -1,2 +1,8 @@
 [target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-Wl,-rpath,/home/scott/.local/lib"]
+# Look for shared libraries next to the executable ($ORIGIN is the directory
+# containing the binary, expanded by the dynamic linker at runtime).
+# This matches the telemuze-dist extraction layout (~/.local/share/telemuze/)
+# where the server binary and .so files live in the same directory.
+# For local development where the .so files live elsewhere (e.g. ~/.local/lib),
+# set LD_LIBRARY_PATH before running the binary.
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
