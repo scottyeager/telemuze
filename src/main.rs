@@ -60,10 +60,11 @@ async fn main() -> Result<()> {
     }
 
     let app = Router::new()
+        .merge(endpoints::web_ui::router())
         .merge(endpoints::transcriptions::router())
         .merge(endpoints::dictate::router())
         .merge(endpoints::long_form::router())
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024)) // 10 MB
+        .layer(DefaultBodyLimit::max(500 * 1024 * 1024)) // 500 MB
         .layer(TraceLayer::new_for_http())
         .layer(CorsLayer::permissive())
         .with_state(shared_state);

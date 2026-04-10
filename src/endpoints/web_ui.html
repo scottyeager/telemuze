@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Telemuze Transcription</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #0f1117;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+
+  h1 {
+    font-size: 1.5rem;
+    font-weight: 600;
+    margin-bottom: 1.5rem;
+    color: #f0f0f0;
+  }
+
+  .container {
+    width: 100%;
+    max-width: 720px;
+  }
+
+  /* Drop zone */
+  .drop-zone {
+    border: 2px dashed #3a3f4b;
+    border-radius: 12px;
+    padding: 3rem 2rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    background: #181a20;
+  }
+
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: #6c8aff;
+    background: #1c1f2a;
+  }
+
+  .drop-zone-icon {
+    font-size: 2.5rem;
+    margin-bottom: 0.75rem;
+    opacity: 0.6;
+  }
+
+  .drop-zone-text {
+    font-size: 0.95rem;
+    color: #888;
+  }
+
+  .drop-zone-text strong {
+    color: #6c8aff;
+  }
+
+  .file-name {
+    margin-top: 0.75rem;
+    font-size: 0.85rem;
+    color: #aaa;
+  }
+
+  /* Processing state */
+  .processing {
+    text-align: center;
+    padding: 2rem;
+  }
+
+  .spinner {
+    width: 36px;
+    height: 36px;
+    border: 3px solid #2a2d35;
+    border-top-color: #6c8aff;
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto 1rem;
+  }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .processing-text {
+    font-size: 0.9rem;
+    color: #888;
+  }
+
+  /* Result */
+  .result {
+    margin-top: 1.5rem;
+  }
+
+  .result-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .result-label {
+    font-size: 0.85rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .result-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .btn {
+    background: #2a2d35;
+    border: 1px solid #3a3f4b;
+    color: #ccc;
+    padding: 0.4rem 0.85rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    cursor: pointer;
+    transition: background 0.15s, border-color 0.15s;
+  }
+
+  .btn:hover {
+    background: #33363f;
+    border-color: #555;
+  }
+
+  .btn.copied {
+    border-color: #4caf50;
+    color: #4caf50;
+  }
+
+  .transcript-box {
+    background: #181a20;
+    border: 1px solid #2a2d35;
+    border-radius: 8px;
+    padding: 1.25rem;
+    font-size: 0.92rem;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    max-height: 60vh;
+    overflow-y: auto;
+  }
+
+  .error-text {
+    color: #ef5350;
+    font-size: 0.9rem;
+    text-align: center;
+    padding: 1rem;
+  }
+
+  input[type="file"] { display: none; }
+</style>
+</head>
+<body>
+
+<div class="container">
+  <h1>Telemuze Transcription</h1>
+
+  <div class="drop-zone" id="dropZone">
+    <div class="drop-zone-icon">&#x1F399;</div>
+    <div class="drop-zone-text">
+      Drag &amp; drop an audio or video file here<br>
+      or <strong>click to browse</strong>
+    </div>
+    <div class="file-name" id="fileName"></div>
+  </div>
+  <input type="file" id="fileInput" accept="audio/*,video/*,.ogg,.opus,.m4a,.mp3,.wav,.flac,.webm,.mp4,.mkv">
+
+  <div class="processing" id="processing" style="display:none">
+    <div class="spinner"></div>
+    <div class="processing-text">Transcribing<span id="dots">...</span></div>
+  </div>
+
+  <div class="result" id="result" style="display:none">
+    <div class="result-header">
+      <span class="result-label">Transcript</span>
+      <div class="result-actions">
+        <button class="btn" id="copyBtn">Copy</button>
+        <button class="btn" id="downloadBtn">Download .txt</button>
+      </div>
+    </div>
+    <div class="transcript-box" id="transcript"></div>
+  </div>
+
+  <div class="error-text" id="error" style="display:none"></div>
+</div>
+
+<script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+const fileName = document.getElementById('fileName');
+const processing = document.getElementById('processing');
+const result = document.getElementById('result');
+const transcript = document.getElementById('transcript');
+const error = document.getElementById('error');
+const copyBtn = document.getElementById('copyBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+
+dropZone.addEventListener('click', () => fileInput.click());
+
+dropZone.addEventListener('dragover', e => {
+  e.preventDefault();
+  dropZone.classList.add('drag-over');
+});
+
+dropZone.addEventListener('dragleave', () => {
+  dropZone.classList.remove('drag-over');
+});
+
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) handleFile(fileInput.files[0]);
+});
+
+async function handleFile(file) {
+  fileName.textContent = file.name + ' (' + formatSize(file.size) + ')';
+  error.style.display = 'none';
+  result.style.display = 'none';
+  processing.style.display = 'block';
+
+  const form = new FormData();
+  form.append('file', file);
+
+  try {
+    const resp = await fetch('/v1/transcribe/long', { method: 'POST', body: form });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({ error: resp.statusText }));
+      throw new Error(body.error || resp.statusText);
+    }
+    const data = await resp.json();
+    processing.style.display = 'none';
+    transcript.textContent = data.full_text;
+    result.style.display = 'block';
+  } catch (err) {
+    processing.style.display = 'none';
+    error.textContent = 'Error: ' + err.message;
+    error.style.display = 'block';
+  }
+}
+
+copyBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(transcript.textContent).then(() => {
+    copyBtn.textContent = 'Copied!';
+    copyBtn.classList.add('copied');
+    setTimeout(() => { copyBtn.textContent = 'Copy'; copyBtn.classList.remove('copied'); }, 1500);
+  });
+});
+
+downloadBtn.addEventListener('click', () => {
+  const blob = new Blob([transcript.textContent], { type: 'text/plain' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'transcript.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / 1048576).toFixed(1) + ' MB';
+}
+</script>
+</body>
+</html>
