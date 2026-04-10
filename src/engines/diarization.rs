@@ -130,69 +130,14 @@ pub struct SpeakerSubSegment {
     pub speaker: Option<i32>,
 }
 
-/// Find the dominant speaker over the time range `[start, end)`.
-///
-/// The pyannote diarization output contains overlapping segments — long
-/// background "main turn" segments often contain shorter, more specific
-/// interjection segments from other speakers nested inside. Naive
-/// largest-overlap selection always picks the background, ignoring the
-/// interjections. Instead we score each candidate as
-/// `overlap / segment_duration`, which rewards specific (short) segments
-/// that tightly cover the word and penalizes diffuse background ones.
-/// Ties are broken by raw overlap amount.
-///
-/// If no segment overlaps, falls back to the nearest segment by time
-/// distance to the word's midpoint.
-fn dominant_speaker(start: f64, end: f64, diar: &[DiarSegment]) -> Option<i32> {
-    if diar.is_empty() {
-        return None;
-    }
-    let mut best_score = 0.0f64;
-    let mut best_overlap = 0.0f64;
-    let mut best_speaker: Option<i32> = None;
-    for seg in diar {
-        let s = seg.start as f64;
-        let e = seg.end as f64;
-        let ov = end.min(e) - start.max(s);
-        if ov <= 0.0 {
-            continue;
-        }
-        let seg_dur = (e - s).max(1e-6);
-        let score = ov / seg_dur;
-        if score > best_score || (score == best_score && ov > best_overlap) {
-            best_score = score;
-            best_overlap = ov;
-            best_speaker = Some(seg.speaker);
-        }
-    }
-    if best_speaker.is_some() {
-        return best_speaker;
-    }
-
-    // Fallback: nearest segment to the midpoint.
-    let mid = (start + end) * 0.5;
-    let mut best_dist = f64::INFINITY;
-    for seg in diar {
-        let s = seg.start as f64;
-        let e = seg.end as f64;
-        let dist = if mid < s {
-            s - mid
-        } else if mid >= e {
-            mid - e
-        } else {
-            0.0
-        };
-        if dist < best_dist {
-            best_dist = dist;
-            best_speaker = Some(seg.speaker);
-        }
-    }
-    best_speaker
-}
-
 /// Group BPE tokens into words. Each returned `(start_idx, end_idx)` pair
-/// is a half-open token range covering one word, where the first token
-/// begins with the SentencePiece marker `▁` (or is the very first token).
+/// is a half-open token range covering one word.
+///
+/// A word starts at any token whose first character is a word-boundary
+/// marker. Different STT models use different conventions:
+///   - SentencePiece (`parakeet-tdt-0.6b-v2`): `▁` (U+2581).
+///   - Raw-space BPE (`parakeet-unified-en-0.6b`): a literal leading space.
+/// We accept either so the same post-processing works for both models.
 fn group_tokens_into_words(tokens: &[String]) -> Vec<(usize, usize)> {
     let mut words = Vec::new();
     if tokens.is_empty() {
@@ -200,7 +145,7 @@ fn group_tokens_into_words(tokens: &[String]) -> Vec<(usize, usize)> {
     }
     let mut start = 0;
     for i in 1..tokens.len() {
-        if tokens[i].starts_with('\u{2581}') {
+        if is_word_start(&tokens[i]) {
             words.push((start, i));
             start = i;
         }
@@ -209,23 +154,65 @@ fn group_tokens_into_words(tokens: &[String]) -> Vec<(usize, usize)> {
     words
 }
 
+/// True if `token` begins with any recognized word-start marker.
+fn is_word_start(token: &str) -> bool {
+    token.starts_with('\u{2581}') || token.starts_with(' ')
+}
+
 /// Split ASR segments at diarization speaker-change boundaries, snapping
-/// splits to whole-word boundaries derived from BPE token markers.
+/// splits to whole-word boundaries.
+///
+/// This is a port of NVIDIA NeMo's `get_word_level_json_list`: a single
+/// monotonically-advancing pointer (`turn_idx`) over diarization segments
+/// sorted by start time. For each word, advance while the word's anchor
+/// timestamp is past the current segment's end, then assign the word to
+/// the current segment's speaker.
+///
+/// Because the pointer never moves backward, brief later-starting
+/// overlapping segments inside a longer run are simply skipped — you stay
+/// with the speaker who got there first until that speaker's run ends.
+/// This is the property that prevents spurious mid-monologue speaker
+/// flips on Sortformer's overlapping per-speaker activity output.
 pub fn split_by_speakers(
     asr_segments: &[crate::state::TranscribedSegment],
     diar: &[DiarSegment],
 ) -> Vec<SpeakerSubSegment> {
+    // Sort diarization segments by start time. parakeet-rs's `binarize()`
+    // emits segments per-speaker, so the input may not be globally sorted.
+    let mut diar_sorted: Vec<&DiarSegment> = diar.iter().collect();
+    diar_sorted.sort_by(|a, b| {
+        a.start
+            .partial_cmp(&b.start)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
     let mut out = Vec::new();
+    let mut turn_idx: usize = 0;
+
+    // Look up the speaker at time `t`, advancing turn_idx forward as needed.
+    // Returns None only when the diarization segment list is empty.
+    let mut speaker_at = |t: f64| -> Option<i32> {
+        if diar_sorted.is_empty() {
+            return None;
+        }
+        while turn_idx + 1 < diar_sorted.len()
+            && t > diar_sorted[turn_idx].end as f64
+        {
+            turn_idx += 1;
+        }
+        Some(diar_sorted[turn_idx].speaker)
+    };
 
     for seg in asr_segments {
         if seg.tokens.is_empty() {
+            let mid = (seg.start_secs + seg.end_secs) * 0.5;
             out.push(SpeakerSubSegment {
                 start: seg.start_secs,
                 end: seg.end_secs,
                 text: seg.text.clone(),
                 tokens: vec![],
                 token_timestamps: vec![],
-                speaker: dominant_speaker(seg.start_secs, seg.end_secs, diar),
+                speaker: speaker_at(mid),
             });
             continue;
         }
@@ -237,33 +224,24 @@ pub fn split_by_speakers(
             .map(|&t| seg.start_secs + t as f64)
             .collect();
 
-        // Group tokens into whole words.
+        // Group tokens into whole words and label each via the monotonic
+        // turn_idx walk. The word's first-token timestamp is the anchor.
         let words = group_tokens_into_words(&seg.tokens);
-
-        // Compute (start, end, speaker) for each word.
-        let mut word_info: Vec<(f64, f64, Option<i32>)> = Vec::with_capacity(words.len());
-        for (wi, &(ws, _we)) in words.iter().enumerate() {
-            let w_start = abs_ts[ws];
-            let w_end = if wi + 1 < words.len() {
-                abs_ts[words[wi + 1].0]
-            } else {
-                seg.end_secs
-            };
-            let spk = dominant_speaker(w_start, w_end, diar);
-            word_info.push((w_start, w_end, spk));
-        }
+        let labels: Vec<Option<i32>> = words
+            .iter()
+            .map(|&(ws, _)| speaker_at(abs_ts[ws]))
+            .collect();
 
         // Group consecutive words with the same speaker into runs.
         let mut run_start_word = 0usize;
-        let mut run_speaker = word_info[0].2;
+        let mut run_speaker = labels[0];
 
-        for wi in 1..word_info.len() {
-            if word_info[wi].2 != run_speaker {
-                // Emit run [run_start_word .. wi).
+        for wi in 1..labels.len() {
+            if labels[wi] != run_speaker {
                 let tok_start = words[run_start_word].0;
                 let tok_end = words[wi].0;
-                let sub_start = word_info[run_start_word].0;
-                let sub_end = word_info[wi].0; // = next word's start
+                let sub_start = abs_ts[tok_start];
+                let sub_end = abs_ts[words[wi].0];
                 let toks = seg.tokens[tok_start..tok_end].to_vec();
                 let ts = abs_ts[tok_start..tok_end].to_vec();
                 let text = join_tokens(&toks);
@@ -276,14 +254,14 @@ pub fn split_by_speakers(
                     speaker: run_speaker,
                 });
                 run_start_word = wi;
-                run_speaker = word_info[wi].2;
+                run_speaker = labels[wi];
             }
         }
 
-        // Emit final run.
+        // Final run.
         let tok_start = words[run_start_word].0;
         let tok_end = seg.tokens.len();
-        let sub_start = word_info[run_start_word].0;
+        let sub_start = abs_ts[tok_start];
         let sub_end = seg.end_secs;
         let toks = seg.tokens[tok_start..tok_end].to_vec();
         let ts = abs_ts[tok_start..tok_end].to_vec();
@@ -301,8 +279,9 @@ pub fn split_by_speakers(
     out
 }
 
-/// Join SentencePiece BPE tokens into readable text. The `▁` marker
-/// indicates a word boundary and is rendered as a leading space.
+/// Join BPE tokens into readable text. Handles both word-boundary
+/// conventions: SentencePiece's `▁` marker (translated to a leading
+/// space) and raw-space BPE (passed through unchanged).
 fn join_tokens(tokens: &[String]) -> String {
     let mut s = String::new();
     for tok in tokens {

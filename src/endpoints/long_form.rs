@@ -135,7 +135,20 @@ async fn handle_long_form(
         match diar.diarize(&pcm) {
             Ok(d) => {
                 let n_spk = d.iter().map(|s| s.speaker).max().map(|m| m + 1).unwrap_or(0);
-                info!("Diarization: {} segments, {} unique speakers", d.len(), n_spk);
+                let mut totals: std::collections::BTreeMap<i32, f64> = Default::default();
+                for s in &d {
+                    *totals.entry(s.speaker).or_insert(0.0) += (s.end - s.start) as f64;
+                }
+                let totals_str: Vec<String> = totals
+                    .iter()
+                    .map(|(spk, dur)| format!("spk{}={:.1}s", spk, dur))
+                    .collect();
+                info!(
+                    "Diarization: {} segments, {} speakers ({})",
+                    d.len(),
+                    n_spk,
+                    totals_str.join(" ")
+                );
                 Some(d)
             }
             Err(e) => {
@@ -148,7 +161,13 @@ async fn handle_long_form(
     };
 
     let result_segments: Vec<SegmentResponse> = if let Some(diar_segs) = &diar_segs_opt {
-        split_by_speakers(&segments, diar_segs)
+        let split = split_by_speakers(&segments, diar_segs);
+        info!(
+            "split_by_speakers: {} ASR segs -> {} output segs",
+            segments.len(),
+            split.len()
+        );
+        split
             .into_iter()
             .map(|s| SegmentResponse {
                 start: s.start,
