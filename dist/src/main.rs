@@ -18,13 +18,11 @@ fn decompress(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn cache_dir() -> PathBuf {
-    if let Ok(xdg) = env::var("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("telemuze")
-    } else if let Ok(home) = env::var("HOME") {
-        PathBuf::from(home).join(".cache").join("telemuze")
+fn data_dir() -> PathBuf {
+    if let Ok(home) = env::var("HOME") {
+        PathBuf::from(home).join(".local").join("share").join("telemuze")
     } else {
-        PathBuf::from("/tmp/telemuze-cache")
+        PathBuf::from("/tmp/telemuze-runtime")
     }
 }
 
@@ -36,45 +34,36 @@ fn needs_extract(cache: &Path) -> bool {
     }
 }
 
-fn extract(cache: &Path) {
-    let bin_dir = cache.join("bin");
-    let lib_dir = cache.join("lib");
-    fs::create_dir_all(&bin_dir).expect("failed to create cache bin dir");
-    fs::create_dir_all(&lib_dir).expect("failed to create cache lib dir");
+fn extract(dir: &Path) {
+    fs::create_dir_all(dir).expect("failed to create runtime dir");
 
     eprintln!("Extracting runtime libraries...");
 
-    let server_path = bin_dir.join("telemuze");
+    let server_path = dir.join("telemuze");
     fs::write(&server_path, decompress(SERVER_GZ)).expect("failed to write server binary");
     fs::set_permissions(&server_path, fs::Permissions::from_mode(0o755))
         .expect("failed to set server binary permissions");
 
-    fs::write(
-        lib_dir.join("libsherpa-onnx-c-api.so"),
-        decompress(SHERPA_SO_GZ),
-    )
-    .expect("failed to write libsherpa-onnx-c-api.so");
+    fs::write(dir.join("libsherpa-onnx-c-api.so"), decompress(SHERPA_SO_GZ))
+        .expect("failed to write libsherpa-onnx-c-api.so");
 
-    fs::write(
-        lib_dir.join("libonnxruntime.so"),
-        decompress(ONNXRUNTIME_SO_GZ),
-    )
-    .expect("failed to write libonnxruntime.so");
+    fs::write(dir.join("libonnxruntime.so"), decompress(ONNXRUNTIME_SO_GZ))
+        .expect("failed to write libonnxruntime.so");
 
-    fs::write(cache.join(".version"), VERSION_HASH).expect("failed to write version file");
+    fs::write(dir.join(".version"), VERSION_HASH).expect("failed to write version file");
 
     eprintln!("Done.");
 }
 
 fn main() {
-    let cache = cache_dir();
+    let dir = data_dir();
 
-    if needs_extract(&cache) {
-        extract(&cache);
+    if needs_extract(&dir) {
+        extract(&dir);
     }
 
-    let server_bin = cache.join("bin").join("telemuze");
-    let lib_dir = cache.join("lib");
+    let server_bin = dir.join("telemuze");
+    let lib_dir = &dir;
 
     // Prepend our lib dir to LD_LIBRARY_PATH
     let ld_path = match env::var("LD_LIBRARY_PATH") {
