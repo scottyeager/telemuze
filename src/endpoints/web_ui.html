@@ -166,6 +166,55 @@
     color: #e0e0e0;
   }
 
+  .speaker-rename {
+    background: #181a20;
+    border: 1px solid #2a2d35;
+    border-radius: 8px;
+    padding: 0.9rem 1rem;
+    margin-bottom: 0.9rem;
+  }
+
+  .speaker-rename-label {
+    font-size: 0.78rem;
+    color: #888;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.6rem;
+  }
+
+  .speaker-rename-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 0.6rem;
+  }
+
+  .speaker-rename-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .speaker-rename-field > span {
+    font-size: 0.72rem;
+    color: #e0a040;
+    font-weight: 600;
+  }
+
+  .speaker-rename-field input {
+    background: #2a2d35;
+    border: 1px solid #3a3f4b;
+    color: #e0e0e0;
+    padding: 0.45rem 0.6rem;
+    border-radius: 5px;
+    font-size: 0.88rem;
+    font-family: inherit;
+  }
+
+  .speaker-rename-field input:focus {
+    outline: none;
+    border-color: #6c8aff;
+  }
+
   .error-text {
     color: #ef5350;
     font-size: 0.9rem;
@@ -204,6 +253,10 @@
         <button class="btn" id="downloadBtn">Download .txt</button>
       </div>
     </div>
+    <div class="speaker-rename" id="speakerRename" style="display:none">
+      <div class="speaker-rename-label">Speaker names</div>
+      <div class="speaker-rename-grid" id="speakerRenameGrid"></div>
+    </div>
     <div class="transcript-box" id="transcript"></div>
   </div>
 
@@ -220,6 +273,16 @@ const transcript = document.getElementById('transcript');
 const error = document.getElementById('error');
 const copyBtn = document.getElementById('copyBtn');
 const downloadBtn = document.getElementById('downloadBtn');
+const speakerRename = document.getElementById('speakerRename');
+const speakerRenameGrid = document.getElementById('speakerRenameGrid');
+
+const speakerNames = {};
+
+function speakerLabel(idx) {
+  const custom = speakerNames[idx];
+  if (custom && custom.trim()) return custom.trim();
+  return 'Speaker ' + (idx + 1);
+}
 
 dropZone.addEventListener('click', () => fileInput.click());
 
@@ -278,6 +341,10 @@ function fmtTime(secs) {
 
 function renderSegments(segments, fallbackText) {
   transcript.innerHTML = '';
+  speakerRenameGrid.innerHTML = '';
+  speakerRename.style.display = 'none';
+  for (const k of Object.keys(speakerNames)) delete speakerNames[k];
+
   if (!segments.length) {
     transcript.textContent = fallbackText;
     return;
@@ -286,20 +353,61 @@ function renderSegments(segments, fallbackText) {
   for (const seg of segments) {
     const div = document.createElement('div');
     div.className = 'segment';
-    let meta = '[' + fmtTime(seg.start) + ']';
-    if (hasSpeakers && seg.speaker != null) {
-      meta += ' <span class="seg-speaker">Speaker ' + (seg.speaker + 1) + '</span>';
-    }
+
     const metaEl = document.createElement('div');
     metaEl.className = 'seg-meta';
-    metaEl.innerHTML = meta;
+    metaEl.textContent = '[' + fmtTime(seg.start) + ']';
+    if (hasSpeakers && seg.speaker != null) {
+      metaEl.appendChild(document.createTextNode(' '));
+      const speakerSpan = document.createElement('span');
+      speakerSpan.className = 'seg-speaker';
+      speakerSpan.dataset.speaker = String(seg.speaker);
+      speakerSpan.textContent = speakerLabel(seg.speaker);
+      metaEl.appendChild(speakerSpan);
+    }
     div.appendChild(metaEl);
+
     const textEl = document.createElement('div');
     textEl.className = 'seg-text';
     textEl.textContent = seg.text;
     div.appendChild(textEl);
     transcript.appendChild(div);
   }
+
+  if (hasSpeakers) {
+    const speakersPresent = [...new Set(
+      segments.filter(s => s.speaker != null).map(s => s.speaker)
+    )].sort((a, b) => a - b);
+    buildSpeakerRenameGrid(speakersPresent);
+    speakerRename.style.display = 'block';
+  }
+}
+
+function buildSpeakerRenameGrid(speakers) {
+  for (const idx of speakers) {
+    const field = document.createElement('label');
+    field.className = 'speaker-rename-field';
+    const caption = document.createElement('span');
+    caption.textContent = 'Speaker ' + (idx + 1);
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'e.g. Alice';
+    input.addEventListener('input', () => {
+      speakerNames[idx] = input.value;
+      updateSpeakerLabels(idx);
+    });
+    field.appendChild(caption);
+    field.appendChild(input);
+    speakerRenameGrid.appendChild(field);
+  }
+}
+
+function updateSpeakerLabels(idx) {
+  const label = speakerLabel(idx);
+  const spans = transcript.querySelectorAll(
+    '.seg-speaker[data-speaker="' + idx + '"]'
+  );
+  for (const span of spans) span.textContent = label;
 }
 
 function getPlainText() {
