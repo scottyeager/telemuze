@@ -14,7 +14,7 @@ pub struct LongFormOutcome {
 /// sub-segments. When diarization is absent each ASR segment becomes one
 /// sub-segment with `speaker = None`.
 pub fn finalize(outcome: LongFormOutcome) -> Vec<SpeakerSubSegment> {
-    if let Some(diar) = &outcome.diar_segments {
+    let subs = if let Some(diar) = &outcome.diar_segments {
         split_by_speakers(&outcome.asr_segments, diar)
     } else {
         outcome
@@ -33,7 +33,50 @@ pub fn finalize(outcome: LongFormOutcome) -> Vec<SpeakerSubSegment> {
                 speaker: None,
             })
             .collect()
+    };
+    merge_same_speaker_runs(subs)
+}
+
+/// Collapse consecutive sub-segments that share the same speaker label,
+/// but only when the output contains two or more distinct speakers.
+///
+/// `split_by_speakers` already merges same-speaker runs within a single
+/// ASR segment. This step closes the remaining gap: the long-form worker
+/// emits one ASR segment per VAD chunk, so a speaker who pauses briefly
+/// turns into two adjacent sub-segments with the same label. In
+/// multi-speaker output we want each turn to read as one block. In
+/// single-speaker (or un-diarized) output we leave the VAD boundaries in
+/// place so long recordings still carry useful intermediate timestamps.
+fn merge_same_speaker_runs(subs: Vec<SpeakerSubSegment>) -> Vec<SpeakerSubSegment> {
+    let mut seen: std::collections::HashSet<i32> = std::collections::HashSet::new();
+    for s in &subs {
+        if let Some(spk) = s.speaker {
+            seen.insert(spk);
+            if seen.len() >= 2 {
+                break;
+            }
+        }
     }
+    if seen.len() < 2 {
+        return subs;
+    }
+
+    let mut out: Vec<SpeakerSubSegment> = Vec::with_capacity(subs.len());
+    for sub in subs {
+        match out.last_mut() {
+            Some(prev) if sub.speaker.is_some() && prev.speaker == sub.speaker => {
+                prev.end = sub.end;
+                if !prev.text.is_empty() && !sub.text.is_empty() {
+                    prev.text.push(' ');
+                }
+                prev.text.push_str(&sub.text);
+                prev.tokens.extend(sub.tokens);
+                prev.token_timestamps.extend(sub.token_timestamps);
+            }
+            _ => out.push(sub),
+        }
+    }
+    out
 }
 
 /// Render speaker sub-segments as a readable transcript with timestamps
