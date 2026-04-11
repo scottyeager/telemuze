@@ -5,9 +5,10 @@ use std::path::PathBuf;
 #[derive(Parser, Debug, Clone)]
 #[command(name = "telemuze", version)]
 pub struct Config {
-    /// Host address to bind to
-    #[arg(long, default_value = "0.0.0.0", env = "TELEMUZE_HOST")]
-    pub host: String,
+    /// Host address to bind to. When unset, the server binds both
+    /// IPv4 (0.0.0.0) and IPv6 ([::]) on the configured port.
+    #[arg(long, env = "TELEMUZE_HOST")]
+    pub host: Option<String>,
 
     /// Port to listen on
     #[arg(long, default_value_t = 7313, env = "TELEMUZE_PORT")]

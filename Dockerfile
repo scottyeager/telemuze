@@ -134,8 +134,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /artifacts/telemuze /usr/local/bin/telemuze
 
-ENV TELEMUZE_HOST=0.0.0.0 \
-    TELEMUZE_PORT=7313
+ENV TELEMUZE_PORT=7313
 
 # Models and runtime state extracted by the launcher
 VOLUME ["/root/.local/share/telemuze"]

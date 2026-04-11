@@ -13,6 +13,7 @@ use anyhow::Result;
 use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use clap::Parser;
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -90,11 +91,44 @@ async fn server_main() -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(shared_state);
 
-    let bind_addr = format!("{}:{}", config.host, config.port);
-    info!("Listening on {bind_addr}");
+    match config.host.as_deref() {
+        Some(host) => {
+            let bind_addr = format!("{}:{}", host, config.port);
+            info!("Listening on {bind_addr}");
+            let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+            axum::serve(listener, app).await?;
+        }
+        None => {
+            let v4_addr: SocketAddr = ([0, 0, 0, 0], config.port).into();
+            let v6_addr = SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, config.port, 0, 0);
+            info!("Listening on {v4_addr} and [{}]:{}", v6_addr.ip(), v6_addr.port());
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    axum::serve(listener, app).await?;
+            let v4_listener = tokio::net::TcpListener::bind(v4_addr).await?;
+            let v6_listener = bind_v6_only(v6_addr)?;
+
+            let app_v6 = app.clone();
+            tokio::try_join!(
+                async move { axum::serve(v4_listener, app).await },
+                async move { axum::serve(v6_listener, app_v6).await },
+            )?;
+        }
+    }
 
     Ok(())
+}
+
+/// Bind an IPv6-only TCP listener. Setting `IPV6_V6ONLY` keeps this
+/// socket from claiming the IPv4 address space, so a separate IPv4
+/// listener on the same port can coexist regardless of the kernel's
+/// `net.ipv6.bindv6only` sysctl.
+fn bind_v6_only(addr: SocketAddrV6) -> Result<tokio::net::TcpListener> {
+    use socket2::{Domain, Protocol, Socket, Type};
+
+    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+    socket.set_only_v6(true)?;
+    socket.set_reuse_address(true)?;
+    socket.set_nonblocking(true)?;
+    socket.bind(&SocketAddr::V6(addr).into())?;
+    socket.listen(1024)?;
+    Ok(tokio::net::TcpListener::from_std(socket.into())?)
 }

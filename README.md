@@ -32,7 +32,7 @@ The binary is written to `target/release/telemuze`.
 ./target/release/telemuze --llm-api-url http://127.0.0.1:8081/v1/chat/completions
 ```
 
-By default the server listens on `0.0.0.0:7313`. Override with `--host` / `--port` or the environment variables below.
+By default the server listens on port `7313` on all IPv4 (`0.0.0.0`) and IPv6 (`[::]`) interfaces. Override with `--host` / `--port` or the environment variables below — setting `--host` pins the server to a single address family.
 
 ## Configuration
 
@@ -40,7 +40,7 @@ All options can be set via CLI flags or environment variables.
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--host` | `TELEMUZE_HOST` | `0.0.0.0` | Bind address |
+| `--host` | `TELEMUZE_HOST` | *(dual-stack IPv4+IPv6)* | Bind address — omit for dual-stack, set to pin one family |
 | `--port` | `TELEMUZE_PORT` | `7313` | Listen port |
 | `--stt-model-path` | `TELEMUZE_STT_MODEL_PATH` | auto-download | Path to Parakeet ONNX model directory |
 | `--vad-model-path` | `TELEMUZE_VAD_MODEL_PATH` | auto-download | Path to Silero VAD ONNX model file |
