@@ -8,7 +8,6 @@ use tokio::sync::Semaphore;
 use tracing::{error, info};
 
 use crate::config::Config;
-use crate::engines::diarization::DiarizationEngine;
 use crate::engines::dictionary::{Dictionary, PipelineConfig};
 use crate::engines::llm::LlmEngine;
 use crate::engines::long_form::LongFormEngine;
@@ -37,11 +36,9 @@ pub struct AppState {
     pub stt_engine: Mutex<SttEngine>,
     pub llm_engine: LlmEngine,
     pub vad_engine: Mutex<VadEngine>,
-    /// Present when both the diarize subprocess binary and the Sortformer
-    /// model file are located at startup. The engine is internally
-    /// stateless (each call spawns a fresh subprocess), so no Mutex.
-    pub diarization_engine: Option<DiarizationEngine>,
     /// Long-form worker launcher — spawns `telemuze transcribe` children.
+    /// Carries the Sortformer model path (if configured); the worker loads
+    /// it on demand and runs diarization alongside ASR in one subprocess.
     pub long_form_engine: LongFormEngine,
     /// FIFO queue for long-form jobs. Permit count defaults to 1 so only
     /// one worker runs at a time (bounded peak RAM).
@@ -112,7 +109,7 @@ impl AppState {
         let vad_engine = VadEngine::new(&vad_path)?;
         info!("VAD model loaded.");
 
-        let diarization_engine = Self::load_diarization_engine(config, &mgr);
+        let diarize_model_path = Self::locate_diarize_model(config, &mgr);
 
         let long_form_binary = locate_long_form_binary(config);
         info!("Long-form worker binary: {}", long_form_binary.display());
@@ -120,6 +117,7 @@ impl AppState {
             long_form_binary,
             stt_path.clone(),
             vad_path.clone(),
+            diarize_model_path,
             config.hotwords_score,
             config.max_active_paths,
             config.blank_penalty,
@@ -173,7 +171,6 @@ impl AppState {
             stt_engine: Mutex::new(stt_engine),
             llm_engine,
             vad_engine: Mutex::new(vad_engine),
-            diarization_engine,
             long_form_engine,
             long_form_semaphore,
             terms_content,
@@ -186,8 +183,9 @@ impl AppState {
 
     /// Run a long-form transcription job: acquires the long-form permit
     /// (FIFO queue), materializes the PCM to a single tempfile, spawns
-    /// transcribe + diarize workers in parallel, and returns the merged
-    /// outcome. The permit is held across both subprocess spawns so the
+    /// one `telemuze transcribe` worker that runs ASR and (if configured)
+    /// diarization in parallel on the same PCM, and returns the merged
+    /// outcome. The permit is held across the subprocess spawn so the
     /// peak RAM from worker children is bounded by the permit count.
     pub async fn long_form_transcribe(
         self: &Arc<Self>,
@@ -214,50 +212,26 @@ impl AppState {
 
         let long_form = self.long_form_engine.clone();
         let hw_owned = hotwords.map(str::to_owned);
-        let pcm_for_asr = pcm_path.clone();
-        let asr_task = tokio::task::spawn_blocking(move || {
-            long_form.transcribe(&pcm_for_asr, hw_owned.as_deref())
-        });
-
-        let diar_task = self.diarization_engine.clone().map(|diar| {
-            let pcm_for_diar = pcm_path.clone();
-            tokio::task::spawn_blocking(move || diar.diarize_from_path(&pcm_for_diar))
-        });
-
-        let asr_segments = asr_task.await.context("ASR task join failed")??;
-
-        let diar_segments = match diar_task {
-            Some(t) => match t.await.context("Diarization task join failed")? {
-                Ok(d) => {
-                    let n_spk = d.iter().map(|s| s.speaker).max().map(|m| m + 1).unwrap_or(0);
-                    info!("Diarization: {} segments, {} speakers", d.len(), n_spk);
-                    Some(d)
-                }
-                Err(e) => {
-                    error!("Diarization failed: {e}");
-                    None
-                }
-            },
-            None => None,
-        };
+        let result = tokio::task::spawn_blocking(move || {
+            long_form.transcribe_and_diarize(&pcm_path, hw_owned.as_deref())
+        })
+        .await
+        .context("Long-form worker task join failed")??;
 
         drop(pcm_file);
 
+        if let Some(ref d) = result.diar {
+            let n_spk = d.iter().map(|s| s.speaker).max().map(|m| m + 1).unwrap_or(0);
+            info!("Diarization: {} segments, {} speakers", d.len(), n_spk);
+        }
+
         Ok(LongFormOutcome {
-            asr_segments,
-            diar_segments,
+            asr_segments: result.segments,
+            diar_segments: result.diar,
         })
     }
 
-    fn load_diarization_engine(config: &Config, mgr: &ModelManager) -> Option<DiarizationEngine> {
-        let binary_path = match locate_diarize_binary(config) {
-            Some(p) => p,
-            None => {
-                info!("telemuze-diarize binary not found — speaker labels disabled.");
-                return None;
-            }
-        };
-
+    fn locate_diarize_model(config: &Config, mgr: &ModelManager) -> Option<PathBuf> {
         let model_path = match config.diarization_model_path.as_ref() {
             Some(p) => p.clone(),
             None => {
@@ -275,12 +249,8 @@ impl AppState {
             }
         };
 
-        info!(
-            "Diarization configured (binary={}, model={})",
-            binary_path.display(),
-            model_path.display()
-        );
-        Some(DiarizationEngine::new(binary_path, model_path))
+        info!("Diarization configured (model={})", model_path.display());
+        Some(model_path)
     }
 
     /// Run VAD segmentation only, returning the speech segments for
@@ -353,37 +323,3 @@ fn locate_long_form_binary(config: &Config) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("telemuze"))
 }
 
-/// Locate the `telemuze-diarize` subprocess binary.
-///
-/// Search order:
-/// 1. Explicit `--diarize-binary` / `TELEMUZE_DIARIZE_BINARY` override.
-/// 2. Sibling of the running `telemuze` binary (matches Cargo's
-///    `target/{debug,release}/` layout and any reasonable install layout).
-/// 3. PATH lookup.
-fn locate_diarize_binary(config: &Config) -> Option<PathBuf> {
-    if let Some(p) = &config.diarize_binary {
-        return if p.exists() { Some(p.clone()) } else { None };
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let candidate = dir.join("telemuze-diarize");
-            if candidate.exists() {
-                return Some(candidate);
-            }
-        }
-    }
-    which_in_path("telemuze-diarize")
-}
-
-/// Minimal PATH walker — looks for an executable file with the given
-/// name in each `PATH` entry. Avoids pulling in the `which` crate.
-fn which_in_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        let candidate = dir.join(name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}

@@ -1,6 +1,7 @@
 //! Long-form transcription engine: spawns a one-shot `telemuze transcribe`
-//! worker subprocess that loads VAD + STT, processes a raw PCM tempfile,
-//! and exits. The always-on server never pays the worker's memory cost.
+//! worker subprocess that loads VAD + STT (and optionally Sortformer
+//! diarization), processes a raw PCM tempfile, and exits. The always-on
+//! server never pays the worker's memory cost.
 
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
@@ -10,6 +11,7 @@ use std::process::Command;
 use tempfile::NamedTempFile;
 use tracing::debug;
 
+use crate::engines::diarization::DiarSegment;
 use crate::state::TranscribedSegment;
 
 #[derive(Deserialize)]
@@ -22,8 +24,24 @@ struct WireSegment {
 }
 
 #[derive(Deserialize)]
+struct WireDiarSegment {
+    start: f64,
+    end: f64,
+    speaker: i32,
+}
+
+#[derive(Deserialize)]
 struct WireOutput {
     segments: Vec<WireSegment>,
+    #[serde(default)]
+    diarization: Option<Vec<WireDiarSegment>>,
+}
+
+/// Result of a single long-form worker invocation — ASR segments plus
+/// optional diarization from the same subprocess.
+pub struct LongFormResult {
+    pub segments: Vec<TranscribedSegment>,
+    pub diar: Option<Vec<DiarSegment>>,
 }
 
 #[derive(Clone)]
@@ -31,6 +49,7 @@ pub struct LongFormEngine {
     binary_path: PathBuf,
     stt_model_dir: PathBuf,
     vad_model_path: PathBuf,
+    diarize_model_path: Option<PathBuf>,
     hotwords_score: f32,
     max_active_paths: i32,
     blank_penalty: f32,
@@ -42,6 +61,7 @@ impl LongFormEngine {
         binary_path: PathBuf,
         stt_model_dir: PathBuf,
         vad_model_path: PathBuf,
+        diarize_model_path: Option<PathBuf>,
         hotwords_score: f32,
         max_active_paths: i32,
         blank_penalty: f32,
@@ -51,6 +71,7 @@ impl LongFormEngine {
             binary_path,
             stt_model_dir,
             vad_model_path,
+            diarize_model_path,
             hotwords_score,
             max_active_paths,
             blank_penalty,
@@ -59,12 +80,13 @@ impl LongFormEngine {
     }
 
     /// Run the long-form worker on an already-materialized raw f32-LE PCM
-    /// tempfile. Returns the parsed ASR segments.
-    pub fn transcribe(
+    /// tempfile. Returns ASR segments and, when a diarization model is
+    /// configured, the matching speaker segments.
+    pub fn transcribe_and_diarize(
         &self,
         pcm_path: &Path,
         hotwords: Option<&str>,
-    ) -> Result<Vec<TranscribedSegment>> {
+    ) -> Result<LongFormResult> {
         let hotwords_tmp = match hotwords {
             Some(hw) if !hw.is_empty() => {
                 let mut tmp = NamedTempFile::new().context("Failed to create hotwords tempfile")?;
@@ -99,6 +121,10 @@ impl LongFormEngine {
             .arg("--num-threads")
             .arg(self.num_threads.to_string());
 
+        if let Some(ref path) = self.diarize_model_path {
+            cmd.arg("--diarize-model").arg(path);
+        }
+
         if let Some(ref tmp) = hotwords_tmp {
             cmd.arg("--hotwords-file").arg(tmp.path());
         }
@@ -132,7 +158,7 @@ impl LongFormEngine {
 
         drop(hotwords_tmp);
 
-        Ok(parsed
+        let segments = parsed
             .segments
             .into_iter()
             .map(|s| TranscribedSegment {
@@ -142,6 +168,18 @@ impl LongFormEngine {
                 tokens: s.tokens,
                 token_timestamps: s.token_timestamps,
             })
-            .collect())
+            .collect();
+
+        let diar = parsed.diarization.map(|segs| {
+            segs.into_iter()
+                .map(|s| DiarSegment {
+                    start: s.start as f32,
+                    end: s.end as f32,
+                    speaker: s.speaker,
+                })
+                .collect()
+        });
+
+        Ok(LongFormResult { segments, diar })
     }
 }

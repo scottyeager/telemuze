@@ -26,7 +26,10 @@ path = "src/bin/eou_test.rs"
 # Audio capture
 cpal = "0.15"
 
-# VAD engine (sherpa-onnx Silero VAD, static linking)
+# VAD engine (sherpa-onnx Silero VAD, static linking).
+# The client only uses streaming VAD + OnlineRecognizer, so it stays on
+# the released crates.io version — unlike the server it doesn't need the
+# Sortformer bindings only present in our local sherpa-onnx fork.
 sherpa-onnx = "1.12"
 
 # HTTP client for sending audio to server

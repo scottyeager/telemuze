@@ -17,8 +17,11 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 
 # Audio pipeline — uses ffmpeg subprocess (must be installed on host)
 
-# STT + VAD engine (sherpa-onnx: Parakeet TDT + Silero VAD)
-sherpa-onnx = { version = "1.12", default-features = false }
+# STT + VAD engine (sherpa-onnx: Parakeet TDT + Silero VAD + Sortformer).
+# Path dep on the local fork so we get the Sortformer diarization bindings
+# that haven't landed in an upstream release yet. Assumes a sibling
+# checkout of sherpa-onnx next to this repo.
+sherpa-onnx = { path = "../sherpa-onnx/sherpa-onnx/rust/sherpa-onnx", default-features = false }
 
 # Phonetic dictionary pipeline
 rphonetic = "3"
