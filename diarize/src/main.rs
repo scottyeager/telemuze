@@ -3,7 +3,7 @@
 //! Loads NVIDIA's Sortformer v2 ONNX model, runs offline diarization on a
 //! mono 16 kHz f32-LE PCM file, prints `{"segments": [...]}` to stdout, and
 //! exits. Designed to be invoked once per long-form transcription request
-//! by the main `telemuze` server, so the 492 MB model isn't permanently
+//! by the main `telemuze` server, so the ~470 MB model isn't permanently
 //! resident.
 
 use anyhow::{Context, Result};
