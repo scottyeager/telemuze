@@ -5,3 +5,4 @@ dist-out
 .github
 *.md
 models
+.venv
