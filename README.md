@@ -32,7 +32,7 @@ The binary is written to `target/release/telemuze`.
 ./target/release/telemuze --llm-api-url http://127.0.0.1:8081/v1/chat/completions
 ```
 
-By default the server listens on port `7313` on all IPv4 (`0.0.0.0`) and IPv6 (`[::]`) interfaces. Override with `--host` / `--port` or the environment variables below — setting `--host` pins the server to a single address family.
+By default the server listens on `0.0.0.0:7313`. Override with `--host` / `--port` or the environment variables below.
 
 ## Configuration
 
@@ -40,7 +40,7 @@ All options can be set via CLI flags or environment variables.
 
 | Flag | Env var | Default | Description |
 |------|---------|---------|-------------|
-| `--host` | `TELEMUZE_HOST` | *(dual-stack IPv4+IPv6)* | Bind address — omit for dual-stack, set to pin one family |
+| `--host` | `TELEMUZE_HOST` | `0.0.0.0` | Bind address |
 | `--port` | `TELEMUZE_PORT` | `7313` | Listen port |
 | `--stt-model-path` | `TELEMUZE_STT_MODEL_PATH` | auto-download | Path to Parakeet ONNX model directory |
 | `--vad-model-path` | `TELEMUZE_VAD_MODEL_PATH` | auto-download | Path to Silero VAD ONNX model file |
@@ -78,20 +78,6 @@ Features:
 * VAD based always-on listening, with transcription only during active speech
 * Keyboard and mouse control features (press "enter", click in different parts of the screen, scrolling, etc)
 * Undo the last text input by saying "undo"
-
-## Python tooling (optional)
-
-A Python environment is only needed if you're converting NeMo checkpoints to ONNX (the `scripts/export_*.py` scripts) or running benchmarks against native NeMo implementations. The shipped Rust binaries don't need it.
-
-```sh
-uv venv .venv --python 3.12
-uv pip install -r requirements.txt
-
-# Example: download and export parakeet-unified to ONNX
-uv run scripts/export_parakeet_unified.py
-```
-
-Source checkpoints are downloaded via `huggingface_hub` into the standard HF cache at `~/.cache/huggingface/hub/`. Converted ONNX outputs land in `~/.local/share/telemuze/models/`.
 
 ## WIP
 
