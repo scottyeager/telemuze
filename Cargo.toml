@@ -2,6 +2,9 @@
 members = [".", "dist", "diarize"]
 resolver = "2"
 
+[patch.crates-io]
+grammers-mtsender = { path = "vendor/grammers-mtsender" }
+
 [package]
 name = "telemuze"
 version = "0.1.0"
