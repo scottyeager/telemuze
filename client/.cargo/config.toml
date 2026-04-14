@@ -1,5 +1,0 @@
-# Point sherpa-onnx-sys at the sibling sherpa-onnx fork's patched static
-# libs (patched-lib has the full set needed for static linking, unlike
-# build/lib which only has the shared-linking subset).
-[env]
-SHERPA_ONNX_LIB_DIR = { value = "../../sherpa-onnx/build/patched-lib", relative = true }

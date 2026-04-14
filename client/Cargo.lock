@@ -1871,7 +1871,8 @@ dependencies = [
 
 [[package]]
 name = "sherpa-onnx"
-version = "1.12.37"
+version = "1.12.37-sortformer1"
+source = "git+https://github.com/scottyeager/sherpa-onnx?tag=v1.12.37-sortformer1#a209dc8c94e7aebac6609435f653520e06939aa9"
 dependencies = [
  "serde",
  "serde_json",
@@ -1880,7 +1881,8 @@ dependencies = [
 
 [[package]]
 name = "sherpa-onnx-sys"
-version = "1.12.37"
+version = "1.12.37-sortformer1"
+source = "git+https://github.com/scottyeager/sherpa-onnx?tag=v1.12.37-sortformer1#a209dc8c94e7aebac6609435f653520e06939aa9"
 dependencies = [
  "bzip2 0.4.4",
  "tar",

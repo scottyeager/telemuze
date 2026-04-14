@@ -3,24 +3,6 @@
 # containing the binary, expanded by the dynamic linker at runtime).
 # This matches the telemuze-dist extraction layout (~/.local/share/telemuze/)
 # where the server binary and .so files live in the same directory.
-# For local development where the .so files live elsewhere (e.g. ~/.local/lib),
-# set LD_LIBRARY_PATH before running the binary.
-#
-# The -L flag adds the fork's fetched onnxruntime directory to the link
-# search path. sherpa-onnx-sys itself adds build/lib (via the env var
-# below), but onnxruntime lives in a separate CMake _deps subtree and has
-# to be pointed at explicitly. Paths are resolved against cargo's
-# invocation directory (the workspace root).
-rustflags = [
-    "-C", "link-arg=-Wl,-rpath,$ORIGIN",
-    "-L", "../sherpa-onnx/build/_deps/onnxruntime-src/lib",
-]
-
-# Point sherpa-onnx-sys at the sibling sherpa-onnx fork's build output so
-# its build script skips the GitHub prebuilt-archive download (which 404s
-# for our fork, whose version hasn't been released upstream). Assumes
-# sherpa-onnx is checked out next to this repo and has been built with
-# `./build.sh` so `build/lib/libsherpa-onnx-c-api.so` exists. Override by
-# exporting SHERPA_ONNX_LIB_DIR before invoking cargo.
-[env]
-SHERPA_ONNX_LIB_DIR = { value = "../sherpa-onnx/build/lib", relative = true }
+# For local development where the .so files live elsewhere, set
+# LD_LIBRARY_PATH before running the binary.
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]

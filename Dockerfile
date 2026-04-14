@@ -12,16 +12,14 @@
 #   docker build -t telemuze:latest .
 #   docker run -p 7313:7313 telemuze:latest
 #
-# Arguments:
-#   SHERPA_ONNX_VERSION  Git tag/branch of k2-fsa/sherpa-onnx to build
-#                        (default: v1.12.34, matching the Cargo.toml dep)
-#   SHERPA_ONNX_REPO     Override the sherpa-onnx repo URL (e.g. to use a fork
-#                        with local patches)
+# sherpa-onnx binaries come from the prebuilt release archives of our fork
+# (scottyeager/sherpa-onnx); sherpa-onnx-sys's build.rs downloads them
+# automatically. Version is pinned via the git tag in Cargo.toml.
 
 ARG UBUNTU_VERSION=22.04
 
 # =====================================================================
-# Stage 1: Builder — compiles sherpa-onnx and the telemuze binaries
+# Stage 1: Builder — compiles the telemuze binaries
 # =====================================================================
 FROM ubuntu:${UBUNTU_VERSION} AS builder
 
@@ -29,7 +27,6 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
-        cmake \
         git \
         curl \
         ca-certificates \
@@ -38,7 +35,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libasound2-dev \
         libxcb1-dev \
         libclang-dev \
-        python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Rust via rustup (minimal stable toolchain)
@@ -49,68 +45,31 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
     sh -s -- -y --default-toolchain stable --profile minimal
 
 # ---------------------------------------------------------------------
-# Build sherpa-onnx (shared libraries) from source so the .so files
-# are linked against the older glibc in this image.
-# ---------------------------------------------------------------------
-ARG SHERPA_ONNX_VERSION=v1.12.34
-ARG SHERPA_ONNX_REPO=https://github.com/k2-fsa/sherpa-onnx.git
-
-RUN git clone --depth 1 --branch ${SHERPA_ONNX_VERSION} \
-        ${SHERPA_ONNX_REPO} /tmp/sherpa-onnx
-
-RUN cmake -S /tmp/sherpa-onnx -B /tmp/sherpa-onnx/build \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DBUILD_SHARED_LIBS=ON \
-        -DSHERPA_ONNX_ENABLE_C_API=ON \
-        -DSHERPA_ONNX_ENABLE_SPEAKER_DIARIZATION=ON \
-        -DSHERPA_ONNX_ENABLE_BINARY=OFF \
-        -DSHERPA_ONNX_ENABLE_TESTS=OFF \
-        -DSHERPA_ONNX_ENABLE_TTS=OFF \
-        -DSHERPA_ONNX_ENABLE_PORTAUDIO=OFF \
-        -DSHERPA_ONNX_ENABLE_PYTHON=OFF \
-    && cmake --build /tmp/sherpa-onnx/build --parallel "$(nproc)"
-
-# Collect the runtime .so files into a stable location.
-# sherpa-onnx downloads onnxruntime during its cmake configure step and places
-# it under _deps/onnxruntime-src/lib/. Copy both it and the C-API .so we just
-# built into a single directory.
-RUN mkdir -p /opt/sherpa-onnx/lib \
-    && cp /tmp/sherpa-onnx/build/lib/libsherpa-onnx-c-api.so /opt/sherpa-onnx/lib/ \
-    && cp /tmp/sherpa-onnx/build/_deps/onnxruntime-src/lib/libonnxruntime.so /opt/sherpa-onnx/lib/
-
-# sherpa-onnx-sys's build.rs looks for the .so files on LD_LIBRARY_PATH
-ENV LD_LIBRARY_PATH=/opt/sherpa-onnx/lib
-
-# ---------------------------------------------------------------------
-# Build telemuze (server, dist launcher, and client)
+# Build telemuze (server, dist launcher, and client). sherpa-onnx-sys's
+# build.rs downloads prebuilt shared/static archives from the fork's
+# GitHub release and copies the runtime .so files into target/release/.
 # ---------------------------------------------------------------------
 WORKDIR /src
 COPY . /src/
 
-# Server — links against /opt/sherpa-onnx/lib via LD_LIBRARY_PATH above.
-# The checked-in .cargo/config.toml sets rpath=$ORIGIN, so the resulting
-# binary finds its .so files next to itself at runtime (which matches the
-# dist-extracted layout).
 RUN cargo build --release --bin telemuze
 
 # Self-contained launcher that embeds the server + .so files
 RUN TELEMUZE_SERVER_BIN=/src/target/release/telemuze \
-    TELEMUZE_SHERPA_SO=/opt/sherpa-onnx/lib/libsherpa-onnx-c-api.so \
-    TELEMUZE_ONNXRUNTIME_SO=/opt/sherpa-onnx/lib/libonnxruntime.so \
+    TELEMUZE_SHERPA_SO=/src/target/release/libsherpa-onnx-c-api.so \
+    TELEMUZE_ONNXRUNTIME_SO=/src/target/release/libonnxruntime.so \
     cargo build --release -p telemuze-dist
 
 # Client (separate workspace, static sherpa-onnx via the crate's build.rs)
-RUN cd /src/client && cargo build --release --no-default-features \
-        --features sherpa-onnx/static --bin telemuze-listen \
-        || cd /src/client && cargo build --release --bin telemuze-listen
+RUN cd /src/client && cargo build --release --bin telemuze-listen
 
 # Collect output artifacts in /artifacts for easy extraction
 RUN mkdir -p /artifacts \
     && cp /src/target/release/telemuze-dist /artifacts/telemuze \
     && cp /src/target/release/telemuze /artifacts/telemuze-server \
-    && cp /opt/sherpa-onnx/lib/libsherpa-onnx-c-api.so /artifacts/ \
-    && cp /opt/sherpa-onnx/lib/libonnxruntime.so /artifacts/ \
-    && (cp /src/client/target/release/telemuze-listen /artifacts/ 2>/dev/null || true) \
+    && cp /src/target/release/libsherpa-onnx-c-api.so /artifacts/ \
+    && cp /src/target/release/libonnxruntime.so /artifacts/ \
+    && cp /src/client/target/release/telemuze-listen /artifacts/ \
     && ls -lh /artifacts/
 
 # =====================================================================

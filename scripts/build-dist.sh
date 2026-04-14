@@ -9,9 +9,11 @@ cargo build --release
 echo ""
 echo "=== Building distribution binary ==="
 
-# Resolve the actual .so paths (follow symlinks)
-SHERPA_SO=$(readlink -f "${TELEMUZE_SHERPA_SO:-$HOME/.local/lib/libsherpa-onnx-c-api.so}")
-ONNXRUNTIME_SO=$(readlink -f "${TELEMUZE_ONNXRUNTIME_SO:-$HOME/.local/lib/libonnxruntime.so}")
+# Resolve the actual .so paths (follow symlinks). sherpa-onnx-sys's build
+# script copies the runtime shared libs into target/<profile>/ next to
+# the binary, so that's the default source.
+SHERPA_SO=$(readlink -f "${TELEMUZE_SHERPA_SO:-$(pwd)/target/release/libsherpa-onnx-c-api.so}")
+ONNXRUNTIME_SO=$(readlink -f "${TELEMUZE_ONNXRUNTIME_SO:-$(pwd)/target/release/libonnxruntime.so}")
 
 TELEMUZE_SERVER_BIN="$(pwd)/target/release/telemuze" \
 TELEMUZE_SHERPA_SO="$SHERPA_SO" \

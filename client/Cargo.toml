@@ -27,9 +27,9 @@ path = "src/bin/eou_test.rs"
 cpal = "0.15"
 
 # VAD engine (sherpa-onnx Silero VAD, static linking).
-# Uses the same local fork as the server to avoid stale crates.io
-# prebuilt downloads. The client only uses VAD + OnlineRecognizer.
-sherpa-onnx = { path = "../../sherpa-onnx/sherpa-onnx/rust/sherpa-onnx", default-features = false, features = ["static"] }
+# Uses the same fork as the server; sherpa-onnx-sys auto-downloads the
+# prebuilt static-lib archive from the fork's GitHub release.
+sherpa-onnx = { git = "https://github.com/scottyeager/sherpa-onnx", tag = "v1.12.37-sortformer1", default-features = false, features = ["static"] }
 
 # HTTP client for sending audio to server
 reqwest = { version = "0.12", features = ["blocking", "multipart", "json"] }
