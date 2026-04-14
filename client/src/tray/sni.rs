@@ -7,15 +7,15 @@ use ksni::{Icon, MenuItem};
 use super::TrayStatus;
 use crate::{Event, IpcCommand};
 
-const ICON_SIZE: i32 = 24;
+const ICON_SIZE: i32 = 48;
 
-const ICON_IDLE: &[u8] = include_bytes!("../../assets/idle.rgba");
-const ICON_SLEEPING: &[u8] = include_bytes!("../../assets/sleeping.rgba");
-const ICON_LISTENING: &[u8] = include_bytes!("../../assets/listening.rgba");
-const ICON_DICTATING: &[u8] = include_bytes!("../../assets/dictating.rgba");
-const ICON_RECORDING: &[u8] = include_bytes!("../../assets/recording.rgba");
-const ICON_PROCESSING: &[u8] = include_bytes!("../../assets/processing.rgba");
-const ICON_RECORDING_PROCESSING: &[u8] = include_bytes!("../../assets/recording_processing.rgba");
+const ICON_IDLE: &[u8] = include_bytes!("../../assets/idle_lg.rgba");
+const ICON_SLEEPING: &[u8] = include_bytes!("../../assets/sleeping_lg.rgba");
+const ICON_LISTENING: &[u8] = include_bytes!("../../assets/listening_lg.rgba");
+const ICON_DICTATING: &[u8] = include_bytes!("../../assets/dictating_lg.rgba");
+const ICON_RECORDING: &[u8] = include_bytes!("../../assets/recording_lg.rgba");
+const ICON_PROCESSING: &[u8] = include_bytes!("../../assets/processing_lg.rgba");
+const ICON_RECORDING_PROCESSING: &[u8] = include_bytes!("../../assets/recording_processing_lg.rgba");
 
 fn icon_rgba(status: TrayStatus) -> &'static [u8] {
     match status {
