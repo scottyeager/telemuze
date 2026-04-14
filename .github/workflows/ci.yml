@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: Build (Linux x86_64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            libssl-dev \
+            libasound2-dev \
+            libxcb1-dev \
+            libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x86_64
+          workspaces: |
+            .
+            client
+
+      - name: Build server
+        run: cargo build --release --bin telemuze
+
+      - name: Build dist launcher
+        env:
+          TELEMUZE_SERVER_BIN: ${{ github.workspace }}/target/release/telemuze
+          TELEMUZE_SHERPA_SO: ${{ github.workspace }}/target/release/libsherpa-onnx-c-api.so
+          TELEMUZE_ONNXRUNTIME_SO: ${{ github.workspace }}/target/release/libonnxruntime.so
+        run: cargo build --release -p telemuze-dist
+
+      - name: Build client
+        working-directory: client
+        run: cargo build --release --bin telemuze-listen

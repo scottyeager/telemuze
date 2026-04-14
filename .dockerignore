@@ -1,0 +1,7 @@
+target
+client/target
+dist-out
+.git
+.github
+*.md
+models
