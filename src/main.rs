@@ -12,8 +12,9 @@ mod worker;
 use anyhow::Result;
 use axum::extract::DefaultBodyLimit;
 use axum::Router;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
@@ -50,7 +51,35 @@ async fn server_main() -> Result<()> {
         )
         .init();
 
-    let config = Config::parse();
+    let matches = Config::command().get_matches();
+    let cli = Config::from_arg_matches(&matches)?;
+
+    // Handle --dump-config / --update-config before starting anything.
+    let dump_request = cli.dump_config.clone();
+    let update_request = cli.update_config;
+
+    let (config, config_path) = config::resolve(cli, &matches)?;
+
+    if let Some(maybe_path) = dump_request {
+        let content = config::dump(&config);
+        match maybe_path {
+            None => print!("{content}"),
+            Some(path) => {
+                atomic_write(&path, &content)?;
+                eprintln!("Config written to {}", path.display());
+            }
+        }
+        return Ok(());
+    }
+
+    if update_request {
+        let path = config_path.unwrap_or_else(config::default_config_path);
+        let content = config::dump(&config);
+        atomic_write(&path, &content)?;
+        eprintln!("Config updated: {}", path.display());
+        return Ok(());
+    }
+
     info!("Telemuze starting up...");
     info!("Loading models into memory...");
 
@@ -121,6 +150,21 @@ async fn server_main() -> Result<()> {
 /// socket from claiming the IPv4 address space, so a separate IPv4
 /// listener on the same port can coexist regardless of the kernel's
 /// `net.ipv6.bindv6only` sysctl.
+/// Write `content` to `path` atomically (tmp file + rename). Creates parent
+/// directories as needed.
+fn atomic_write(path: &Path, content: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let fname = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "server.toml".into());
+    let tmp: PathBuf = parent.join(format!(".{fname}.tmp"));
+    std::fs::write(&tmp, content)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 fn bind_v6_only(addr: SocketAddrV6) -> Result<tokio::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
 

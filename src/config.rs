@@ -1,10 +1,27 @@
-use clap::Parser;
-use std::path::PathBuf;
+use anyhow::{Context, Result};
+use clap::{ArgMatches, Parser};
+use serde::Deserialize;
+use std::path::{Path, PathBuf};
 
 /// Telemuze: Self-hosted AI dictation and transcription server.
 #[derive(Parser, Debug, Clone)]
 #[command(name = "telemuze", version)]
 pub struct Config {
+    /// Path to TOML configuration file.
+    /// Defaults to ~/.config/telemuze/server.toml when that file exists.
+    #[arg(long, env = "TELEMUZE_CONFIG")]
+    pub config: Option<PathBuf>,
+
+    /// Print the full resolved configuration as TOML (with comments) and exit.
+    /// Optionally accepts an output file path; if omitted, prints to stdout.
+    #[arg(long, num_args = 0..=1, value_name = "FILE")]
+    pub dump_config: Option<Option<PathBuf>>,
+
+    /// Update the config file in place with the full resolved configuration and exit.
+    /// Writes back to the file specified by --config (or the default location).
+    #[arg(long)]
+    pub update_config: bool,
+
     /// Host address to bind to. When unset, the server binds both
     /// IPv4 (0.0.0.0) and IPv6 ([::]) on the configured port.
     #[arg(long, env = "TELEMUZE_HOST")]
@@ -52,15 +69,23 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_MODELS_DIR")]
     pub models_dir: Option<PathBuf>,
 
+    /// Enable LLM dictation correction. When disabled (the default), the LLM
+    /// model is NOT downloaded or loaded into RAM, and dictation relies
+    /// solely on the phonetic/fuzzy dictionary pipeline.
+    #[arg(long, env = "TELEMUZE_ENABLE_LLM_CORRECTION")]
+    pub enable_llm_correction: bool,
+
     /// URL of an OpenAI-compatible chat completions API for LLM correction.
     /// Example: http://127.0.0.1:8081/v1/chat/completions
     /// When set, uses the HTTP backend instead of native inference.
+    /// Only consulted when --enable-llm-correction is set.
     #[arg(long, env = "TELEMUZE_LLM_API_URL", default_value = "")]
     pub llm_api_url: String,
 
     /// Path to a GGUF model file for native LLM inference.
     /// If omitted (and no --llm-api-url), the model selected by
     /// --llm-model-size is auto-downloaded.
+    /// Only consulted when --enable-llm-correction is set.
     #[arg(long, env = "TELEMUZE_LLM_MODEL_PATH")]
     pub llm_model_path: Option<PathBuf>,
 
@@ -87,10 +112,6 @@ pub struct Config {
     /// Disable fuzzy string matching (Jaro-Winkler) in the dictionary pipeline.
     #[arg(long, env = "TELEMUZE_DISABLE_FUZZY_MATCH")]
     pub disable_fuzzy_match: bool,
-
-    /// Disable LLM correction (only phonetic/fuzzy pipeline runs).
-    #[arg(long, env = "TELEMUZE_DISABLE_LLM_CORRECTION")]
-    pub disable_llm_correction: bool,
 
     /// Jaro-Winkler similarity threshold for fuzzy matching (0.0–1.0).
     #[arg(long, env = "TELEMUZE_FUZZY_THRESHOLD", default_value_t = 0.85)]
@@ -156,4 +177,247 @@ impl Config {
                 .join("terms.txt")
         }
     }
+}
+
+// ── TOML file struct ─────────────────────────────────────────────────────
+
+/// TOML file layout. Every field is optional so partial configs work; missing
+/// fields fall back to the clap default.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", default)]
+pub struct FileConfig {
+    pub host: Option<String>,
+    pub port: Option<u16>,
+    pub stt_model_path: Option<PathBuf>,
+    pub vad_model_path: Option<PathBuf>,
+    pub diarization_model_path: Option<PathBuf>,
+    pub diarize_binary: Option<PathBuf>,
+    pub longform_binary: Option<PathBuf>,
+    pub max_longform_concurrency: Option<usize>,
+    pub models_dir: Option<PathBuf>,
+    pub enable_llm_correction: Option<bool>,
+    pub llm_api_url: Option<String>,
+    pub llm_model_path: Option<PathBuf>,
+    pub llm_model_size: Option<String>,
+    pub terms_file: Option<PathBuf>,
+    pub llm_temperature: Option<f32>,
+    pub disable_phonetic_match: Option<bool>,
+    pub disable_fuzzy_match: Option<bool>,
+    pub fuzzy_threshold: Option<f64>,
+    pub hotwords_score: Option<f32>,
+    pub max_active_paths: Option<i32>,
+    pub blank_penalty: Option<f32>,
+    pub telegram_api_id: Option<i32>,
+    pub telegram_api_hash: Option<String>,
+    pub telegram_bot_token: Option<String>,
+    pub telegram_allowed_users: Option<String>,
+}
+
+// ── Config loading ───────────────────────────────────────────────────────
+
+/// Default config file location: `~/.config/telemuze/server.toml`.
+pub fn default_config_path() -> PathBuf {
+    dirs_next::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("telemuze")
+        .join("server.toml")
+}
+
+/// Load config from an explicit path, or the XDG default if present.
+pub fn load_config(explicit_path: Option<&Path>) -> Result<(FileConfig, Option<PathBuf>)> {
+    let path = match explicit_path {
+        Some(p) => {
+            if !p.exists() {
+                anyhow::bail!("Config file not found: {}", p.display());
+            }
+            p.to_owned()
+        }
+        None => {
+            let default = default_config_path();
+            if !default.exists() {
+                return Ok((FileConfig::default(), None));
+            }
+            default
+        }
+    };
+
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+    let config: FileConfig = toml::from_str(&contents)
+        .with_context(|| format!("Failed to parse config file: {}", path.display()))?;
+    Ok((config, Some(path)))
+}
+
+// ── Merging CLI + config ─────────────────────────────────────────────────
+
+/// True when clap reports the value came from the command line or an
+/// environment variable (i.e. the user explicitly set it).
+fn is_explicit(matches: &ArgMatches, id: &str) -> bool {
+    let id = id.replace('-', "_");
+    matches
+        .value_source(&id)
+        .is_some_and(|s| {
+            matches!(
+                s,
+                clap::parser::ValueSource::CommandLine | clap::parser::ValueSource::EnvVariable
+            )
+        })
+}
+
+/// Merge a config file into the parsed CLI values. Precedence:
+/// CLI arg / env (if explicit) > config file > clap default (already in cli).
+pub fn resolve(mut cli: Config, matches: &ArgMatches) -> Result<(Config, Option<PathBuf>)> {
+    let (file, config_path) = load_config(cli.config.as_deref())?;
+
+    macro_rules! merge {
+        ($field:ident, $id:expr) => {
+            if !is_explicit(matches, $id) {
+                if let Some(v) = file.$field {
+                    cli.$field = v;
+                }
+            }
+        };
+    }
+    macro_rules! merge_opt {
+        ($field:ident, $id:expr) => {
+            if !is_explicit(matches, $id) && cli.$field.is_none() {
+                cli.$field = file.$field;
+            }
+        };
+    }
+
+    merge_opt!(host, "host");
+    merge!(port, "port");
+    merge_opt!(stt_model_path, "stt-model-path");
+    merge_opt!(vad_model_path, "vad-model-path");
+    merge_opt!(diarization_model_path, "diarization-model-path");
+    merge_opt!(diarize_binary, "diarize-binary");
+    merge_opt!(longform_binary, "longform-binary");
+    merge!(max_longform_concurrency, "max-longform-concurrency");
+    merge_opt!(models_dir, "models-dir");
+    merge!(enable_llm_correction, "enable-llm-correction");
+    merge!(llm_api_url, "llm-api-url");
+    merge_opt!(llm_model_path, "llm-model-path");
+    merge!(llm_model_size, "llm-model-size");
+    merge_opt!(terms_file, "terms-file");
+    merge!(llm_temperature, "llm-temperature");
+    merge!(disable_phonetic_match, "disable-phonetic-match");
+    merge!(disable_fuzzy_match, "disable-fuzzy-match");
+    merge!(fuzzy_threshold, "fuzzy-threshold");
+    merge!(hotwords_score, "hotwords-score");
+    merge!(max_active_paths, "max-active-paths");
+    merge!(blank_penalty, "blank-penalty");
+    merge!(telegram_api_id, "telegram-api-id");
+    merge!(telegram_api_hash, "telegram-api-hash");
+    merge!(telegram_bot_token, "telegram-bot-token");
+    merge!(telegram_allowed_users, "telegram-allowed-users");
+
+    Ok((cli, config_path))
+}
+
+// ── Dump config ──────────────────────────────────────────────────────────
+
+/// Generate a complete commented TOML config from the resolved values.
+pub fn dump(cfg: &Config) -> String {
+    let mut out = String::new();
+    let mut line = |s: &str| {
+        out.push_str(s);
+        out.push('\n');
+    };
+
+    let opt_path = |p: &Option<PathBuf>, placeholder: &str| -> String {
+        match p {
+            Some(p) => format!("{} = \"{}\"", placeholder, p.display()),
+            None => format!("# {placeholder} = \"/path/to/file\""),
+        }
+    };
+
+    line("# ── Networking ────────────────────────────────────────────────────────────");
+    line("# Host to bind. Omit to listen on both IPv4 (0.0.0.0) and IPv6 ([::]).");
+    match &cfg.host {
+        Some(h) => line(&format!("host = \"{h}\"")),
+        None => line("# host = \"0.0.0.0\""),
+    }
+    line("");
+    line("# TCP port to listen on.");
+    line(&format!("port = {}", cfg.port));
+    line("");
+
+    line("# ── Models ────────────────────────────────────────────────────────────────");
+    line("# Directory for auto-downloaded models (STT, VAD, LLM, diarization).");
+    line("# Defaults to ~/.local/share/telemuze/models when omitted.");
+    match &cfg.models_dir {
+        Some(p) => line(&format!("models-dir = \"{}\"", p.display())),
+        None => line("# models-dir = \"/var/lib/telemuze/models\""),
+    }
+    line("");
+    line("# Explicit paths. If set, these override auto-download for that model.");
+    line(&opt_path(&cfg.stt_model_path, "stt-model-path"));
+    line(&opt_path(&cfg.vad_model_path, "vad-model-path"));
+    line(&opt_path(&cfg.diarization_model_path, "diarization-model-path"));
+    line("");
+
+    line("# ── Long-form workers ─────────────────────────────────────────────────────");
+    line("# Path to the `telemuze-diarize` binary (diarization subprocess).");
+    line("# If omitted, looks alongside the telemuze binary, then on PATH.");
+    line(&opt_path(&cfg.diarize_binary, "diarize-binary"));
+    line("# Path to the telemuze binary used to spawn long-form workers.");
+    line(&opt_path(&cfg.longform_binary, "longform-binary"));
+    line("# Max concurrent long-form jobs. Additional jobs queue FIFO.");
+    line(&format!("max-longform-concurrency = {}", cfg.max_longform_concurrency));
+    line("");
+
+    line("# ── LLM correction (opt-in) ───────────────────────────────────────────────");
+    line("# When false (default), no LLM model is downloaded or loaded; dictation");
+    line("# is corrected via the phonetic/fuzzy dictionary pipeline only.");
+    line(&format!("enable-llm-correction = {}", cfg.enable_llm_correction));
+    line("");
+    line("# Optional OpenAI-compatible chat completions URL (external LLM).");
+    line("# When set, uses the HTTP backend instead of native inference.");
+    if cfg.llm_api_url.is_empty() {
+        line("# llm-api-url = \"http://127.0.0.1:8081/v1/chat/completions\"");
+    } else {
+        line(&format!("llm-api-url = \"{}\"", cfg.llm_api_url));
+    }
+    line("");
+    line("# Path to a GGUF model file for native inference.");
+    line("# If omitted, auto-downloads the model selected by llm-model-size.");
+    line(&opt_path(&cfg.llm_model_path, "llm-model-path"));
+    line("# LLM model size for auto-download: \"0.8b\" | \"2b\".");
+    line(&format!("llm-model-size = \"{}\"", cfg.llm_model_size));
+    line("# Sampling temperature for the native backend (Qwen3.5 recommends 1.0).");
+    line(&format!("llm-temperature = {}", cfg.llm_temperature));
+    line("");
+
+    line("# ── Dictionary pipeline ───────────────────────────────────────────────────");
+    line("# Path to the dictation terms file (one term per line).");
+    line("# Defaults to ~/.config/telemuze/terms.txt when omitted.");
+    line(&opt_path(&cfg.terms_file, "terms-file"));
+    line("# Disable phonetic (Double Metaphone) matching.");
+    line(&format!("disable-phonetic-match = {}", cfg.disable_phonetic_match));
+    line("# Disable fuzzy (Jaro-Winkler) matching.");
+    line(&format!("disable-fuzzy-match = {}", cfg.disable_fuzzy_match));
+    line("# Jaro-Winkler similarity threshold (0.0–1.0).");
+    line(&format!("fuzzy-threshold = {}", cfg.fuzzy_threshold));
+    line("");
+
+    line("# ── STT decoding ──────────────────────────────────────────────────────────");
+    line("# Hotword score boost during recognition (0.0 disables; typical 1.0–4.0).");
+    line(&format!("hotwords-score = {}", cfg.hotwords_score));
+    line("# Beam search width (1–10). Lower is faster, may reduce accuracy.");
+    line(&format!("max-active-paths = {}", cfg.max_active_paths));
+    line("# Blank-token penalty; positive slows frame advance, negative speeds it.");
+    line(&format!("blank-penalty = {}", cfg.blank_penalty));
+    line("");
+
+    line("# ── Telegram bot (optional) ───────────────────────────────────────────────");
+    line("# All three of telegram-api-id / telegram-api-hash / telegram-bot-token");
+    line("# must be set to enable the bot.");
+    line(&format!("telegram-api-id = {}", cfg.telegram_api_id));
+    line(&format!("telegram-api-hash = \"{}\"", cfg.telegram_api_hash));
+    line(&format!("telegram-bot-token = \"{}\"", cfg.telegram_bot_token));
+    line("# Comma-separated allowed @usernames. Empty = allow all.");
+    line(&format!("telegram-allowed-users = \"{}\"", cfg.telegram_allowed_users));
+
+    out
 }

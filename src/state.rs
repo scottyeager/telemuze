@@ -34,7 +34,9 @@ pub struct TranscribedSegment {
 /// via `Arc<AppState>` in axum's state extractor.
 pub struct AppState {
     pub stt_engine: Mutex<SttEngine>,
-    pub llm_engine: LlmEngine,
+    /// LLM correction engine — `None` when --enable-llm-correction is not set.
+    /// No model is downloaded or loaded into RAM in that case.
+    pub llm_engine: Option<LlmEngine>,
     pub vad_engine: Mutex<VadEngine>,
     /// Long-form worker launcher — spawns `telemuze transcribe` children.
     /// Carries the Sortformer model path (if configured); the worker loads
@@ -46,7 +48,6 @@ pub struct AppState {
     pub terms_content: String,
     pub dictionary: Dictionary,
     pub pipeline_config: PipelineConfig,
-    pub disable_llm_correction: bool,
     pub telegram_allowed_users: HashSet<String>,
 }
 
@@ -86,23 +87,27 @@ impl AppState {
         )?;
         info!("STT model loaded.");
 
-        // Initialize LLM engine:
-        // - If --llm-api-url is set, use HTTP backend
-        // - If --llm-model-path is set, use native with that GGUF
-        // - Otherwise, auto-download based on --llm-model-size
-        info!("Initializing LLM engine...");
-        let llm_engine = if !config.llm_api_url.is_empty() {
-            LlmEngine::new_http(&config.llm_api_url)
-        } else {
-            let gguf_path = if let Some(ref path) = config.llm_model_path {
-                path.clone()
+        // Initialize LLM engine only when explicitly enabled. Otherwise the
+        // GGUF is neither downloaded nor loaded into RAM.
+        let llm_engine = if config.enable_llm_correction {
+            info!("Initializing LLM engine (--enable-llm-correction set)...");
+            let engine = if !config.llm_api_url.is_empty() {
+                LlmEngine::new_http(&config.llm_api_url)
             } else {
-                let model_id = format!("qwen3.5-{}", config.llm_model_size);
-                info!("Ensuring LLM model {} is available...", model_id);
-                mgr.ensure_llm_model(&model_id).await?;
-                mgr.llm_model_path(&model_id)?
+                let gguf_path = if let Some(ref path) = config.llm_model_path {
+                    path.clone()
+                } else {
+                    let model_id = format!("qwen3.5-{}", config.llm_model_size);
+                    info!("Ensuring LLM model {} is available...", model_id);
+                    mgr.ensure_llm_model(&model_id).await?;
+                    mgr.llm_model_path(&model_id)?
+                };
+                LlmEngine::new_native(&gguf_path, config.llm_temperature)?
             };
-            LlmEngine::new_native(&gguf_path, config.llm_temperature)?
+            Some(engine)
+        } else {
+            info!("LLM correction disabled — model will not be downloaded or loaded.");
+            None
         };
 
         info!("Loading VAD model from {:?}...", vad_path);
@@ -160,7 +165,7 @@ impl AppState {
             pipeline_config.phonetic_enabled,
             pipeline_config.fuzzy_enabled,
             pipeline_config.fuzzy_threshold,
-            !config.disable_llm_correction,
+            llm_engine.is_some(),
         );
 
         if !telegram_allowed_users.is_empty() {
@@ -176,7 +181,6 @@ impl AppState {
             terms_content,
             dictionary,
             pipeline_config,
-            disable_llm_correction: config.disable_llm_correction,
             telegram_allowed_users,
         })
     }

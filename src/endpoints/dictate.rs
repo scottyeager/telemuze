@@ -125,12 +125,12 @@ async fn handle_smart_dictation(
     };
 
     // Step 4: LLM correction (with candidate hints if available)
-    let corrected = if state.disable_llm_correction {
-        debug!("LLM correction disabled, returning raw STT");
-        raw_text
-    } else {
-        match state
-            .llm_engine
+    let corrected = match state.llm_engine.as_ref() {
+        None => {
+            debug!("LLM correction disabled, returning raw STT");
+            raw_text
+        }
+        Some(engine) => match engine
             .correct_dictation(&raw_text, &state.terms_content, candidate_hints.as_deref())
             .await
         {
@@ -139,7 +139,7 @@ async fn handle_smart_dictation(
                 error!("LLM correction failed, returning raw STT: {e}");
                 raw_text
             }
-        }
+        },
     };
 
     info!("Corrected: '{}'", corrected);
@@ -172,12 +172,12 @@ async fn handle_correct(
         Some(dictionary::format_candidates_for_llm(&candidates))
     };
 
-    let corrected = if state.disable_llm_correction {
-        debug!("LLM correction disabled, returning input text");
-        raw_text.to_string()
-    } else {
-        match state
-            .llm_engine
+    let corrected = match state.llm_engine.as_ref() {
+        None => {
+            debug!("LLM correction disabled, returning input text");
+            raw_text.to_string()
+        }
+        Some(engine) => match engine
             .correct_dictation(raw_text, &state.terms_content, candidate_hints.as_deref())
             .await
         {
@@ -190,7 +190,7 @@ async fn handle_correct(
                 )
                     .into_response();
             }
-        }
+        },
     };
 
     info!("Correct: '{}' -> '{}'", raw_text, corrected);

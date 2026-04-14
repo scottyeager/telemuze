@@ -58,6 +58,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tempfile = "3"
 dirs-next = "2"
+toml = "0.8"
 bytes = "1"
 
 # Telegram bot (MTProto)
