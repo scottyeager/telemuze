@@ -3,7 +3,15 @@ members = [".", "dist", "diarize"]
 resolver = "2"
 
 [patch.crates-io]
-grammers-mtsender = { path = "vendor/grammers-mtsender" }
+# Upstream fix for a stray `dbg!` call in grammers-mtsender. Drop this patch
+# once a release past commit be66b6e lands on crates.io. All grammers-*
+# crates must be patched together so they share a single version.
+grammers-client = { git = "https://codeberg.org/Lonami/grammers.git", rev = "be66b6e" }
+grammers-session = { git = "https://codeberg.org/Lonami/grammers.git", rev = "be66b6e" }
+grammers-mtsender = { git = "https://codeberg.org/Lonami/grammers.git", rev = "be66b6e" }
+grammers-mtproto = { git = "https://codeberg.org/Lonami/grammers.git", rev = "be66b6e" }
+grammers-tl-types = { git = "https://codeberg.org/Lonami/grammers.git", rev = "be66b6e" }
+grammers-crypto = { git = "https://codeberg.org/Lonami/grammers.git", rev = "be66b6e" }
 
 [package]
 name = "telemuze"
