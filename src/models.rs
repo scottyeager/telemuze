@@ -110,12 +110,13 @@ const SILERO_VAD: ModelInfo = ModelInfo {
 };
 
 // NVIDIA Sortformer v2.1 (4 speaker, streaming) — community ONNX export.
-// NVIDIA's official ONNX export is broken; this build is from
+// NVIDIA's official ONNX export is broken; this build originates from
 // huggingface.co/altunenes/parakeet-rs and is the model the parakeet-rs
-// crate is tuned against. Used by the telemuze-diarize subprocess.
+// crate is tuned against. We re-host a copy on our own HF account so the
+// asset stays pinned. Used by the telemuze-diarize subprocess.
 // Supports up to 4 speakers; requires ~492 MB on disk.
 const SORTFORMER_FILES: &[ModelFile] = &[ModelFile {
-    url: "https://huggingface.co/altunenes/parakeet-rs/resolve/main/diar_streaming_sortformer_4spk-v2.1.onnx",
+    url: "https://huggingface.co/scottyeager/diar_streaming_sortformer_4spk-v2.1/resolve/main/diar_streaming_sortformer_4spk-v2.1.onnx",
     filename: "diar_streaming_sortformer_4spk-v2.1.onnx",
 }];
 

@@ -36,7 +36,7 @@ use std::time::Instant;
 
 const MODEL_DIR_NAME: &str = "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000";
 const MODEL_DIR_NAME_INT8: &str = "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8";
-const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000.tar.bz2";
+const MODEL_HF_BASE: &str = "https://huggingface.co/scottyeager/sherpa-onnx-nemo-parakeet-tdt-transducer-110m-en-int8/resolve/main";
 const MODEL_ENCODER: &str = "encoder.onnx";
 const MODEL_ENCODER_INT8: &str = "encoder.int8.onnx";
 const MODEL_DECODER: &str = "decoder.onnx";
@@ -181,31 +181,20 @@ fn ensure_model(model_dir: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let parent = model_dir
-        .parent()
-        .context("Model dir has no parent")?;
-    std::fs::create_dir_all(parent)?;
-
-    let archive = parent.join(format!("{MODEL_DIR_NAME}.tar.bz2"));
-    download_file(MODEL_ARCHIVE_URL, &archive)?;
-
-    eprintln!("Extracting model...");
-    let status = std::process::Command::new("tar")
-        .args(["xjf"])
-        .arg(&archive)
-        .arg("-C")
-        .arg(parent)
-        .status()
-        .context("tar command failed — is bzip2 support installed?")?;
-
-    if !status.success() {
-        bail!("Failed to extract model archive");
+    std::fs::create_dir_all(model_dir)?;
+    for filename in [
+        MODEL_ENCODER_INT8,
+        MODEL_DECODER_INT8,
+        MODEL_JOINER_INT8,
+        MODEL_TOKENS,
+        MODEL_BPE_VOCAB,
+    ] {
+        let dest = model_dir.join(filename);
+        if dest.exists() {
+            continue;
+        }
+        download_file(&format!("{MODEL_HF_BASE}/{filename}"), &dest)?;
     }
-
-    // Clean up archive
-    std::fs::remove_file(&archive).ok();
-
-    // Generate bpe.vocab (not included in the 110m archive)
     generate_bpe_vocab(model_dir)?;
 
     if !has_model_files(model_dir) {

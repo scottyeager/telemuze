@@ -56,10 +56,6 @@ ksni = { version = "0.3", features = ["blocking"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Model archive extraction
-tar = "0.4"
-bzip2 = "0.5"
-
 # Utilities
 anyhow = "1"
 dirs-next = "2"

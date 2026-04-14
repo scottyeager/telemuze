@@ -14,7 +14,7 @@ use tracing::{debug, info};
 
 const MODEL_DIR_NAME: &str = "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000";
 const MODEL_DIR_NAME_INT8: &str = "sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000-int8";
-const MODEL_ARCHIVE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet_tdt_transducer_110m-en-36000.tar.bz2";
+const MODEL_HF_BASE: &str = "https://huggingface.co/scottyeager/sherpa-onnx-nemo-parakeet-tdt-transducer-110m-en-int8/resolve/main";
 
 const MODEL_ENCODER: &str = "encoder.onnx";
 const MODEL_ENCODER_INT8: &str = "encoder.int8.onnx";
@@ -24,6 +24,15 @@ const MODEL_JOINER: &str = "joiner.onnx";
 const MODEL_JOINER_INT8: &str = "joiner.int8.onnx";
 const MODEL_TOKENS: &str = "tokens.txt";
 const MODEL_BPE_VOCAB: &str = "bpe.vocab";
+
+/// Files to fetch from the HF int8 repo.
+const MODEL_HF_FILES: &[&str] = &[
+    MODEL_ENCODER_INT8,
+    MODEL_DECODER_INT8,
+    MODEL_JOINER_INT8,
+    MODEL_TOKENS,
+    MODEL_BPE_VOCAB,
+];
 
 // ── Defaults ───────────────────────────────────────────────────────────────
 
@@ -49,10 +58,15 @@ fn models_dir() -> PathBuf {
 pub fn default_model_dir() -> PathBuf {
     let base = models_dir();
     let int8_dir = base.join(MODEL_DIR_NAME_INT8);
-    if int8_dir.join(MODEL_ENCODER_INT8).exists() {
-        int8_dir
+    let fp32_dir = base.join(MODEL_DIR_NAME);
+    // Use an existing fp32 install if the user already has one; otherwise
+    // target the int8 directory (which is what ensure_model downloads).
+    if !int8_dir.join(MODEL_ENCODER_INT8).exists()
+        && fp32_dir.join(MODEL_ENCODER).exists()
+    {
+        fp32_dir
     } else {
-        base.join(MODEL_DIR_NAME)
+        int8_dir
     }
 }
 
@@ -107,35 +121,54 @@ fn generate_bpe_vocab(model_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Download and extract the Parakeet TDT 110m model if not present.
+/// Download the Parakeet TDT 110m int8 model files from Hugging Face if
+/// they are not already present. Each file is streamed individually into
+/// `model_dir`; partial files are written to a `.partial` sibling and
+/// renamed on success.
 pub fn ensure_model(model_dir: &Path) -> Result<()> {
     if has_model_files(model_dir) {
         generate_bpe_vocab(model_dir)?;
         return Ok(());
     }
 
-    let parent = model_dir.parent().context("Model dir has no parent")?;
-    std::fs::create_dir_all(parent)?;
+    std::fs::create_dir_all(model_dir)
+        .with_context(|| format!("Failed to create {}", model_dir.display()))?;
 
-    eprintln!("Downloading Parakeet-TDT 110m model...");
-    let response = reqwest::blocking::get(MODEL_ARCHIVE_URL)
-        .context("Failed to download model")?;
-    if !response.status().is_success() {
-        bail!("Download failed with status {}", response.status());
+    eprintln!("Downloading Parakeet-TDT 110m int8 model from Hugging Face...");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(None)
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    for filename in MODEL_HF_FILES {
+        let dest = model_dir.join(filename);
+        if dest.exists() {
+            continue;
+        }
+        let url = format!("{MODEL_HF_BASE}/{filename}");
+        eprintln!("  {filename}");
+        let response = client
+            .get(&url)
+            .send()
+            .with_context(|| format!("Request failed for {url}"))?;
+        if !response.status().is_success() {
+            bail!("Download of {} failed: HTTP {}", filename, response.status());
+        }
+        let partial = dest.with_extension("partial");
+        let bytes = response
+            .bytes()
+            .with_context(|| format!("Failed to read body for {filename}"))?;
+        std::fs::write(&partial, &bytes)
+            .with_context(|| format!("Failed to write {}", partial.display()))?;
+        std::fs::rename(&partial, &dest)
+            .with_context(|| format!("Failed to finalize {}", dest.display()))?;
     }
-
-    let bytes = response.bytes().context("Failed to read response body")?;
-    eprintln!("Downloaded {} MB, extracting...", bytes.len() / 1_000_000);
-
-    let decoder = bzip2::read::BzDecoder::new(bytes.as_ref());
-    let mut archive = tar::Archive::new(decoder);
-    archive.unpack(parent).context("Failed to extract model archive")?;
 
     generate_bpe_vocab(model_dir)?;
 
     if !has_model_files(model_dir) {
         bail!(
-            "Model extraction succeeded but expected files not found in {}",
+            "Download succeeded but expected files not found in {}",
             model_dir.display()
         );
     }

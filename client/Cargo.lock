@@ -206,15 +206,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bzip2"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "49ecfb22d906f800d4fe833b6282cf4dc1c298f5057ca0b5445e5c209735ca47"
-dependencies = [
- "bzip2-sys",
-]
-
-[[package]]
 name = "bzip2-sys"
 version = "0.1.13+1.0.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1884,7 +1875,7 @@ name = "sherpa-onnx-sys"
 version = "1.12.37-sortformer1"
 source = "git+https://github.com/scottyeager/sherpa-onnx?tag=v1.12.37-sortformer1#a209dc8c94e7aebac6609435f653520e06939aa9"
 dependencies = [
- "bzip2 0.4.4",
+ "bzip2",
  "tar",
  "ureq",
 ]
@@ -2029,7 +2020,6 @@ name = "telemuze-listen"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bzip2 0.5.2",
  "clap",
  "cpal",
  "dirs-next",
@@ -2040,7 +2030,6 @@ dependencies = [
  "serde_json",
  "sherpa-onnx",
  "signal-hook",
- "tar",
  "toml",
  "tracing",
  "tracing-subscriber",
