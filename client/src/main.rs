@@ -1957,8 +1957,21 @@ fn find_phrase(lower: &str, from: usize, words: &[&str]) -> Option<(usize, usize
     let mut search_start = 0;
 
     while let Some(p) = haystack[search_start..].find(first) {
-        let abs_start = from + search_start + p;
-        let mut pos = search_start + p + first.len();
+        let match_start = search_start + p;
+        let abs_start = from + match_start;
+        let mut pos = match_start + first.len();
+
+        // Require a word boundary before the first word: either the match is at
+        // the start of `lower`, or the preceding char is not alphanumeric.
+        let prev_ok = abs_start == 0
+            || lower[..abs_start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+        if !prev_ok {
+            search_start = match_start + first.len();
+            continue;
+        }
 
         let mut matched = true;
         for &word in &words[1..] {
@@ -1981,10 +1994,18 @@ fn find_phrase(lower: &str, from: usize, words: &[&str]) -> Option<(usize, usize
         }
 
         if matched {
-            return Some((abs_start, from + pos));
+            // Require a word boundary after the last word.
+            let end_abs = from + pos;
+            let next_ok = lower[end_abs..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
+            if next_ok {
+                return Some((abs_start, end_abs));
+            }
         }
 
-        search_start = search_start + p + first.len();
+        search_start = match_start + first.len();
     }
 
     None
