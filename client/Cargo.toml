@@ -27,10 +27,9 @@ path = "src/bin/eou_test.rs"
 cpal = "0.15"
 
 # VAD engine (sherpa-onnx Silero VAD, static linking).
-# The client only uses streaming VAD + OnlineRecognizer, so it stays on
-# the released crates.io version — unlike the server it doesn't need the
-# Sortformer bindings only present in our local sherpa-onnx fork.
-sherpa-onnx = "1.12"
+# Uses the same local fork as the server to avoid stale crates.io
+# prebuilt downloads. The client only uses VAD + OnlineRecognizer.
+sherpa-onnx = { path = "../../sherpa-onnx/sherpa-onnx/rust/sherpa-onnx", default-features = false, features = ["static"] }
 
 # HTTP client for sending audio to server
 reqwest = { version = "0.12", features = ["blocking", "multipart", "json"] }
@@ -49,8 +48,9 @@ toml = "0.8"
 # Signal handling
 signal-hook = "0.3"
 
-# System tray (XEmbed protocol for X11)
+# System tray: XEmbed on X11, StatusNotifierItem on Wayland.
 x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+ksni = { version = "0.3", features = ["blocking"] }
 
 # Logging
 tracing = "0.1"

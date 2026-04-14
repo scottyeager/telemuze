@@ -591,18 +591,143 @@ fn detect_display_server() -> String {
 
 fn type_into_window(text: &str, display_server: &str) {
     debug!(text, display_server, "type_into_window");
-    let result = if display_server == "wayland" {
-        std::process::Command::new("wtype")
-            .arg(format!("{text} "))
-            .status()
-    } else {
-        std::process::Command::new("xdotool")
-            .args(["type", "--clearmodifiers", &format!("{text} ")])
-            .status()
-    };
-    if let Err(e) = result {
+    let s = format!("{text} ");
+    if display_server == "wayland" {
+        wayland_type(&s);
+    } else if let Err(e) = std::process::Command::new("xdotool")
+        .args(["type", "--clearmodifiers", &s])
+        .status()
+    {
         warn!("Text injection failed: {e}");
     }
+}
+
+/// Try `wtype` with the given args. Returns true if it ran and exited successfully.
+/// Any other outcome (binary missing, non-zero exit) falls through to ydotool.
+fn wtype_ok(args: &[&str]) -> bool {
+    matches!(
+        std::process::Command::new("wtype").args(args).status(),
+        Ok(s) if s.success()
+    )
+}
+
+fn ydotool_run(args: &[&str]) {
+    match std::process::Command::new("ydotool").args(args).status() {
+        Err(e) => warn!("ydotool failed: {e} (is ydotoold running?)"),
+        Ok(s) if !s.success() => warn!("ydotool exited with {s}"),
+        _ => {}
+    }
+}
+
+/// Linux evdev keycode for a modifier canonical name.
+fn ydotool_modifier_code(m: &str) -> Option<u32> {
+    Some(match m {
+        "ctrl" => 29,    // KEY_LEFTCTRL
+        "shift" => 42,   // KEY_LEFTSHIFT
+        "alt" => 56,     // KEY_LEFTALT
+        "super" => 125,  // KEY_LEFTMETA
+        _ => return None,
+    })
+}
+
+/// Linux evdev keycode for an xkb-style key name (as produced by `key_name`).
+fn ydotool_key_code(k: &str) -> Option<u32> {
+    // Single lowercase letter
+    if k.len() == 1 {
+        let c = k.as_bytes()[0];
+        if c.is_ascii_lowercase() {
+            // KEY_A..=KEY_Z, QWERTY row layout
+            return Some(match c {
+                b'a' => 30, b'b' => 48, b'c' => 46, b'd' => 32,
+                b'e' => 18, b'f' => 33, b'g' => 34, b'h' => 35,
+                b'i' => 23, b'j' => 36, b'k' => 37, b'l' => 38,
+                b'm' => 50, b'n' => 49, b'o' => 24, b'p' => 25,
+                b'q' => 16, b'r' => 19, b's' => 31, b't' => 20,
+                b'u' => 22, b'v' => 47, b'w' => 17, b'x' => 45,
+                b'y' => 21, b'z' => 44,
+                _ => return None,
+            });
+        }
+    }
+    Some(match k {
+        "Return" => 28,
+        "Tab" => 15,
+        "space" => 57,
+        "BackSpace" => 14,
+        "Delete" => 111,
+        "Escape" => 1,
+        "Up" => 103,
+        "Down" => 108,
+        "Left" => 105,
+        "Right" => 106,
+        "Home" => 102,
+        "End" => 107,
+        _ => return None,
+    })
+}
+
+fn wayland_type(text: &str) {
+    if wtype_ok(&[text]) {
+        return;
+    }
+    // `--` stops option parsing so text starting with '-' is literal.
+    ydotool_run(&["type", "--", text]);
+}
+
+fn wayland_key(key: &str) {
+    if wtype_ok(&["-k", key]) {
+        return;
+    }
+    let Some(code) = ydotool_key_code(key) else {
+        warn!("wtype unavailable and no ydotool mapping for key '{key}'");
+        return;
+    };
+    ydotool_run(&["key", &format!("{code}:1"), &format!("{code}:0")]);
+}
+
+fn wayland_modified_key(modifiers: &[&str], key: &str) {
+    let mut wargs: Vec<String> = Vec::new();
+    for m in modifiers {
+        wargs.push("-M".into());
+        wargs.push((*m).into());
+    }
+    wargs.push("-k".into());
+    wargs.push(key.into());
+    for m in modifiers.iter().rev() {
+        wargs.push("-m".into());
+        wargs.push((*m).into());
+    }
+    let wrefs: Vec<&str> = wargs.iter().map(String::as_str).collect();
+    if wtype_ok(&wrefs) {
+        return;
+    }
+
+    let Some(key_code) = ydotool_key_code(key) else {
+        warn!("wtype unavailable and no ydotool mapping for key '{key}'");
+        return;
+    };
+    let mut mod_codes: Vec<u32> = Vec::with_capacity(modifiers.len());
+    for m in modifiers {
+        match ydotool_modifier_code(m) {
+            Some(c) => mod_codes.push(c),
+            None => {
+                warn!("wtype unavailable and no ydotool mapping for modifier '{m}'");
+                return;
+            }
+        }
+    }
+    let mut seq: Vec<String> = Vec::with_capacity(mod_codes.len() * 2 + 2);
+    seq.push("key".into());
+    for c in &mod_codes {
+        seq.push(format!("{c}:1"));
+    }
+    seq.push(format!("{key_code}:1"));
+    seq.push(format!("{key_code}:0"));
+    for c in mod_codes.iter().rev() {
+        seq.push(format!("{c}:0"));
+    }
+    let refs: Vec<&str> = seq.iter().map(String::as_str).collect();
+    ydotool_run(&refs);
 }
 
 /// Insert a punctuation character, replacing trailing space (and any existing
@@ -624,14 +749,12 @@ fn type_punctuation(ch: char, ctx: &AppContext) {
 
     // Type the new punctuation character, with trailing space unless em dash.
     let s = if new_has_space { format!("{ch} ") } else { format!("{ch}") };
-    let result = if ds == "wayland" {
-        std::process::Command::new("wtype").arg(&s).status()
-    } else {
-        std::process::Command::new("xdotool")
-            .args(["type", "--clearmodifiers", &s])
-            .status()
-    };
-    if let Err(e) = result {
+    if ds == "wayland" {
+        wayland_type(&s);
+    } else if let Err(e) = std::process::Command::new("xdotool")
+        .args(["type", "--clearmodifiers", &s])
+        .status()
+    {
         warn!("Punctuation injection failed: {e}");
     }
 
@@ -796,47 +919,28 @@ fn output_text(text: &str, ctx: &AppContext) {
 
 fn send_key(key: &str, display_server: &str) {
     debug!(key, display_server, "send_key");
-    let result = if display_server == "wayland" {
-        std::process::Command::new("wtype")
-            .args(["-k", key])
-            .status()
-    } else {
-        std::process::Command::new("xdotool")
-            .args(["key", "--clearmodifiers", key])
-            .status()
-    };
-    if let Err(e) = result {
+    if display_server == "wayland" {
+        wayland_key(key);
+    } else if let Err(e) = std::process::Command::new("xdotool")
+        .args(["key", "--clearmodifiers", key])
+        .status()
+    {
         warn!("Key injection failed: {e}");
     }
 }
 
 fn send_modified_key(modifiers: &[&str], key: &str, display_server: &str) {
     debug!(?modifiers, key, display_server, "send_modified_key");
-    let result = if display_server == "wayland" {
-        // wtype: -M mod -k key -m mod (press modifier, tap key, release modifier)
-        let mut args: Vec<String> = Vec::new();
-        for m in modifiers {
-            args.push("-M".into());
-            args.push(m.to_string());
-        }
-        args.push("-k".into());
-        args.push(key.into());
-        for m in modifiers.iter().rev() {
-            args.push("-m".into());
-            args.push(m.to_string());
-        }
-        std::process::Command::new("wtype")
-            .args(&args)
-            .status()
+    if display_server == "wayland" {
+        wayland_modified_key(modifiers, key);
     } else {
-        // xdotool: "ctrl+Return" style
         let combo = format!("{}+{}", modifiers.join("+"), key);
-        std::process::Command::new("xdotool")
+        if let Err(e) = std::process::Command::new("xdotool")
             .args(["key", "--clearmodifiers", &combo])
             .status()
-    };
-    if let Err(e) = result {
-        warn!("Modified key injection failed: {e}");
+        {
+            warn!("Modified key injection failed: {e}");
+        }
     }
 }
 
@@ -2777,7 +2881,16 @@ fn main() -> Result<()> {
         };
         match tray::spawn_tray(tx.clone(), initial) {
             Ok(handle) => ctx.tray_handle = Some(handle),
-            Err(e) => warn!("System tray unavailable: {e}"),
+            Err(e) => {
+                warn!("System tray unavailable: {e}");
+                if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                    warn!(
+                        "On Wayland this usually means no StatusNotifierWatcher is running. \
+                         GNOME users: install the \"AppIndicator and KStatusNotifierItem Support\" \
+                         extension (gnome-shell-extension-appindicator) and enable it."
+                    );
+                }
+            }
         }
     }
 

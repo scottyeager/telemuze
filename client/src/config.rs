@@ -392,7 +392,8 @@ pub fn dump(cfg: &ResolvedConfig) -> String {
     line(&format!("output-method = \"{}\"", cfg.output_method));
     line("");
 
-    line("# Show a system tray icon indicating recording/processing state (X11 only).");
+    line("# Show a system tray icon indicating recording/processing state.");
+    line("# Uses XEmbed on X11 and StatusNotifierItem on Wayland.");
     line("# Options: true | false");
     line(&format!("tray = {}", cfg.tray));
     line("");
