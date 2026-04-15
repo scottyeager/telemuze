@@ -42,7 +42,7 @@ If you also use a `terms.txt` file, create it and mount it in the same path insi
 curl -Lo telemuze https://github.com/scottyeager/telemuze/releases/latest/download/telemuze-linux-x86_64
 chmod +x telemuze
 # Move the binary somewhere in your PATH, for example:
-sudo mv teleumuze /usr/local/bin
+sudo mv telemuze /usr/local/bin
 telemuze
 ```
 
@@ -55,7 +55,7 @@ on is unchanged. All flags are passed through to the server.
 curl -Lo telemuze-listen https://github.com/scottyeager/telemuze/releases/latest/download/telemuze-listen-linux-x86_64
 chmod +x telemuze-listen
 # Move the binary somewhere in your PATH, for example:
-sudo mv teleumuze-listen /usr/local/bin
+sudo mv telemuze-listen /usr/local/bin
 telemuze-listen
 ```
 
