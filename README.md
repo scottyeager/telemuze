@@ -1,6 +1,6 @@
 # Telemuze
 
-Telemuze is a personal speech-to-text server and desktop client for Linux. It supports Nvidia's Parakeet STT models, Nvidia Sortformer for diarization, and Silero voice activity detection.
+Telemuze is a personal speech-to-text server and desktop client for Linux. It supports Nvidia's Parakeet STT models (English + [24 European languages](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)), Nvidia Sortformer for diarization, and Silero voice activity detection. For now, the focus is on CPU support only.
 
 Features at a glance:
 
@@ -13,12 +13,11 @@ Features at a glance:
   * Telegram bot support (forward voice notes to the bot, send large files)
   * Automatic conversion of all video and audio formats supported by `ffmpeg`
 
-
 ## Quickstart
 
 Pre-built binaries and Docker images are available.
 
-## Start the server with Docker
+### Start the server with Docker
 
 Generate a starter `server.toml` with default settings:
 
@@ -37,7 +36,7 @@ docker run -p 7313:7313 \
 
 If you also use a `terms.txt` file, create it and mount it in the same path inside the container.
 
-## Install the server using self-extracting binary
+### Install the server using self-extracting binary
 
 ```sh
 curl -Lo telemuze https://github.com/scottyeager/telemuze/releases/latest/download/telemuze-linux-x86_64
@@ -50,7 +49,7 @@ telemuze
 On first run the binary extracts the server and its shared libraries into `~/.local/share/telemuze/`, then execs the server. Subsequent runs skip extraction if the versi
 on is unchanged. All flags are passed through to the server.
 
-## Download and install pre-compiled client
+### Download and install pre-compiled client
 
 ```sh
 curl -Lo telemuze-listen https://github.com/scottyeager/telemuze/releases/latest/download/telemuze-listen-linux-x86_64
@@ -69,7 +68,12 @@ rm -rf ~/.local/share/telemuze/
 rm -rf ~/.config/telemuze/
 ```
 
+If you installed binaries, delete those too. For example:
 
+```
+sudo rm /usr/local/bin/telemuze
+sudo rm /usr/local/bin/telemuze-listen
+```
 
 ## Build
 
@@ -113,6 +117,26 @@ telemuze-listen --update-config
 You can then edit the config options to your liking and launch the program. You'll find comments inline explaining the various options.
 
 If a new version introduces new config options, running the update config command again will update the config file with any new options and their default. As a word of warning, this will also delete any config values that have been deprecated. Taking a backup of the existing config file first might be a good idea.
+
+## Models
+
+On the server side, we support the following Nvidia Parakeet models for fast and high quality transcription:
+
+* [parakeet-unified-en-0.6b](https://huggingface.co/nvidia/parakeet-unified-en-0.6b) - in offline (non-streaming) mode, this model out performs Parakeet v2 at English transcription while maintaining comparable speed (performance benchmarks for speed haven't been released at time of writing)
+* [parakeet-tdt-0.6b-v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3) - this model adds support for 24 more European languages alongside English, at the expense of some English accuracy
+* [parakeet-tdt-0.6b-v2](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2) - very fast and accurate English only model
+
+The server also supports diarization (tagging output text by speaker) using Nvidia Sortformer:
+
+* [diar_streaming_sortformer_4spk-v2.1](https://huggingface.co/nvidia/diar_streaming_sortformer_4spk-v2.1) - good accuracy but only supports up to four speakers
+
+The client can run its own smaller Parakeet model for low latency command detection (higher accuracy output from the server is used as a fallback if needed):
+
+* [parakeet-tdt_ctc-110m](https://huggingface.co/nvidia/parakeet-tdt_ctc-110m) - extremely fast and fairly small English only model, with accuracy still as good as Whisper Large v3
+
+Both the client and the server use the [Silero VAD](https://github.com/snakers4/silero-vad) model to avoid unnecessary CPU usage processing audio that doesn't contain speech.
+
+Adding more models supporting more languages isn't on the immediate roadmap
 
 ## Full Client
 
