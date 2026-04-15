@@ -64,7 +64,7 @@ pub struct ModelInfo {
 // Parakeet TDT 0.6B v2 ONNX (int8) — packaged by sherpa-onnx (k2-fsa)
 // Original model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v2
 // sherpa-onnx export: https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8
-const PARAKEET_FILES: &[ModelFile] = &[
+const PARAKEET_V2_FILES: &[ModelFile] = &[
     ModelFile {
         url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8/resolve/main/encoder.int8.onnx",
         filename: "encoder.int8.onnx",
@@ -83,20 +83,84 @@ const PARAKEET_FILES: &[ModelFile] = &[
     },
 ];
 
+// Parakeet TDT 0.6B v3 ONNX (int8) — packaged by sherpa-onnx (k2-fsa)
+// Original model: https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3
+// sherpa-onnx export: https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8
+const PARAKEET_V3_FILES: &[ModelFile] = &[
+    ModelFile {
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/encoder.int8.onnx",
+        filename: "encoder.int8.onnx",
+    },
+    ModelFile {
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/decoder.int8.onnx",
+        filename: "decoder.int8.onnx",
+    },
+    ModelFile {
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/joiner.int8.onnx",
+        filename: "joiner.int8.onnx",
+    },
+    ModelFile {
+        url: "https://huggingface.co/csukuangfj/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8/resolve/main/tokens.txt",
+        filename: "tokens.txt",
+    },
+];
+
+// Parakeet Unified 0.6B (int8) — exported by us via scripts/export_parakeet_unified.py
+// from NVIDIA's https://huggingface.co/nvidia/parakeet-unified-en-0.6b. Jointly
+// trained for offline + streaming; we currently use the offline transducer branch.
+const PARAKEET_UNIFIED_FILES: &[ModelFile] = &[
+    ModelFile {
+        url: "https://huggingface.co/scottyeager/parakeet-unified-en-0.6b-int8/resolve/main/encoder.int8.onnx",
+        filename: "encoder.int8.onnx",
+    },
+    ModelFile {
+        url: "https://huggingface.co/scottyeager/parakeet-unified-en-0.6b-int8/resolve/main/decoder.int8.onnx",
+        filename: "decoder.int8.onnx",
+    },
+    ModelFile {
+        url: "https://huggingface.co/scottyeager/parakeet-unified-en-0.6b-int8/resolve/main/joiner.int8.onnx",
+        filename: "joiner.int8.onnx",
+    },
+    ModelFile {
+        url: "https://huggingface.co/scottyeager/parakeet-unified-en-0.6b-int8/resolve/main/tokens.txt",
+        filename: "tokens.txt",
+    },
+];
+
 // Silero VAD — hosted by sherpa-onnx
 const SILERO_VAD_FILES: &[ModelFile] = &[ModelFile {
     url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx",
     filename: "silero_vad.onnx",
 }];
 
-const PARAKEET: ModelInfo = ModelInfo {
+const PARAKEET_V2: ModelInfo = ModelInfo {
     id: "parakeet-tdt-0.6b-v2",
     name: "Parakeet TDT 0.6B v2 (int8, sherpa-onnx)",
     dirname: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v2-int8",
     is_directory: true,
     kind: ModelKind::Stt,
     is_downloaded: false,
-    files: PARAKEET_FILES,
+    files: PARAKEET_V2_FILES,
+};
+
+const PARAKEET_V3: ModelInfo = ModelInfo {
+    id: "parakeet-tdt-0.6b-v3",
+    name: "Parakeet TDT 0.6B v3 (int8, sherpa-onnx)",
+    dirname: "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8",
+    is_directory: true,
+    kind: ModelKind::Stt,
+    is_downloaded: false,
+    files: PARAKEET_V3_FILES,
+};
+
+const PARAKEET_UNIFIED: ModelInfo = ModelInfo {
+    id: "parakeet-unified-en-0.6b-int8",
+    name: "Parakeet Unified 0.6B (int8, offline+streaming)",
+    dirname: "parakeet-unified-en-0.6b-int8",
+    is_directory: true,
+    kind: ModelKind::Stt,
+    is_downloaded: false,
+    files: PARAKEET_UNIFIED_FILES,
 };
 
 const SILERO_VAD: ModelInfo = ModelInfo {
@@ -169,13 +233,16 @@ const QWEN_2B: ModelInfo = ModelInfo {
 /// All models that Telemuze knows about.
 fn default_models() -> HashMap<&'static str, ModelInfo> {
     let mut m = HashMap::new();
-    m.insert(PARAKEET.id, PARAKEET);
+    m.insert(PARAKEET_V2.id, PARAKEET_V2);
+    m.insert(PARAKEET_V3.id, PARAKEET_V3);
+    m.insert(PARAKEET_UNIFIED.id, PARAKEET_UNIFIED);
     m.insert(SILERO_VAD.id, SILERO_VAD);
     m.insert(SORTFORMER.id, SORTFORMER);
     m.insert(QWEN_0_8B.id, QWEN_0_8B);
     m.insert(QWEN_2B.id, QWEN_2B);
     m
 }
+
 
 // ── ModelManager ────────────────────────────────────────────────────────────
 
@@ -184,21 +251,34 @@ pub struct ModelManager {
     models_dir: PathBuf,
     models: Mutex<HashMap<&'static str, ModelInfo>>,
     cancel_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Which STT model to download / return from `stt_model_path()`. Other
+    /// STT entries in the registry are kept available for explicit
+    /// `download_model()` calls but are not auto-downloaded.
+    selected_stt_id: String,
 }
 
 impl ModelManager {
     /// Create a new manager rooted at `models_dir`.
     ///
     /// The directory is created if it does not exist. Download status is
-    /// detected from existing files on disk.
-    pub fn new(models_dir: PathBuf) -> Result<Self> {
+    /// detected from existing files on disk. `selected_stt_id` picks which
+    /// STT model `ensure_models()` will download and `stt_model_path()`
+    /// returns; it must match an entry in the registry.
+    pub fn new(models_dir: PathBuf, selected_stt_id: impl Into<String>) -> Result<Self> {
         fs::create_dir_all(&models_dir)
             .with_context(|| format!("Failed to create models directory: {}", models_dir.display()))?;
 
+        let selected_stt_id = selected_stt_id.into();
+        let models = default_models();
+        if !models.contains_key(selected_stt_id.as_str()) {
+            bail!("Unknown STT model id: {}", selected_stt_id);
+        }
+
         let mgr = Self {
             models_dir,
-            models: Mutex::new(default_models()),
+            models: Mutex::new(models),
             cancel_flags: Arc::new(Mutex::new(HashMap::new())),
+            selected_stt_id,
         };
         mgr.update_download_status()?;
         Ok(mgr)
@@ -218,15 +298,16 @@ impl ModelManager {
         Ok(self.models_dir.join(info.dirname))
     }
 
-    /// Return the STT model directory path (first downloaded STT model).
+    /// Return the path to the selected STT model directory.
     pub fn stt_model_path(&self) -> Result<PathBuf> {
         let models = self.models.lock().unwrap();
-        for info in models.values() {
-            if matches!(info.kind, ModelKind::Stt) && info.is_downloaded {
-                return Ok(self.models_dir.join(info.dirname));
-            }
+        let info = models
+            .get(self.selected_stt_id.as_str())
+            .with_context(|| format!("Unknown STT model id: {}", self.selected_stt_id))?;
+        if !info.is_downloaded {
+            bail!("STT model {} is not downloaded", self.selected_stt_id);
         }
-        bail!("No STT model downloaded")
+        Ok(self.models_dir.join(info.dirname))
     }
 
     /// Return the VAD model file path (first downloaded VAD model).
@@ -250,15 +331,19 @@ impl ModelManager {
         Ok(self.models_dir.join(info.dirname))
     }
 
-    /// Check whether all required non-LLM models are present on disk.
-    /// LLM is optional (native inference is not required when an HTTP
-    /// backend is configured).
+    /// Check whether all required models are present on disk: the selected
+    /// STT model plus every non-STT, non-LLM model (VAD, diarization). Other
+    /// STT entries are not considered required.
     pub fn all_models_available(&self) -> bool {
         let models = self.models.lock().unwrap();
-        models
-            .values()
-            .filter(|m| !matches!(m.kind, ModelKind::Llm))
-            .all(|m| m.is_downloaded)
+        let stt_ok = models
+            .get(self.selected_stt_id.as_str())
+            .map(|m| m.is_downloaded)
+            .unwrap_or(false);
+        let others_ok = models.values().all(|m| {
+            matches!(m.kind, ModelKind::Llm | ModelKind::Stt) || m.is_downloaded
+        });
+        stt_ok && others_ok
     }
 
     /// Download a specific LLM model if not already present.
@@ -272,15 +357,25 @@ impl ModelManager {
         self.download_model(model_id).await
     }
 
-    /// Ensure all required (non-LLM) models are downloaded. Downloads any
-    /// that are missing. LLM models are handled separately via
-    /// `ensure_llm_model()`.
+    /// Ensure all required models are downloaded: the selected STT model
+    /// plus every non-STT, non-LLM model (VAD, diarization). Non-selected
+    /// STT entries and LLM models are handled separately via
+    /// `download_model()` / `ensure_llm_model()`.
     pub async fn ensure_models(&self) -> Result<()> {
         let to_download: Vec<String> = {
             let models = self.models.lock().unwrap();
             models
                 .iter()
-                .filter(|(_, info)| !info.is_downloaded && !matches!(info.kind, ModelKind::Llm))
+                .filter(|(id, info)| {
+                    if info.is_downloaded {
+                        return false;
+                    }
+                    match info.kind {
+                        ModelKind::Llm => false,
+                        ModelKind::Stt => **id == self.selected_stt_id.as_str(),
+                        _ => true,
+                    }
+                })
                 .map(|(id, _)| id.to_string())
                 .collect()
         };

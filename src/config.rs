@@ -36,6 +36,13 @@ pub struct Config {
     #[arg(long, env = "TELEMUZE_STT_MODEL_PATH")]
     pub stt_model_path: Option<PathBuf>,
 
+    /// STT model to auto-download when --stt-model-path is unset.
+    /// Options: "v2" (parakeet-tdt-0.6b-v2), "v3" (parakeet-tdt-0.6b-v3),
+    /// "unified" (parakeet-unified-en-0.6b — default).
+    #[arg(long, env = "TELEMUZE_STT_MODEL", default_value = "unified",
+           value_parser = clap::builder::PossibleValuesParser::new(["v2", "v3", "unified"]))]
+    pub stt_model: String,
+
     /// Path to the Silero VAD ONNX model file.
     /// If omitted, models are auto-downloaded to --models-dir.
     #[arg(long, env = "TELEMUZE_VAD_MODEL_PATH")]
@@ -165,6 +172,16 @@ impl Config {
         }
     }
 
+    /// Map the user-facing `--stt-model` name ("v2" / "v3" / "unified") to
+    /// the registry id used by `ModelManager`.
+    pub fn stt_model_id(&self) -> &'static str {
+        match self.stt_model.as_str() {
+            "v2" => "parakeet-tdt-0.6b-v2",
+            "v3" => "parakeet-tdt-0.6b-v3",
+            _ => "parakeet-unified-en-0.6b-int8",
+        }
+    }
+
     /// Resolved terms file path, defaulting to
     /// `~/.config/telemuze/terms.txt`.
     pub fn resolved_terms_file(&self) -> PathBuf {
@@ -189,6 +206,7 @@ pub struct FileConfig {
     pub host: Option<String>,
     pub port: Option<u16>,
     pub stt_model_path: Option<PathBuf>,
+    pub stt_model: Option<String>,
     pub vad_model_path: Option<PathBuf>,
     pub diarization_model_path: Option<PathBuf>,
     pub diarize_binary: Option<PathBuf>,
@@ -289,6 +307,7 @@ pub fn resolve(mut cli: Config, matches: &ArgMatches) -> Result<(Config, Option<
     merge_opt!(host, "host");
     merge!(port, "port");
     merge_opt!(stt_model_path, "stt-model-path");
+    merge!(stt_model, "stt-model");
     merge_opt!(vad_model_path, "vad-model-path");
     merge_opt!(diarization_model_path, "diarization-model-path");
     merge_opt!(diarize_binary, "diarize-binary");
@@ -350,6 +369,10 @@ pub fn dump(cfg: &Config) -> String {
         Some(p) => line(&format!("models-dir = \"{}\"", p.display())),
         None => line("# models-dir = \"/var/lib/telemuze/models\""),
     }
+    line("");
+    line("# STT model to auto-download: \"v2\" | \"v3\" | \"unified\".");
+    line("# Ignored when stt-model-path is set.");
+    line(&format!("stt-model = \"{}\"", cfg.stt_model));
     line("");
     line("# Explicit paths. If set, these override auto-download for that model.");
     line(&opt_path(&cfg.stt_model_path, "stt-model-path"));

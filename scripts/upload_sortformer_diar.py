@@ -19,8 +19,12 @@ def main() -> None:
     if not MODEL_FILE.is_file():
         raise SystemExit(f"Model file not found: {MODEL_FILE}")
 
-    print(f"Uploading: {MODEL_FILE}")
-    print(f"      to: https://huggingface.co/{REPO_ID}")
+    size_mb = MODEL_FILE.stat().st_size / (1024 * 1024)
+    print(f"Uploading from: {MODEL_FILE.parent}")
+    print(f"           to: https://huggingface.co/{REPO_ID}")
+    print("Files:")
+    print(f"  {MODEL_FILE.name} ({size_mb:.1f} MB)")
+
     token = getpass.getpass("Hugging Face token (write access): ").strip()
     if not token:
         raise SystemExit("No token provided.")

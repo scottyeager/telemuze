@@ -57,7 +57,9 @@ impl AppState {
         // auto-download to the models directory.
         let models_dir = config.resolved_models_dir();
         info!("Models directory: {}", models_dir.display());
-        let mgr = ModelManager::new(models_dir)?;
+        let stt_id = config.stt_model_id();
+        info!("Selected STT model: {} ({})", config.stt_model, stt_id);
+        let mgr = ModelManager::new(models_dir, stt_id)?;
 
         let (stt_path, vad_path) = if config.stt_model_path.is_some() && config.vad_model_path.is_some()
         {

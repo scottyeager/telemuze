@@ -19,8 +19,14 @@ def main() -> None:
     if not MODEL_DIR.is_dir():
         raise SystemExit(f"Model directory not found: {MODEL_DIR}")
 
-    print(f"Uploading: {MODEL_DIR}")
-    print(f"      to: https://huggingface.co/{REPO_ID}")
+    files = sorted(p for p in MODEL_DIR.iterdir() if p.is_file())
+    print(f"Uploading from: {MODEL_DIR}")
+    print(f"           to: https://huggingface.co/{REPO_ID}")
+    print("Files:")
+    for p in files:
+        size_mb = p.stat().st_size / (1024 * 1024)
+        print(f"  {p.name} ({size_mb:.1f} MB)")
+
     token = getpass.getpass("Hugging Face token (write access): ").strip()
     if not token:
         raise SystemExit("No token provided.")
